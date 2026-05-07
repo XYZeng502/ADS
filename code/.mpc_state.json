@@ -1,0 +1,16 @@
+{
+  "calibration_factor_d1": 1.0,
+  "daily_snapshots": [
+    {
+      "date": "2026-04-21",
+      "actual_spend": 18987.46,
+      "actual_d1_rate": 0.5961,
+      "predicted_roi": 0.9003,
+      "predicted_total_spend": 1212078.37,
+      "predicted_d1_rate": 0.6826,
+      "days_remaining": 9,
+      "calibration_factor": 1.0
+    }
+  ],
+  "error_history": []
+}
