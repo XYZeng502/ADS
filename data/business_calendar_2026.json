@@ -1,0 +1,20 @@
+{
+  "source": "local_china_holiday_seed",
+  "version": "2026-local-v1",
+  "country": "CN",
+  "description": "本地版本化中国节假日种子数据，可由官方/API 数据源刷新，也支持业务人工 override。",
+  "holiday_windows": [
+    {"id": 1, "name": "new_year", "display_name": "元旦", "start": "2026-01-01", "end": "2026-01-03"},
+    {"id": 2, "name": "spring_festival", "display_name": "春节", "start": "2026-02-16", "end": "2026-02-22"},
+    {"id": 3, "name": "qingming", "display_name": "清明节", "start": "2026-04-04", "end": "2026-04-06"},
+    {"id": 4, "name": "labor_day", "display_name": "劳动节", "start": "2026-05-01", "end": "2026-05-03"},
+    {"id": 5, "name": "dragon_boat", "display_name": "端午节", "start": "2026-06-19", "end": "2026-06-21"},
+    {"id": 6, "name": "national_day", "display_name": "国庆节", "start": "2026-10-01", "end": "2026-10-07"}
+  ],
+  "adjusted_workdays": [],
+  "shopping_days": [
+    {"name": "618", "date": "2026-06-18"},
+    {"name": "double_11", "date": "2026-11-11"},
+    {"name": "double_12", "date": "2026-12-12"}
+  ]
+}

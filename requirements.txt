@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+python-dateutil
+pandas
+numpy
+matplotlib
+scikit-learn
+pulp

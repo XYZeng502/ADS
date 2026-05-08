@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 环境与密钥
+.env
+.env.*
+*.pem
+secrets/
+
+# IDE / 本地
+.idea/
+.vscode/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# 日志
+*.log
+
+# --- 本项目：不上传运行结果与外部目录 ---
+outputs/
+external/
+
+# 数据与大型二进制（训练/回测明细、导出等）
+*.csv
+*.parquet
+*.feather
+*.arrow
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.zip
+*.gz
+*.tar
+*.7z
+*.duckdb
+*.db
+*.sqlite
+*.sqlite3
+
+# data：默认忽略；仅保留业务日历配置（CalendarService 依赖）
+/data/*
+!/data/business_calendar_2026.json
