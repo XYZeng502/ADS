@@ -85,6 +85,7 @@ PYTHONPATH=. python scripts/offline_backtest.py \
 - `outputs/app_level_last_day_suggestions.csv`（每个应用1行汇总）
 
 口径说明（重要）：
+
 - 离线评估中不再使用“买量广告收入”作为实际收入参考（该字段混合新老用户总量）
 - 当前分子采用 cohort 可观测口径（D1 回收）用于对齐新增用户贡献
 
@@ -99,6 +100,7 @@ PYTHONPATH=. python scripts/plot_product_roi_curves.py \
 ```
 
 说明：
+
 - `--top-n <= 0` 可切换为全量产品出图
 - 每个产品输出一张 PNG 曲线图，并生成 `product_roi_curve_summary.csv`
 
@@ -117,6 +119,7 @@ PYTHONPATH=. python scripts/plot_single_cohort_curve.py \
 ```
 
 说明：
+
 - 也可用 `--row-index` 直接按原始CSV行号选中一个cohort
 - 默认仅输出成熟样本（`age_days >= max_day`）；如需强制看未成熟样本，追加 `--allow-immature`
 - 默认使用 `monotone_cubic` 插值（更平滑有弧度）；如需线性可加 `--interp-method linear`
@@ -135,6 +138,7 @@ PYTHONPATH=. python scripts/predict_competitor_by_template.py \
 ```
 
 说明：
+
 - 仅用成熟样本（age>=30）构建倍率模板
 - 默认使用 `monotone_cubic` 插值让日级曲线更平滑；可切换 `--interp-method linear`
 - 输出 P50 主曲线 + P25/P75 区间带
@@ -151,6 +155,7 @@ PYTHONPATH=. python scripts/app_level_aggregate_and_encode.py \
 ```
 
 说明：
+
 - 先按 `应用ID+日期` 聚合，再分析 D1 波动目标（`abs_delta_roi_d1`）
 - 低基数类别（唯一值<=阈值）自动 one-hot
 - 高基数类别自动做统计向量 SVD embedding
@@ -166,11 +171,13 @@ PYTHONPATH=. python scripts/run_parallel_models_roi_d1.py \
 ```
 
 模型：
+
 - EWMA
 - RandomForestRegressor
 - GradientBoostingRegressor (GBDT)
 
 月末 ROI 预测已接入“释放倍率曲线”校准：
+
 - 文件：`app/services/predictor.py`
 - 逻辑：根据“距月末可释放天数”映射倍率，替代固定比例外推
 - 默认读取：`outputs/competitor_forecast/competitor_demo_curved_competitor_roi_curve.csv`
@@ -181,8 +188,8 @@ PYTHONPATH=. python scripts/run_parallel_models_roi_d1.py \
 为了在业务调整（清洗规则、聚合维度、特征改造、口径变化等）期间，确保 ROI_D1 误差不退化：
 
 1. 基线锁定：`outputs/baseline_roi_d1_metrics.json`
-   - 配置：训练实体 `应用ID + 推广流量名称`、清洗组 `应用ID/推广流量/推广流量名称/流量场景/流量场景名称/创意规格/创意规格名称`
-   - 默认相对容差：MAE/RMSE/MAPE 各 10%
+  - 配置：训练实体 `应用ID + 推广流量名称`、清洗组 `应用ID/推广流量/推广流量名称/流量场景/流量场景名称/创意规格/创意规格名称`
+  - 默认相对容差：MAE/RMSE/MAPE 各 10%
 2. 跑出新指标到任意目录（如 `outputs/run_xxx`）后执行护栏：
 
 ```bash
@@ -191,10 +198,11 @@ PYTHONPATH=. python scripts/check_metrics_against_baseline.py \
   --candidate-dir outputs/run_xxx
 ```
 
-3. 输出 `outputs/metrics_drift_report.json`，并在终端打印超阈违规清单。
-4. CI/护栏强制：加 `--fail-on-violation`，超阈直接非零退出，阻断上线。
+1. 输出 `outputs/metrics_drift_report.json`，并在终端打印超阈违规清单。
+2. CI/护栏强制：加 `--fail-on-violation`，超阈直接非零退出，阻断上线。
 
 适用场景：
+
 - 切换清洗规则
 - 切换训练实体维度
 - 替换/新增模型
@@ -231,3 +239,4 @@ PYTHONPATH=. python scripts/check_metrics_against_baseline.py \
 3. 接入真实节假日服务与电商节配置中心
 4. 打通数据中台 API，落地每天 T+1 自动重算任务
 5. 增加运营看板（建议、风险、诊断、KPI 变更影响）
+

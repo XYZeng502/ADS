@@ -13,6 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from app.core.calendar import CalendarService
+from app.prediction_artifacts import validate_merged_daily_csv
 
 try:
     from lightgbm import LGBMRegressor
@@ -102,11 +103,9 @@ def _build_app_daily(
     clean_group_cols: List[str],
     product_key_cols: List[str],
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    raw = pd.read_csv(input_csv, encoding="utf-8-sig")
-    raw["日期"] = pd.to_datetime(raw["日期"], errors="coerce")
-    raw = raw[raw["日期"].notna()].copy()
-    for c in ["消耗金额", "首日广告收入", "曝光量", "点击量", "下载量", "激活人数(快应用新增用户数)"]:
-        raw[c] = pd.to_numeric(raw[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+    from app.data_cleaning import clean as _clean_csv
+
+    raw = _clean_csv(Path(input_csv))
 
     split_col = str(split_col or "").strip()
     clean_group_cols = _normalize_cols(clean_group_cols or DEFAULT_CLEAN_GROUP_COLS)
@@ -326,7 +325,7 @@ def _feature_cols(feature_set: str = "base") -> List[str]:
     return BASE_FEATURE_COLS
 
 
-def _build_model(name: str) -> Optional[object]:
+def _build_model(name: str, use_gpu: bool = False) -> Optional[object]:
     if name == "RandomForest":
         return RandomForestRegressor(n_estimators=300, max_depth=10, min_samples_leaf=4, random_state=42, n_jobs=-1)
     if name == "GBDT":
@@ -336,14 +335,18 @@ def _build_model(name: str) -> Optional[object]:
     if name == "LightGBM":
         if LGBMRegressor is None:
             return None
-        return LGBMRegressor(
+        kwargs: dict = dict(
             n_estimators=500,
             learning_rate=0.03,
             num_leaves=31,
             subsample=0.9,
             colsample_bytree=0.9,
             random_state=42,
+            verbose=-1,
         )
+        if use_gpu:
+            kwargs["device"] = "cuda"
+        return LGBMRegressor(**kwargs)
     return None
 
 
@@ -535,12 +538,12 @@ def _ewma_spend(train_df: pd.DataFrame, test_df: pd.DataFrame, alpha: float) -> 
     return pd.DataFrame(preds)
 
 
-def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feats: List[str], use_log_target: bool) -> pd.DataFrame:
+def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feats: List[str], use_log_target: bool, use_gpu: bool = False) -> pd.DataFrame:
     train = train_df.dropna(subset=feats + ["target_t1_spend"]).copy()
     test = test_df.dropna(subset=feats + ["target_t1_spend"]).copy()
     if train.empty or test.empty:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
-    model = _build_model(name)
+    model = _build_model(name, use_gpu=use_gpu)
     if model is None:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
     x_train = train[feats]
@@ -578,6 +581,15 @@ def _apply_holiday_transition_calibration(test_df: pd.DataFrame, pred: np.ndarra
         adjusted[first_workday_after_holiday],
         recent_ref[first_workday_after_holiday] * 0.45,
     )
+
+    # 节后周末校准：长假后第一个周末广告主常出现“报复性投放”，模型会低估；
+    # 同时也有部分app延续假期低价策略。综合：地板75% + 上限115%。
+    target_is_weekend = pd.to_numeric(test_df.get("target_is_weekend", 0), errors="coerce").fillna(0).to_numpy() == 1
+    days_since_holiday = pd.to_numeric(test_df.get("target_days_since_prev_holiday", 99), errors="coerce").fillna(99).to_numpy()
+    post_holiday_weekend = target_is_weekend & (days_since_holiday >= 1) & (days_since_holiday <= 7)
+    adjusted[post_holiday_weekend] = np.maximum(adjusted[post_holiday_weekend], recent_ref[post_holiday_weekend] * 0.75)
+    adjusted[post_holiday_weekend] = np.minimum(adjusted[post_holiday_weekend], recent_ref[post_holiday_weekend] * 1.15)
+
     return np.clip(adjusted, 0.0, None)
 
 
@@ -649,7 +661,7 @@ def _two_stage_regime_predict(train_df: pd.DataFrame, test_df: pd.DataFrame, fea
         return 2
 
     train["regime"] = train["target_t1_spend"].map(bucket)
-    clf = LogisticRegression(max_iter=1000)
+    clf = LogisticRegression(max_iter=4000, solver="lbfgs")
     clf.fit(train[feats], train["regime"])
     reg_pred = clf.predict(test[feats])
 
@@ -704,46 +716,77 @@ def _run(
     feature_set: str = "base",
     min_target_spend_train: float = 0.0,
     min_target_spend_eval: float = 0.0,
+    *,
+    eval_recent_days: Optional[int] = None,
+    tree_models: Optional[List[str]] = None,
+    skip_baseline_two_stage: bool = False,
+    use_gpu: bool = False,
 ) -> List[ModelResult]:
     feats = _feature_cols(feature_set)
-    models = ["RandomForest", "GBDT", "ExtraTrees", "LightGBM"]
+    models = list(tree_models) if tree_models else ["RandomForest", "GBDT", "ExtraTrees", "LightGBM"]
     preds_by_model: Dict[str, List[pd.DataFrame]] = {"EWMA": [], "BaselineResidual": [], "TwoStageRegime": []}
     for m in models:
         preds_by_model[m] = []
         if use_log_target:
             preds_by_model[f"{m}_log"] = []
 
-    # 与 roi_d1 分流逻辑对齐：按 split_value 分桶后分别进行 walk-forward
+    _enc_app_avg_spend = "app_avg_spend"
+    _enc_app_avg_roi = "app_avg_roi_d1"
     for _, bucket in df.groupby("split_value"):
-        bucket = bucket.sort_values(["应用ID", "日期"]).copy()
-        app_dummies = pd.get_dummies(bucket["应用ID"].astype(str), prefix="app")
-        model_df = pd.concat([bucket.reset_index(drop=True), app_dummies.reset_index(drop=True)], axis=1)
-        feats_all = feats + list(app_dummies.columns)
+        model_df = bucket.sort_values(["应用ID", "日期"]).reset_index(drop=True).copy()
+        # 向量化 expanding-window 目标编码替代 app dummies（无泄漏）
+        grp_spend = model_df.groupby("应用ID")["target_t1_spend"]
+        model_df[_enc_app_avg_spend] = (
+            grp_spend.cumsum().sub(model_df["target_t1_spend"])
+            / grp_spend.cumcount().clip(lower=1)
+        )
+        model_df[_enc_app_avg_spend] = model_df[_enc_app_avg_spend].fillna(model_df["target_t1_spend"].median())
+        if "roi_d1" in model_df.columns:
+            grp_roi = model_df.groupby("应用ID")["roi_d1"]
+            model_df[_enc_app_avg_roi] = (
+                grp_roi.cumsum().sub(model_df["roi_d1"])
+                / grp_spend.cumcount().clip(lower=1)
+            )
+            model_df[_enc_app_avg_roi] = model_df[_enc_app_avg_roi].fillna(model_df["roi_d1"].median())
+            enc_feats = [_enc_app_avg_spend, _enc_app_avg_roi]
+        else:
+            enc_feats = [_enc_app_avg_spend]
+        feats_all = feats + enc_feats
+
         dates = sorted(model_df["日期"].dropna().unique())
-        for cutoff in dates[:-1]:
-            train = model_df[model_df["日期"] <= cutoff].copy()
-            test = model_df[model_df["日期"] == (cutoff + np.timedelta64(1, "D"))].copy()
+        cutoffs = list(dates[:-1])
+        if eval_recent_days is not None and eval_recent_days > 0 and len(cutoffs) > eval_recent_days:
+            cutoffs = cutoffs[-eval_recent_days:]
+        n_cutoffs = len(cutoffs)
+        for i, cutoff in enumerate(cutoffs):
+            t_cutoff = pd.Timestamp(cutoff)
+            next_day = cutoff + np.timedelta64(1, "D")
+            train = model_df[model_df["日期"] <= t_cutoff].copy()
+            test = model_df[model_df["日期"] == next_day].copy()
             if min_target_spend_train > 0:
                 train = train[train["target_t1_spend"] >= min_target_spend_train].copy()
             if min_target_spend_eval > 0:
                 test = test[test["target_t1_spend"] >= min_target_spend_eval].copy()
             if test.empty or train["日期"].nunique() < min_train_days:
                 continue
+            print(f"  [{i+1}/{n_cutoffs}] cutoff={t_cutoff.date()} train={len(train)} test={len(test)}", flush=True)
             ew = _ewma_spend(train, test, alpha)
             if not ew.empty:
                 preds_by_model["EWMA"].append(ew)
-            br = _baseline_residual_predict(train, test, feats_all)
-            if not br.empty:
-                preds_by_model["BaselineResidual"].append(br)
-            ts = _two_stage_regime_predict(train, test, feats_all)
-            if not ts.empty:
-                preds_by_model["TwoStageRegime"].append(ts)
-            with ThreadPoolExecutor(max_workers=6) as ex:
+            if not skip_baseline_two_stage:
+                br = _baseline_residual_predict(train, test, feats_all)
+                if not br.empty:
+                    preds_by_model["BaselineResidual"].append(br)
+                ts = _two_stage_regime_predict(train, test, feats_all)
+                if not ts.empty:
+                    preds_by_model["TwoStageRegime"].append(ts)
+            max_workers = max(2, min(8, len(models) * (2 if use_log_target else 1)))
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 futures = {}
                 for m in models:
-                    futures[ex.submit(_tree_predict, m, train, test, feats_all, False)] = m
+                    futures[ex.submit(_tree_predict, m, train, test, feats_all, False, use_gpu)] = m
                     if use_log_target:
-                        futures[ex.submit(_tree_predict, m, train, test, feats_all, True)] = f"{m}_log"
+                        futures[ex.submit(_tree_predict, m, train, test, feats_all, True, use_gpu)] = f"{m}_log"
                 for fut in as_completed(futures):
                     name = futures[fut]
                     pred_df = fut.result()
@@ -841,7 +884,40 @@ def main() -> None:
         default="base",
         help="特征集：base 为当前稳定特征；calendar_pacing 额外加入月末/节假日/滚动节奏特征",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="新数据快速出数：默认仅近 40 个 walk-forward 截止日 + 仅 ExtraTrees + 跳过 Baseline/TwoStage（可用 --eval-recent-days / --tree-models 覆盖）",
+    )
+    parser.add_argument(
+        "--use-gpu",
+        action="store_true",
+        help="LightGBM 使用 GPU 加速（需支持 CUDA 的 LightGBM 版本）",
+    )
+    parser.add_argument(
+        "--eval-recent-days",
+        type=int,
+        default=0,
+        help=">0 时仅对最近 N 个训练截止日做预测步（大幅加速）；0 表示不截断",
+    )
+    parser.add_argument(
+        "--tree-models",
+        default="",
+        help="逗号分隔覆盖默认四树模型；与应用级 T+1 融合建议 --split-col \"\" --product-key-cols 应用ID",
+    )
     args = parser.parse_args()
+
+    validate_merged_daily_csv(Path(args.input))
+
+    eval_recent: Optional[int] = int(args.eval_recent_days) if args.eval_recent_days > 0 else None
+    tree_override: Optional[List[str]] = [x.strip() for x in str(args.tree_models).split(",") if x.strip()] or None
+    skip_bs = False
+    if args.fast:
+        if eval_recent is None:
+            eval_recent = 40
+        if not tree_override:
+            tree_override = ["ExtraTrees"]
+        skip_bs = True
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -861,6 +937,10 @@ def main() -> None:
         feature_set=args.feature_set,
         min_target_spend_train=float(args.min_target_spend_train),
         min_target_spend_eval=float(args.min_target_spend_eval),
+        eval_recent_days=eval_recent,
+        tree_models=tree_override,
+        skip_baseline_two_stage=skip_bs,
+        use_gpu=bool(args.use_gpu),
     )
     if not results:
         raise ValueError("未得到 spend 预测结果，请检查数据和参数。")
@@ -907,6 +987,10 @@ def main() -> None:
 
     report = {
         "target": "T+1 spend",
+        "fast_mode": bool(args.fast),
+        "eval_recent_days": eval_recent,
+        "tree_models": tree_override,
+        "skip_baseline_two_stage": skip_bs,
         "split_col": args.split_col,
         "clean_group_cols": clean_group_cols,
         "product_key_cols": product_key_cols,
@@ -915,6 +999,8 @@ def main() -> None:
         "min_target_spend_eval": float(args.min_target_spend_eval),
         "feature_set": args.feature_set,
         "feature_count": len(_feature_cols(args.feature_set)),
+        "use_gpu": bool(args.use_gpu),
+        "app_encoding": "expanding_target",
         "best_model_by_mape": str(metric_df.iloc[0]["model"]),
         "best_mape": float(metric_df.iloc[0]["mape"]),
         "best_mape_pct": float(metric_df.iloc[0]["mape_pct"]),

@@ -2,6 +2,7 @@ import csv
 import html
 import json
 import threading
+from collections import deque
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,7 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.core.calendar import CalendarService
+from app.prediction_artifacts import resolve_roi_predictions_csv, resolve_spend_predictions_csv
 from scripts.offline_backtest import run_app_level_last_day_prediction, run_backtest
 
 router = APIRouter(tags=["web"])
@@ -125,6 +127,18 @@ def _read_csv(path: Path, limit: int) -> List[Dict[str, str]]:
     return rows
 
 
+def _read_csv_tail(path: Path, limit: int) -> List[Dict[str, str]]:
+    """取 CSV 末尾若干行（预测文件多按日期升序，取前 N 行会卡在旧月份如图表只到 4 月下旬）。"""
+    if not path.exists() or limit <= 0:
+        return []
+    buf: deque[Dict[str, str]] = deque(maxlen=limit)
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            buf.append(row)
+    return list(buf)
+
+
 def _filter_rows(rows: List[Dict[str, str]], task: str, app_id: str, advertiser_id: str, date: str) -> List[Dict[str, str]]:
     filtered = rows
     if app_id:
@@ -211,9 +225,11 @@ def _pick_existing(paths: List[Path]) -> Path | None:
     return None
 
 
-def _read_csv_rows(path: Path | None, limit: int = 5000) -> List[Dict[str, str]]:
+def _read_csv_rows(path: Path | None, limit: int = 5000, *, from_end: bool = False) -> List[Dict[str, str]]:
     if path is None or not path.exists():
         return []
+    if from_end:
+        return _read_csv_tail(path, limit)
     return _read_csv(path, limit)
 
 
@@ -239,20 +255,10 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     app_month_roi_summary = _read_json(root / "app_level_last_day_prediction.json")
 
     roi_metrics_path = roi_dir / "metrics_summary.csv" if roi_dir else None
-    roi_pred_path = roi_dir / "predictions_ExtraTrees_hard_tuned_log.csv" if roi_dir else None
-    if roi_pred_path and not roi_pred_path.exists() and roi_dir:
-        roi_pred_path = _pick_existing(list(roi_dir.glob("predictions_*.csv")))
+    roi_pred_path = resolve_roi_predictions_csv(roi_dir) if roi_dir else None
+    spend_pred_path = resolve_spend_predictions_csv(spend_dir) if spend_dir else None
 
-    spend_predictions = _read_csv_rows(
-        _pick_existing(
-            [
-                spend_dir / "predictions_GBDT_log.csv" if spend_dir else Path("__missing__"),
-                spend_dir / "predictions_LightGBM_log.csv" if spend_dir else Path("__missing__"),
-                spend_dir / "predictions_reconciled.csv" if spend_dir else Path("__missing__"),
-            ]
-        ),
-        5000,
-    )
+    spend_predictions = _read_csv_rows(spend_pred_path, 2000, from_end=True)
     calendar = CalendarService()
     spend_calendar = {}
     for row in spend_predictions:
@@ -270,20 +276,36 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "target_is_first_workday_after_holiday": target_features["is_first_workday_after_holiday"],
         }
 
+    # 全量统计（不受显示行数限制）
+    roi_stats = _compute_prediction_stats("roi")
+    spend_stats = _compute_prediction_stats("spend")
+
+    # 全量日期聚合图表数据（不受显示行数限制）
+    roi_chart_data = _compute_chart_data("roi")
+    spend_chart_data = _compute_chart_data("spend")
+
     payload = {
         "roi": {
             "title": "T+1 ROI_D1 预测效果",
             "metrics": _read_csv_rows(roi_metrics_path, 100),
-            "predictions": _read_csv_rows(roi_pred_path, 5000),
+            "predictions": _read_csv_rows(roi_pred_path, 2000, from_end=True),
+            "prediction_file": str(roi_pred_path.resolve()) if roi_pred_path and roi_pred_path.exists() else "",
             "source": str(roi_dir) if roi_dir else "",
+            "stats": roi_stats["overall"] if roi_stats else None,
+            "apps": roi_stats["apps"] if roi_stats else [],
+            "chart_data": roi_chart_data or [],
         },
         "spend": {
             "title": "T+1 Spend 预测效果（目标日历 + 假期切换校准）",
             "report": _read_json(spend_dir / "report.json") if spend_dir else {},
             "predictions": spend_predictions,
-            "baseline_predictions": _read_csv_rows(old_spend_path, 5000),
+            "prediction_file": str(spend_pred_path.resolve()) if spend_pred_path and spend_pred_path.exists() else "",
+            "baseline_predictions": _read_csv_rows(old_spend_path, 2000, from_end=True),
             "calendar": spend_calendar,
             "source": str(spend_dir) if spend_dir else "",
+            "stats": spend_stats["overall"] if spend_stats else None,
+            "apps": spend_stats["apps"] if spend_stats else [],
+            "chart_data": spend_chart_data or [],
         },
         "date_feature_compare": _read_json(date_feature_dir / "date_feature_business_compare.json"),
         "date_feature_source": str(date_feature_dir),
@@ -418,9 +440,6 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
           <option value="spend">T+1 Spend 预测</option>
         </select>
       </label>
-      <label>应用ID
-        <select id="appSel"><option value="">全部应用</option></select>
-      </label>
       <label>开始日期
         <input type="date" id="startDate" />
       </label>
@@ -428,6 +447,10 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
         <input type="date" id="endDate" />
       </label>
       <button id="resetBtn">重置筛选</button>
+    </div>
+    <div id="appSelectHint" style="margin-top:10px; display:none; padding:8px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px; font-size:13px;">
+      <span id="appSelectText"></span>
+      <button id="clearAppSelBtn" style="height:26px; padding:0 10px; font-size:12px; margin-left:12px;">返回全量</button>
     </div>
   </div>
 
@@ -462,8 +485,27 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
 
   <div class="panel">
     <div class="section-title">
-      <h2>预测明细</h2>
-      <div class="hint">每一行是某应用在某天的预测和实际结果，可用于追查具体偏差</div>
+      <h2>应用总览表</h2>
+      <div class="hint">全量样本按应用聚合；点击行加载该应用明细；表头可排序</div>
+    </div>
+    <div style="margin-bottom:8px;"><input type="text" id="appTableSearch" placeholder="搜索应用ID…" /></div>
+    <div class="table-wrap" style="max-height:320px;">
+      <table>
+        <thead id="appSummaryHead"></thead>
+        <tbody id="appSummaryBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" id="detailPanel">
+    <div class="section-title">
+      <h2>预测明细 <span id="detailTitleSuffix" style="font-weight:400;color:var(--muted);font-size:14px;"></span></h2>
+      <div class="hint" id="detailPageInfo"></div>
+    </div>
+    <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center;">
+      <button id="detailPrevBtn" disabled>上一页</button>
+      <span id="detailPageLabel">-</span>
+      <button id="detailNextBtn" disabled>下一页</button>
     </div>
     <div class="table-wrap">
       <table>
@@ -640,10 +682,9 @@ function rowsForTarget(target) {{
 
 function currentRows() {{
   const target = document.getElementById('targetSel').value;
-  const app = document.getElementById('appSel').value;
   const start = document.getElementById('startDate').value;
   const end = document.getElementById('endDate').value;
-  return rowsForTarget(target).filter(r => (!app || r.app === app) && (!start || r.date >= start) && (!end || r.date <= end));
+  return rowsForTarget(target).filter(r => (!start || r.date >= start) && (!end || r.date <= end));
 }}
 
 let appRoiSort = {{ key: 'app', dir: 'asc' }};
@@ -657,19 +698,53 @@ function compareRows(a, b, sortState) {{
   return sortState.dir === 'asc' ? cmp : -cmp;
 }}
 
+function appRoiCanonicalLabel(s) {{
+  if (s === 'stable') return '稳定锚点';
+  if (s === 'pred_only') return '纯预测';
+  if (s === 'fused') return '融合';
+  return String(s || '-');
+}}
+
 function appRoiDecision(r) {{
   const gap = r.roiGap;
   const alertCount = r.alertCount;
+  const kpiT = num(r.kpiTarget || 1.05);
   const budgetChange = r.actualSpend > 1e-8 ? (r.plannedBudget - r.actualSpend) / r.actualSpend : 0;
+  const mode = String(r.mode || '').toUpperCase();
+  const scaleMode = mode === 'SCALE';
+  const guardMode = mode === 'GUARD';
+
   let action = '维持观察';
-  if (gap >= 0.15 && alertCount === 0) action = '放量并小幅调高出价';
-  else if (gap >= 0.05 && alertCount <= 1) action = '小幅放量';
-  else if (gap < -0.05 || alertCount >= 2) action = '收紧并降低出价';
-  else if (gap < 0.02 || alertCount > 0) action = '保守控量';
+  const hardBad = gap < -0.11 || alertCount >= 3 || (gap < -0.08 && alertCount >= 2);
+  const midBad = gap < -0.08 || (alertCount >= 2 && gap < 0.1);
+  const softBad = (gap < -0.05 && alertCount >= 1) || (gap < -0.06 && alertCount === 0);
+  const strongOk = gap >= 0.14 && alertCount === 0;
+  const okScale = gap >= 0.06 && alertCount <= 1 && (scaleMode || gap >= 0.1);
+  const okTight = gap >= 0.06 && alertCount === 0;
+
+  if (hardBad || (midBad && !scaleMode)) {{
+    action = '收紧并降低出价';
+  }} else if (midBad && scaleMode) {{
+    action = '保守控量';
+  }} else if (strongOk) {{
+    action = '放量并小幅调高出价';
+  }} else if (okScale || okTight) {{
+    action = '小幅放量';
+  }} else if (softBad) {{
+    action = '保守控量';
+  }} else if (alertCount === 1 && gap >= -0.04) {{
+    action = '维持观察';
+  }} else if (guardMode && gap < -0.03 && gap >= -0.08) {{
+    action = '保守控量';
+  }} else if (gap < -0.05) {{
+    action = '保守控量';
+  }}
 
   const basis = [
-    `预测月末ROI=${{fmt(r.monthEndRoi,4)}}，KPI差距=${{pct(gap)}}`,
-    `昨日实际消耗=${{fmt(r.actualSpend,2)}}，计划预算=${{fmt(r.plannedBudget,2)}}，预算变化=${{pct(budgetChange)}}`,
+    `主决策月末ROI=${{fmt(r.monthEndRoi,4)}}（口径=${{r.canonicalLabel}}），对照KPI=${{fmt(kpiT,4)}}，差距=${{pct(gap)}}；cohort增量口径，与单日D1类KPI不同标尺；求解器模式 ${{mode || '-'}}；主口径唯一配置项见 app/config.py settings.app_last_day_canonical_month_end_roi`,
+    `三条对照：稳定锚点=${{fmt(r.monthEndRoiStable,4)}}，纯预测模块=${{fmt(r.monthEndRoiPredOnly,4)}}，融合=${{fmt(r.monthEndRoiFused,4)}}`,
+    `未来日耗(三套)：稳定=${{fmt(r.plannedDailyStable,2)}}，纯预测=${{fmt(r.plannedDailyPredOnly,2)}}，融合=${{fmt(r.plannedDailyFused,2)}}；昨日实际消耗=${{fmt(r.actualSpend,2)}}，主用计划预算=${{fmt(r.plannedBudget,2)}}，预算变化=${{pct(budgetChange)}}`,
+    `T+1 校准输入：spend=${{fmt(r.spendT1Calibrated,2)}}，roi_d1=${{fmt(r.roiD1T1Calibrated,4)}}`,
     `风险告警=${{alertCount}}，偏差主因=${{r.dominantFactor}}`,
     `D1锚点 raw=${{fmt(r.d1Raw,4)}} → calibrated=${{fmt(r.d1Calibrated,4)}}`,
   ].join('；');
@@ -681,14 +756,26 @@ function appMonthRoiRows() {{
     const monthEndRoi = num(r.month_end_roi_prediction);
     const kpi = num(payload.app_month_roi.kpi || 1.05);
     const alertCount = num(r.alert_count);
+    const srcRaw = r.canonical_month_end_roi_source
+      || (payload.app_month_roi.summary || {{}}).canonical_month_end_roi_source
+      || 'fused';
     const row = {{
       targetDay: r.target_day || '',
       app: String(r.app_id || ''),
       mode: r.mode || '-',
+      kpiTarget: kpi,
+      canonicalSource: String(srcRaw),
+      canonicalLabel: appRoiCanonicalLabel(srcRaw),
       actualSpend: num(r.actual_spend_last_day),
       actualRevenue: num(r.actual_revenue_last_day),
       plannedBudget: num(r.planned_total_budget),
+      plannedDailyStable: num(r.planned_daily_spend_stable_anchor),
+      plannedDailyPredOnly: num(r.planned_daily_spend_pred_only),
+      plannedDailyFused: num(r.planned_daily_spend_fused),
       monthEndRoi,
+      monthEndRoiStable: num(r.month_end_roi_stable_anchor),
+      monthEndRoiPredOnly: num(r.month_end_roi_pred_only),
+      monthEndRoiFused: num(r.month_end_roi_fused),
       monthEndSpend: num(r.month_end_spend_prediction),
       roiA: num(r.month_end_roi_prediction_a),
       roiB: num(r.month_end_roi_prediction_b),
@@ -699,6 +786,8 @@ function appMonthRoiRows() {{
       dominantFactor: r.roi_dominant_factor || '-',
       d1Raw: num(r.d1_anchor_raw_mean),
       d1Calibrated: num(r.d1_anchor_calibrated_mean),
+      spendT1Calibrated: num(r.spend_t1_pred_calibrated),
+      roiD1T1Calibrated: num(r.roi_d1_t1_pred_calibrated),
       topActions: r.top_actions || '',
       roiGap: monthEndRoi - kpi,
     }};
@@ -758,7 +847,10 @@ function refreshAppRoiActions() {{
 function renderAppMonthRoiTable() {{
   refreshAppRoiActions();
   const hintEl = document.getElementById('appRoiSourceHint');
-  if (hintEl) hintEl.textContent = `数据来源：${{payload.app_month_roi.source || '暂无'}} · 原始行数 ${{ (payload.app_month_roi.rows || []).length }}`;
+  const sum = payload.app_month_roi.summary || {{}};
+  const cs = sum.canonical_month_end_roi_source || '';
+  const canonHint = cs ? ` · 主决策口径「${{appRoiCanonicalLabel(cs)}}」` : '';
+  if (hintEl) hintEl.textContent = `数据来源：${{payload.app_month_roi.source || '暂无'}} · 原始行数 ${{ (payload.app_month_roi.rows || []).length }}${{canonHint}}`;
   const allRows = appMonthRoiRows();
   const visibleRows = currentAppRoiRows();
   const aboveKpi = visibleRows.filter(r => r.roiGap >= 0).length;
@@ -775,11 +867,15 @@ function renderAppMonthRoiTable() {{
   const headers = [
     ['app', '应用ID'],
     ['targetDay', '预测日期'],
-    ['monthEndRoi', '预测月末ROI'],
+    ['canonicalLabel', '主口径'],
+    ['monthEndRoi', '月末ROI(主)'],
+    ['monthEndRoiStable', '稳定锚点'],
+    ['monthEndRoiPredOnly', '纯预测'],
+    ['monthEndRoiFused', '融合'],
     ['roiGap', '较KPI差距'],
     ['action', '建议动作'],
     ['monthEndSpend', '预测月末消耗'],
-    ['plannedBudget', '今日计划预算'],
+    ['plannedBudget', '主用计划预算'],
     ['budgetChange', '预算变化'],
     ['roi30d', '30日总ROI'],
     ['roiA', 'Raw锚点ROI'],
@@ -789,6 +885,8 @@ function renderAppMonthRoiTable() {{
     ['dominantFactor', '偏差主因'],
     ['d1Raw', 'D1 Raw'],
     ['d1Calibrated', 'D1校准'],
+    ['spendT1Calibrated', 'T+1 Spend(校准)'],
+    ['roiD1T1Calibrated', 'T+1 ROI_D1(校准)'],
     ['priorityScore', '处理优先级'],
     ['basis', '推荐依据'],
     ['topActions', 'Top计划动作'],
@@ -815,7 +913,11 @@ function renderAppMonthRoiTable() {{
     return `<tr>
       <td>${{r.app}}</td>
       <td>${{r.targetDay}}</td>
+      <td>${{r.canonicalLabel}}</td>
       <td class="${{roiCls}}">${{fmt(r.monthEndRoi,4)}}</td>
+      <td>${{fmt(r.monthEndRoiStable,4)}}</td>
+      <td>${{fmt(r.monthEndRoiPredOnly,4)}}</td>
+      <td>${{fmt(r.monthEndRoiFused,4)}}</td>
       <td class="${{roiCls}}">${{pct(r.roiGap)}}</td>
       <td><span class="pill ${{actionCls}}">${{r.action}}</span></td>
       <td>${{fmt(r.monthEndSpend,2)}}</td>
@@ -829,6 +931,8 @@ function renderAppMonthRoiTable() {{
       <td>${{r.dominantFactor}}</td>
       <td>${{fmt(r.d1Raw,4)}}</td>
       <td>${{fmt(r.d1Calibrated,4)}}</td>
+      <td>${{fmt(r.spendT1Calibrated,2)}}</td>
+      <td>${{fmt(r.roiD1T1Calibrated,4)}}</td>
       <td>${{fmt(r.priorityScore,2)}}</td>
       <td class="basis">${{r.basis}}</td>
       <td class="basis">${{r.topActions}}</td>
@@ -836,12 +940,110 @@ function renderAppMonthRoiTable() {{
   }}).join('');
 }}
 
-function refreshApps() {{
+let detailState = {{ appId: '', page: 0, limit: 200, total: 0 }};
+let selectedAppId = '';
+let appSummarySort = {{ key: 'mape_pct', dir: 'asc' }};
+
+function renderAppSummary() {{
   const target = document.getElementById('targetSel').value;
-  const current = document.getElementById('appSel').value;
-  const apps = [...new Set(rowsForTarget(target).map(r => r.app).filter(Boolean))].sort();
-  document.getElementById('appSel').innerHTML = '<option value="">全部应用</option>' + apps.map(a => `<option value="${{a}}">${{a}}</option>`).join('');
-  if (apps.includes(current)) document.getElementById('appSel').value = current;
+  const apps = (target === 'roi' ? payload.roi.apps : payload.spend.apps) || [];
+  const search = inputTrim('appTableSearch').toLowerCase();
+  let filtered = search ? apps.filter(a => String(a.app_id).toLowerCase().includes(search)) : apps.slice();
+  filtered = [...filtered].sort((a, b) => {{
+    const av = a[appSummarySort.key]; const bv = b[appSummarySort.key];
+    const cmp = typeof av === 'string' ? String(av).localeCompare(String(bv)) : Number(av) - Number(bv);
+    return appSummarySort.dir === 'asc' ? cmp : -cmp;
+  }});
+  document.getElementById('appSummaryHead').innerHTML = '<tr>' + [
+    ['app_id','应用ID'],['mae','MAE'],['rmse','RMSE'],['mape_pct','MAPE%'],['samples','样本数']
+  ].map(([key,name]) => {{
+    const mark = appSummarySort.key === key ? (appSummarySort.dir === 'asc' ? ' ↑' : ' ↓') : ' ↕';
+    return `<th class="sortable" data-asort="${{key}}">${{name}}${{mark}}</th>`;
+  }}).join('') + '</tr>';
+  document.getElementById('appSummaryBody').innerHTML = filtered.map(a => {{
+    const cls = a.mape_pct <= 50 ? 'good' : (a.mape_pct <= 100 ? '' : 'bad');
+    const sel = a.app_id === selectedAppId ? ' style="background:#eff6ff;"' : '';
+    return `<tr class="app-summary-row" data-app="${{a.app_id}}"${{sel}}>
+      <td><b>${{a.app_id}}</b></td><td>${{fmt(a.mae,4)}}</td><td>${{fmt(a.rmse,4)}}</td>
+      <td class="${{cls}}">${{pct(a.mape)}}</td><td>${{a.samples}}</td></tr>`;
+  }}).join('');
+  document.querySelectorAll('#appSummaryHead th[data-asort]').forEach(th => {{
+    th.addEventListener('click', () => {{
+      const key = th.dataset.asort;
+      if (appSummarySort.key === key) appSummarySort.dir = appSummarySort.dir === 'asc' ? 'desc' : 'asc';
+      else appSummarySort = {{ key, dir: key === 'app_id' ? 'asc' : 'desc' }};
+      renderAppSummary();
+    }});
+  }});
+  document.querySelectorAll('.app-summary-row').forEach(row => {{
+    row.addEventListener('click', () => selectApp(row.dataset.app));
+  }});
+}}
+
+function selectApp(appId) {{
+  if (selectedAppId === appId) {{
+    selectedAppId = '';
+    document.getElementById('appSelectHint').style.display = 'none';
+  }} else {{
+    selectedAppId = appId;
+    document.getElementById('appSelectHint').style.display = '';
+    document.getElementById('appSelectText').textContent = `已选中应用 ${{appId}} — 图表和明细均仅显示该应用数据`;
+  }}
+  detailState.appId = selectedAppId;
+  detailState.page = 0;
+  detailState.total = 0;
+  detailSort = {{ key: 'date', dir: 'asc' }};
+  render();
+}}
+
+function loadAppDetail() {{
+  const target = document.getElementById('targetSel').value;
+  const {{ appId, page, limit }} = detailState;
+  if (!appId) {{ renderTable(currentRows()); return; }}
+  const offset = page * limit;
+  document.getElementById('detailBody').innerHTML = '<tr><td colspan="10" style="text-align:center;padding:20px;">加载中…</td></tr>';
+  fetch(`/web/data/${{target}}/app/${{encodeURIComponent(appId)}}?offset=${{offset}}&limit=${{limit}}`)
+    .then(r => r.json())
+    .then(data => {{
+      detailState.total = data.total;
+      renderDetailTable(target, data.rows, data.total, data.offset, data.limit);
+    }})
+    .catch(() => {{
+      document.getElementById('detailBody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--red);padding:20px;">加载失败，请重试</td></tr>';
+    }});
+}}
+
+function renderDetailTable(target, rows, total, offset, limit) {{
+  const digits = target === 'roi' ? 4 : 2;
+  const headers = target === 'roi'
+    ? [['日期','日期'],['应用ID','应用ID'],['y_true','实际 ROI_D1'],['y_pred','预测 ROI_D1'],['ape','APE'],['model','模型']]
+    : [['日期','日期'],['target_date','T+1日期'],['calendar_label','日历标签'],['应用ID','应用ID'],['y_true','实际 Spend'],
+       ['y_pred','新版预测'],['y_pred_old','旧版预测'],['ape','APE'],['model','模型']];
+  document.getElementById('detailHead').innerHTML = '<tr>' + headers.map(([key, name]) => {{
+    return `<th>${{name}}</th>`;
+  }}).join('') + '</tr>';
+  document.getElementById('detailBody').innerHTML = rows.map(r => {{
+    const y = Number(r.y_true); const p = Number(r.y_pred);
+    const ape = y > 1e-8 ? Math.abs((y - p) / y) : 0;
+    const cls = ape <= .3 ? 'good' : 'bad';
+    const date = String(r['日期'] || '').slice(0,10);
+    const app = String(r['应用ID'] || '');
+    if (target === 'roi') {{
+      return `<tr><td>${{date}}</td><td>${{app}}</td><td>${{fmt(y,digits)}}</td><td>${{fmt(p,digits)}}</td><td class="${{cls}}">${{pct(ape)}}</td><td>${{r.model || '-'}}</td></tr>`;
+    }}
+    const oldPred = Number(r.y_pred_old);
+    const oldApe = y > 1e-8 && Number.isFinite(oldPred) ? Math.abs((y - oldPred) / y) : null;
+    const improvement = Number.isFinite(oldApe) && ape !== null ? oldApe - ape : null;
+    const impCls = Number.isFinite(improvement) && improvement >= 0 ? 'good' : 'bad';
+    return `<tr><td>${{date}}</td><td>${{r.target_date || '-'}}</td><td>${{r.calendar_label || '-'}}</td><td>${{app}}</td><td>${{fmt(y,digits)}}</td><td>${{fmt(p,digits)}}</td><td>${{fmt(oldPred,digits)}}</td><td class="${{cls}}">${{pct(ape)}}</td><td>${{r.model || '-'}}</td></tr>`;
+  }}).join('');
+  const currentPage = Math.floor(offset / Math.max(limit, 1));
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+  document.getElementById('detailPrevBtn').disabled = currentPage <= 0;
+  document.getElementById('detailNextBtn').disabled = currentPage >= totalPages - 1;
+  document.getElementById('detailPageLabel').textContent = `第 ${{currentPage + 1}}/${{totalPages}} 页 (共 ${{total}} 条)`;
+  document.getElementById('detailTitleSuffix').textContent = selectedAppId ? `应用 ${{selectedAppId}}` : '';
+  document.getElementById('detailPageInfo').textContent = selectedAppId ? `共 ${{total}} 条记录` : '';
 }}
 
 function calcMetrics(rows) {{
@@ -860,12 +1062,13 @@ function calcMetrics(rows) {{
 
 function renderCards(rows) {{
   const target = document.getElementById('targetSel').value;
+  const stats = target === 'roi' ? payload.roi.stats : payload.spend.stats;
   const m = calcMetrics(rows);
   const cards = [
-    ['样本数', String(m.n), target === 'roi' ? '应用-日期 ROI 样本' : '应用-日期 spend 样本'],
-    ['MAPE', pct(m.mape), '平均百分比误差，越低越好'],
-    ['WMAPE', pct(m.wmape), '按实际规模加权，更接近业务影响'],
-    ['30%内命中率', pct(m.hit30), '预测偏差在 30% 以内的样本占比'],
+    ['全量样本数', stats ? String(stats.samples) : String(m.n), target === 'roi' ? '全量应用-日期 ROI 样本' : '全量应用-日期 spend 样本'],
+    ['全量MAPE', stats ? pct(stats.mape) : pct(m.mape), '全量平均百分比误差'],
+    ['全量MAE', stats ? fmt(stats.mae, 4) : fmt(m.mae, 4), '全量平均绝对误差'],
+    ['全量应用数', stats ? String(stats.apps) : '-', '覆盖的应用数量'],
   ];
   document.getElementById('metricCards').innerHTML = cards.map(c => `<div class="metric"><div class="k">${{c[0]}}</div><div class="v">${{c[1]}}</div><div class="d">${{c[2]}}</div></div>`).join('');
 }}
@@ -983,19 +1186,42 @@ function renderBusinessSnapshot() {{
 function renderCharts(rows) {{
   const target = document.getElementById('targetSel').value;
   const unit = target === 'roi' ? 'ROI_D1' : '消耗金额';
-  const data = aggregateByDate(rows);
+  // All-apps: use pre-computed full chart_data; single-app: fetch per-app chart data
+  if (selectedAppId) {{
+    renderChartsForApp(target, unit);
+    return;
+  }}
+  const chartData = (target === 'roi' ? payload.roi.chart_data : payload.spend.chart_data) || [];
+  const data = chartData.length > 0 ? chartData : aggregateByDate(rows);
+  renderChartSeries(data, unit, target);
+}}
+
+let _chartAppId = '';
+function renderChartsForApp(target, unit) {{
+  if (_chartAppId === selectedAppId) return;  // already loading/loaded
+  _chartAppId = selectedAppId;
+  fetch(`/web/data/${{target}}/app/${{encodeURIComponent(selectedAppId)}}/chart`)
+    .then(r => r.json())
+    .then(data => {{
+      if (selectedAppId !== _chartAppId) return;  // selection changed during fetch
+      renderChartSeries(data, unit, target);
+    }});
+}}
+
+function renderChartSeries(data, unit, target) {{
   const dates = data.map(x => x.date);
   const actualName = target === 'roi' ? '实际 T+1 ROI_D1' : '实际 T+1 Spend';
   const predName = target === 'roi' ? '预测 T+1 ROI_D1' : '目标日历校准预测 T+1 Spend';
+  const titleSuffix = selectedAppId ? ` — 应用 ${{selectedAppId}}` : '';
   const series = [
     {{ name: actualName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.actual) }},
     {{ name: predName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.pred) }},
   ];
-  if (target === 'spend' && data.some(x => Number.isFinite(x.pred2) && x.pred2 > 0)) series.push({{ name: '应用基线预测 T+1 Spend', type: 'line', smooth: true, symbolSize: 5, data: data.map(x => x.pred2) }});
   charts.line.setOption({{
     color: ['#16a34a', '#2563eb', '#f59e0b'],
     tooltip: {{ trigger: 'axis' }},
     legend: {{ top: 8 }},
+    title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
     grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
     xAxis: {{ type: 'category', name: '日期', nameLocation: 'middle', nameGap: 34, data: dates }},
     yAxis: {{ type: 'value', name: unit, nameGap: 48 }},
@@ -1008,7 +1234,7 @@ function renderCharts(rows) {{
     grid: {{ left: 62, right: 24, top: 36, bottom: 54 }},
     xAxis: {{ type:'value', name:`实际${{unit}}`, nameLocation:'middle', nameGap:34 }},
     yAxis: {{ type:'value', name:`预测${{unit}}`, nameGap:44 }},
-    series: [{{ name:'单样本预测校准', type:'scatter', symbolSize: 7, data: rows.map(r => [r.actual, r.pred]) }}]
+    series: [{{ name:'每日预测校准', type:'scatter', symbolSize: 9, data: data.map(x => [x.actual, x.pred]) }}]
   }});
   charts.error.setOption({{
     color: ['#dc2626'],
@@ -1039,19 +1265,23 @@ function renderSummary(rows) {{
 
 function renderTable(rows) {{
   const target = document.getElementById('targetSel').value;
+  // Single-app mode: AJAX detail
+  if (selectedAppId) {{
+    if (detailState.appId !== selectedAppId) {{ detailState.appId = selectedAppId; detailState.page = 0; detailState.total = 0; }}
+    loadAppDetail();
+    return;
+  }}
+  // All-apps mode: in-memory pagination
+  detailState.appId = '';
   const digits = target === 'roi' ? 4 : 2;
   const enriched = rows.map(r => ({{
     ...r,
     ape: r.actual > 1e-8 ? Math.abs((r.actual-r.pred)/r.actual) : 0,
   }}));
   const headers = target === 'roi'
-    ? [
-      ['date','日期'], ['app','应用ID'], ['actual','实际 ROI_D1'], ['pred','预测 ROI_D1'], ['ape','APE'], ['model','模型']
-    ]
-    : [
-      ['date','日期'], ['targetDate','T+1日期'], ['calendarLabel','日历标签'], ['app','应用ID'], ['actual','实际 Spend'],
-      ['pred','新版预测'], ['oldPred','旧版预测'], ['newApe','新版APE'], ['oldApe','旧版APE'], ['improvement','改善'], ['model','模型']
-    ];
+    ? [['date','日期'], ['app','应用ID'], ['actual','实际 ROI_D1'], ['pred','预测 ROI_D1'], ['ape','APE'], ['model','模型']]
+    : [['date','日期'], ['targetDate','T+1日期'], ['calendarLabel','日历标签'], ['app','应用ID'], ['actual','实际 Spend'],
+      ['pred','新版预测'], ['oldPred','旧版预测'], ['newApe','新版APE'], ['oldApe','旧版APE'], ['improvement','改善'], ['model','模型']];
   document.getElementById('detailHead').innerHTML = '<tr>' + headers.map(([key, name]) => {{
     const mark = detailSort.key === key ? (detailSort.dir === 'asc' ? ' ↑' : ' ↓') : ' ↕';
     return `<th class="sortable" data-detail-sort="${{key}}">${{name}}${{mark}}</th>`;
@@ -1061,21 +1291,34 @@ function renderTable(rows) {{
       const key = th.dataset.detailSort;
       if (detailSort.key === key) detailSort.dir = detailSort.dir === 'asc' ? 'desc' : 'asc';
       else detailSort = {{ key, dir: ['date','app','model','calendarLabel','targetDate'].includes(key) ? 'asc' : 'desc' }};
+      detailState.page = 0;
       renderTable(currentRows());
     }});
   }});
-  const tableRows = [...enriched].sort((a,b) => compareRows(a, b, detailSort));
-  document.getElementById('detailBody').innerHTML = tableRows.slice(0, 300).map(r => {{
+  const sorted = [...enriched].sort((a,b) => compareRows(a, b, detailSort));
+  const limit = detailState.limit;
+  const total = sorted.length;
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+  if (detailState.page >= totalPages) detailState.page = totalPages - 1;
+  if (detailState.page < 0) detailState.page = 0;
+  const offset = detailState.page * limit;
+  const pageRows = sorted.slice(offset, offset + limit);
+  document.getElementById('detailBody').innerHTML = pageRows.map(r => {{
     const ape = r.ape;
     const cls = ape <= .3 ? 'good' : 'bad';
     if (target === 'roi') return `<tr><td>${{r.date}}</td><td>${{r.app}}</td><td>${{fmt(r.actual,digits)}}</td><td>${{fmt(r.pred,digits)}}</td><td class="${{cls}}">${{pct(ape)}}</td><td>${{r.model}}</td></tr>`;
     const impCls = Number.isFinite(r.improvement) && r.improvement >= 0 ? 'good' : 'bad';
     return `<tr><td>${{r.date}}</td><td>${{r.targetDate}}</td><td>${{r.calendarLabel}}</td><td>${{r.app}}</td><td>${{fmt(r.actual,digits)}}</td><td>${{fmt(r.pred,digits)}}</td><td>${{fmt(r.oldPred,digits)}}</td><td class="${{cls}}">${{pct(r.newApe)}}</td><td>${{pct(r.oldApe)}}</td><td class="${{impCls}}">${{pct(r.improvement)}}</td><td>${{r.model}}</td></tr>`;
   }}).join('');
+  document.getElementById('detailPrevBtn').disabled = detailState.page <= 0;
+  document.getElementById('detailNextBtn').disabled = detailState.page >= totalPages - 1;
+  document.getElementById('detailPageLabel').textContent = `第 ${{detailState.page + 1}}/${{totalPages}} 页 (共 ${{total}} 条)`;
+  document.getElementById('detailTitleSuffix').textContent = '';
+  document.getElementById('detailPageInfo').textContent = '';
 }}
 
 function render() {{
-  refreshApps();
+  renderAppSummary();
   const rows = currentRows();
   const target = document.getElementById('targetSel').value;
   document.getElementById('lineTitle').textContent = target === 'roi' ? 'T+1 ROI_D1：预测值 vs 实际值' : 'T+1 Spend：预测值 vs 实际值';
@@ -1087,9 +1330,29 @@ function render() {{
   renderTable(rows);
 }}
 
-['targetSel','appSel','startDate','endDate'].forEach(id => {{
+['targetSel','startDate','endDate'].forEach(id => {{
   const el = document.getElementById(id);
-  if (el) el.addEventListener('change', render);
+  if (el) el.addEventListener('change', () => {{ selectedAppId = ''; _chartAppId = ''; document.getElementById('appSelectHint').style.display = 'none'; detailState = {{ appId: '', page: 0, limit: 200, total: 0 }}; render(); }});
+}});
+const appTableSearchEl = document.getElementById('appTableSearch');
+if (appTableSearchEl) appTableSearchEl.addEventListener('input', renderAppSummary);
+const clearAppSelBtn = document.getElementById('clearAppSelBtn');
+if (clearAppSelBtn) clearAppSelBtn.addEventListener('click', () => {{
+  selectedAppId = '';
+  document.getElementById('appSelectHint').style.display = 'none';
+  detailState = {{ appId: '', page: 0, limit: 200, total: 0 }};
+  detailSort = {{ key: 'date', dir: 'asc' }};
+  render();
+}});
+const detailPrevBtn = document.getElementById('detailPrevBtn');
+if (detailPrevBtn) detailPrevBtn.addEventListener('click', () => {{
+  if (detailState.page > 0) {{ detailState.page--; }}
+  if (selectedAppId) {{ loadAppDetail(); }} else {{ renderTable(currentRows()); }}
+}});
+const detailNextBtn = document.getElementById('detailNextBtn');
+if (detailNextBtn) detailNextBtn.addEventListener('click', () => {{
+  detailState.page++;
+  if (selectedAppId) {{ loadAppDetail(); }} else {{ renderTable(currentRows()); }}
 }});
 ['appRoiSearch','appRoiKpiStatus','appRoiAction','appRoiRisk','appRoiMin','appRoiMax'].forEach(id => {{
   const el = document.getElementById(id);
@@ -1126,7 +1389,13 @@ if (viewRecommend) {{
     const key = th.dataset.sort;
     if (!key) return;
     if (appRoiSort.key === key) appRoiSort.dir = appRoiSort.dir === 'asc' ? 'desc' : 'asc';
-    else appRoiSort = {{ key, dir: key === 'monthEndRoi' || key === 'roiGap' ? 'asc' : 'desc' }};
+    else appRoiSort = {{
+      key,
+      dir: key === 'monthEndRoi' || key === 'roiGap' || key === 'monthEndRoiStable' || key === 'monthEndRoiPredOnly'
+        || key === 'monthEndRoiFused' || key === 'canonicalLabel'
+        ? 'asc'
+        : 'desc',
+    }};
     renderAppMonthRoiTable();
   }});
 }}
@@ -1139,7 +1408,11 @@ function setActiveView(view) {{
 document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
 const rb = document.getElementById('resetBtn');
 if (rb) rb.addEventListener('click', () => {{
-  document.getElementById('appSel').value = '';
+  selectedAppId = '';
+  _chartAppId = '';
+  document.getElementById('appSelectHint').style.display = 'none';
+  detailState = {{ appId: '', page: 0, limit: 200, total: 0 }};
+  detailSort = {{ key: 'date', dir: 'asc' }};
   document.getElementById('startDate').value = '';
   document.getElementById('endDate').value = '';
   render();
@@ -1637,8 +1910,10 @@ def web_recommendation_dashboard():
 
     function renderTable(rows) {{
       const appHeaders = [
-        'target_day','app_id','mode','actual_spend_last_day','actual_revenue_last_day','planned_total_budget',
-        'month_end_roi_prediction','month_end_spend_prediction','alert_count','roi_dominant_factor',
+        'target_day','app_id','mode','canonical_month_end_roi_source','actual_spend_last_day','actual_revenue_last_day',
+        'planned_total_budget','planned_daily_spend_stable_anchor','planned_daily_spend_pred_only','planned_daily_spend_fused',
+        'month_end_roi_prediction','month_end_roi_stable_anchor','month_end_roi_pred_only','month_end_roi_fused',
+        'month_end_spend_prediction','alert_count','roi_dominant_factor',
         'month_end_roi_prediction_a','month_end_roi_prediction_b','ab_roi_delta_b_minus_a',
         'd1_anchor_raw_mean','d1_anchor_calibrated_mean','top_actions'
       ];
@@ -1851,4 +2126,228 @@ def web_run_status(job_id: str):
             }
         )
     return JSONResponse(content=data)
+
+
+# ── 按应用搜索 + 分页 API ───────────────────────────────────────────
+
+def _resolve_prediction_path(target: str) -> Path | None:
+    root = _repo_root() / "outputs"
+    if target == "roi":
+        roi_dir = _pick_existing(
+            [
+                root / "model_parallel_roi_d1_default_weekly_v3",
+                root / "model_parallel_roi_d1_default_weekly_v2",
+                root / "model_parallel_roi_d1_default_weekly",
+                root / "model_parallel_roi_d1",
+            ]
+        )
+        if roi_dir is None:
+            return None
+        return resolve_roi_predictions_csv(roi_dir)
+    spend_dir = _pick_existing(
+        [
+            root / "model_parallel_spend_t1_target_calendar_calibrated_app",
+            root / "model_parallel_spend_t1_split_online_fusion_script_verified",
+        ]
+    )
+    if spend_dir is None:
+        return None
+    return resolve_spend_predictions_csv(spend_dir)
+
+
+def _compute_chart_data(target: str) -> list[dict] | None:
+    """全量CSV按日期聚合，供前端图表使用（不受行数限制）。"""
+    path = _resolve_prediction_path(target)
+    if path is None or not path.exists():
+        return None
+    date_map: dict[str, dict] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            day = str(r.get("日期", ""))[:10]
+            if not day:
+                continue
+            y = float(r.get("y_true", 0) or 0)
+            p = float(r.get("y_pred_fused", 0) or 0) or float(r.get("y_pred", 0) or 0)
+            if day not in date_map:
+                date_map[day] = {"date": day, "actual": 0.0, "pred": 0.0, "n": 0}
+            date_map[day]["actual"] += y
+            date_map[day]["pred"] += p
+            date_map[day]["n"] += 1
+    result = []
+    for day in sorted(date_map):
+        d = date_map[day]
+        ape = abs((d["actual"] - d["pred"]) / d["actual"]) if d["actual"] > 1e-8 else 0.0
+        result.append({
+            "date": day,
+            "actual": round(d["actual"], 4),
+            "pred": round(d["pred"], 4),
+            "n": d["n"],
+            "ape": round(ape, 6),
+        })
+    return result
+
+
+def _compute_prediction_stats(target: str) -> dict | None:
+    """读取全量预测CSV，计算整体+分应用统计（不受5000行限制）。"""
+    path = _resolve_prediction_path(target)
+    if path is None or not path.exists():
+        return None
+    import numpy as np
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            rows.append(r)
+    if not rows:
+        return None
+    app_stats: dict[str, dict] = {}
+    all_y, all_p = [], []
+    for r in rows:
+        y = float(r.get("y_true", 0) or 0)
+        p = float(r.get("y_pred_fused", 0) or 0) or float(r.get("y_pred", 0) or 0)
+        all_y.append(y)
+        all_p.append(p)
+        app_id = str(r.get("应用ID", "")).strip()
+        if not app_id:
+            continue
+        if app_id not in app_stats:
+            app_stats[app_id] = {"y": [], "p": [], "app_id": app_id}
+        app_stats[app_id]["y"].append(y)
+        app_stats[app_id]["p"].append(p)
+
+    y_arr = np.array(all_y)
+    p_arr = np.array(all_p)
+    mae = float(np.mean(np.abs(y_arr - p_arr)))
+    rmse = float(np.sqrt(np.mean((y_arr - p_arr) ** 2)))
+    mask = y_arr > 1e-8
+    mape = float(np.mean(np.abs((y_arr[mask] - p_arr[mask]) / y_arr[mask]))) if mask.any() else 0.0
+
+    app_list = []
+    for app_id, s in app_stats.items():
+        ya = np.array(s["y"])
+        pa = np.array(s["p"])
+        amae = float(np.mean(np.abs(ya - pa)))
+        amask = ya > 1e-8
+        amape = float(np.mean(np.abs((ya[amask] - pa[amask]) / ya[amask]))) if amask.any() else 0.0
+        arms = float(np.sqrt(np.mean((ya - pa) ** 2)))
+        app_list.append({
+            "app_id": app_id,
+            "mae": round(amae, 4),
+            "rmse": round(arms, 4),
+            "mape": round(amape, 4),
+            "mape_pct": round(amape * 100, 2),
+            "samples": len(s["y"]),
+        })
+    app_list.sort(key=lambda x: x["mape"])
+    return {
+        "overall": {"mae": round(mae, 4), "rmse": round(rmse, 4), "mape": round(mape, 4), "mape_pct": round(mape * 100, 2), "samples": len(rows), "apps": len(app_list)},
+        "apps": app_list,
+    }
+
+
+@router.get("/web/data/{target}/stats")
+def web_prediction_stats(target: str):
+    stats = _compute_prediction_stats(target)
+    if stats is None:
+        return JSONResponse(status_code=404, content={"error": f"未找到 {target} 预测文件"})
+    return JSONResponse(content=stats["overall"])
+
+
+@router.get("/web/data/{target}/apps")
+def web_prediction_apps(target: str):
+    stats = _compute_prediction_stats(target)
+    if stats is None:
+        return JSONResponse(status_code=404, content={"error": f"未找到 {target} 预测文件"})
+    return JSONResponse(content=stats["apps"])
+
+
+@router.get("/web/data/{target}/app/{app_id}")
+def web_prediction_app_detail(target: str, app_id: str, offset: int = 0, limit: int = 200):
+    path = _resolve_prediction_path(target)
+    if path is None or not path.exists():
+        return JSONResponse(status_code=404, content={"error": f"未找到 {target} 预测文件"})
+    # spend 模式：预加载 baseline 对照数据
+    baseline_map = {}
+    calendar_map = {}
+    if target == "spend":
+        root = _repo_root() / "outputs"
+        old_spend_path = root / "model_parallel_spend_t1_split_online_fusion_script_verified" / "predictions_reconciled.csv"
+        if old_spend_path.exists():
+            with old_spend_path.open("r", encoding="utf-8-sig", newline="") as bf:
+                for br in csv.DictReader(bf):
+                    key = f"{str(br.get('日期', ''))[:10]}|{str(br.get('应用ID', '')).strip()}"
+                    baseline_map[key] = {
+                        "pred": float(br.get("y_pred_fused", 0) or 0) or float(br.get("y_pred", 0) or 0),
+                    }
+        calendar = CalendarService()
+        calendar_map = {}  # date_str -> {target_date, day_type, ...}
+    app_rows = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if str(r.get("应用ID", "")).strip() == app_id:
+                y = float(r.get("y_true", 0) or 0)
+                p = float(r.get("y_pred_fused", 0) or 0) or float(r.get("y_pred", 0) or 0)
+                day_text = str(r.get("日期", ""))[:10]
+                row = {
+                    "日期": day_text,
+                    "应用ID": app_id,
+                    "y_true": round(y, 4),
+                    "y_pred": round(p, 4),
+                    "model": r.get("model", ""),
+                }
+                if target == "spend":
+                    bk = baseline_map.get(f"{day_text}|{app_id}", {})
+                    old_pred = bk.get("pred")
+                    row["y_pred_old"] = round(old_pred, 2) if old_pred is not None else None
+                    day = datetime.fromisoformat(day_text).date()
+                    target_day = day + timedelta(days=1)
+                    tfeat = calendar.features_for_day(target_day)
+                    flags = []
+                    if tfeat.get("holiday_display_name"):
+                        flags.append(tfeat["holiday_display_name"])
+                    if tfeat.get("is_last_holiday_day"):
+                        flags.append("假期最后一天")
+                    if tfeat.get("is_first_workday_after_holiday"):
+                        flags.append("节后首个工作日")
+                    row["target_date"] = target_day.isoformat()
+                    row["calendar_label"] = " / ".join(flags) or tfeat.get("day_type", "-")
+                app_rows.append(row)
+    app_rows.sort(key=lambda x: x["日期"])
+    total = len(app_rows)
+    page = app_rows[offset : offset + limit]
+    return JSONResponse(content={"rows": page, "total": total, "offset": offset, "limit": limit})
+
+
+@router.get("/web/data/{target}/app/{app_id}/chart")
+def web_prediction_app_chart(target: str, app_id: str):
+    """单个应用全量日期聚合，供前端图表使用。"""
+    path = _resolve_prediction_path(target)
+    if path is None or not path.exists():
+        return JSONResponse(status_code=404, content={"error": f"未找到 {target} 预测文件"})
+    date_map: dict[str, dict] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if str(r.get("应用ID", "")).strip() != app_id:
+                continue
+            day = str(r.get("日期", ""))[:10]
+            if not day:
+                continue
+            y = float(r.get("y_true", 0) or 0)
+            p = float(r.get("y_pred_fused", 0) or 0) or float(r.get("y_pred", 0) or 0)
+            if day not in date_map:
+                date_map[day] = {"date": day, "actual": 0.0, "pred": 0.0, "n": 0}
+            date_map[day]["actual"] += y
+            date_map[day]["pred"] += p
+            date_map[day]["n"] += 1
+    result = []
+    for day in sorted(date_map):
+        d = date_map[day]
+        ape = abs((d["actual"] - d["pred"]) / d["actual"]) if d["actual"] > 1e-8 else 0.0
+        result.append({
+            "date": day,
+            "actual": round(d["actual"], 4),
+            "pred": round(d["pred"], 4),
+            "n": d["n"],
+            "ape": round(ape, 6),
+        })
+    return JSONResponse(content=result)
 

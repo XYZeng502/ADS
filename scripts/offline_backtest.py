@@ -5,9 +5,10 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Deque, Dict, List, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from app.config import settings
+from app.prediction_artifacts import resolve_roi_predictions_csv, resolve_spend_predictions_csv
 from app.schemas import ClientContext, ProductSlotMetrics, ProductState
 from app.services.orchestrator import DailyOrchestrator
 from app.services.risk import RiskService
@@ -15,6 +16,8 @@ from app.services.risk import RiskService
 
 DEFAULT_KPI = 1.05
 DEFAULT_M30 = 1.44
+
+_APP_LAST_DAY_CANONICAL_ROI_CHOICES = ("stable", "pred_only", "fused")
 
 
 def _run_with_d1_calibration(orchestrator: DailyOrchestrator, context: ClientContext, enabled: bool):
@@ -118,6 +121,110 @@ def _quantile(values: List[float], q: float) -> float:
     ordered = sorted(values)
     idx = min(max(int(round((len(ordered) - 1) * q)), 0), len(ordered) - 1)
     return ordered[idx]
+
+
+def _pick_existing(paths: List[Path]) -> Optional[Path]:
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
+
+def _safe_date(s: str) -> Optional[date]:
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _load_t1_prediction_rows(target: str) -> List[Dict[str, str]]:
+    """
+    读取预测模块输出（roi/spend），用于校准月末ROI输入。
+    target: "roi" or "spend"
+    """
+    root = Path("outputs")
+    if target == "roi":
+        roi_dir = _pick_existing(
+            [
+                root / "model_parallel_roi_d1_default_weekly_v3",
+                root / "model_parallel_roi_d1_default_weekly_v2",
+                root / "model_parallel_roi_d1_default_weekly",
+                root / "model_parallel_roi_d1",
+            ]
+        )
+        if roi_dir is None:
+            return []
+        pred_path = resolve_roi_predictions_csv(roi_dir) or Path("__missing__")
+    else:
+        spend_dir = _pick_existing(
+            [
+                root / "model_parallel_spend_t1_target_calendar_calibrated_app",
+                root / "model_parallel_spend_t1_split_online_fusion_script_verified",
+                root / "model_parallel_spend_t1",
+            ]
+        )
+        if spend_dir is None:
+            return []
+        pred_path = resolve_spend_predictions_csv(spend_dir) or Path("__missing__")
+
+    if not pred_path.exists():
+        return []
+    try:
+        with pred_path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return rows
+    except Exception:
+        return []
+
+
+def _build_app_calibration_from_predictions(
+    rows: List[Dict[str, str]],
+    target_day: date,
+    *,
+    pred_keys: List[str],
+    true_key: str = "y_true",
+    app_key: str = "应用ID",
+    lookback_days: int = 14,
+    min_points: int = 3,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    返回：
+    - app_bias_factor: 历史真实/预测 比值（用于校准）
+    - app_t1_pred: 当天（date==target_day）预测值（用于融合）
+    """
+    by_app_hist: Dict[str, List[Tuple[date, float, float]]] = defaultdict(list)
+    app_t1_pred: Dict[str, float] = {}
+    pred_source_day = target_day - timedelta(days=1)
+    start_day = pred_source_day - timedelta(days=lookback_days)
+
+    for r in rows:
+        app_id = str(r.get(app_key, "")).strip()
+        d = _safe_date(str(r.get("日期", "")))
+        if not app_id or d is None:
+            continue
+        pred = 0.0
+        for k in pred_keys:
+            val = to_float(r.get(k, "0"))
+            if val > 0:
+                pred = val
+                break
+        true_v = to_float(r.get(true_key, "0"))
+        # 预测模块按 d -> d+1 组织，目标日 target_day 对应记录日期应为 target_day-1
+        if d == pred_source_day and pred > 0:
+            app_t1_pred[app_id] = pred
+        # 历史偏差只用更早窗口，避免把目标日同日标签信息带入校准
+        if d < pred_source_day and d >= start_day and pred > 0 and true_v > 0:
+            by_app_hist[app_id].append((d, true_v, pred))
+
+    app_bias_factor: Dict[str, float] = {}
+    for app_id, hist in by_app_hist.items():
+        if len(hist) < min_points:
+            continue
+        ratios = sorted([max(min(t / p, 1.35), 0.65) for _, t, p in hist if p > 0 and t > 0])
+        if not ratios:
+            continue
+        app_bias_factor[app_id] = _quantile(ratios, 0.5)
+    return app_bias_factor, app_t1_pred
 
 
 def _stable_app_future_d1_roi(
@@ -568,6 +675,11 @@ def run_backtest(csv_path: Path, output_dir: Path, kpi: float) -> Dict:
 
 
 def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: float) -> Dict:
+    if settings.app_last_day_canonical_month_end_roi not in _APP_LAST_DAY_CANONICAL_ROI_CHOICES:
+        raise ValueError(
+            f"app_last_day_canonical_month_end_roi 必须是 {_APP_LAST_DAY_CANONICAL_ROI_CHOICES} 之一，"
+            f"当前为 {settings.app_last_day_canonical_month_end_roi!r}"
+        )
     orchestrator = DailyOrchestrator()
     risk = RiskService()
 
@@ -588,6 +700,18 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
     else:
         month_end_dt = date(month_start_dt.year, month_start_dt.month + 1, 1) - timedelta(days=1)
     release_curve = _load_release_multiplier_curve()
+    roi_pred_rows = _load_t1_prediction_rows("roi")
+    spend_pred_rows = _load_t1_prediction_rows("spend")
+    roi_bias, roi_t1_pred = _build_app_calibration_from_predictions(
+        roi_pred_rows,
+        target_day=target_day_dt,
+        pred_keys=["y_pred"],
+    )
+    spend_bias, spend_t1_pred = _build_app_calibration_from_predictions(
+        spend_pred_rows,
+        target_day=target_day_dt,
+        pred_keys=["y_pred_fused", "y_pred"],
+    )
 
     # 训练统计（应用维度：同一应用下全部广告主统一建模）
     slot_stats = defaultdict(lambda: {"spend": 0.0, "d1": 0.0, "d30": 0.0, "max_spend": 0.0, "days": 0})
@@ -742,24 +866,44 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
         )
         all_alerts = [a.model_dump() for a in plan.alerts] + [a.model_dump() for a in extra_alerts]
         top_suggestions = sorted(plan.suggestions, key=lambda x: x.suggested_budget, reverse=True)[:8]
+        solver_budget_b = round(sum(x.suggested_budget for x in plan_b.suggestions), 2)
         planned_total_budget = round(sum(x.suggested_budget for x in plan.suggestions), 2)
         planned_d1_total = sum(x.expected_d1_revenue for x in plan.suggestions)
         planned_d1_roi = planned_d1_total / planned_total_budget if planned_total_budget > 0 else 0.0
-        app_future_d1_roi = _stable_app_future_d1_roi(
+        spend_pred_calibrated = spend_t1_pred.get(app_id, 0.0) * spend_bias.get(app_id, 1.0)
+        stable_app_future_d1_roi = _stable_app_future_d1_roi(
             app_id=app_id,
             month_start=month_start_dt,
             target_day=target_day_dt,
             historical_daily=app_daily_history,
         )
-        month_end_d1_roi = app_future_d1_roi if app_future_d1_roi > 0 else planned_d1_roi
+        roi_pred_calibrated = roi_t1_pred.get(app_id, 0.0) * roi_bias.get(app_id, 1.0)
+        stable_anchor_d1_roi = (
+            stable_app_future_d1_roi if stable_app_future_d1_roi > 0 else planned_d1_roi
+        )
+        fused_budget = solver_budget_b
+        if spend_pred_calibrated > 0:
+            fused_budget = round(max(0.65 * solver_budget_b + 0.35 * spend_pred_calibrated, 0.0), 2)
+        fused_app_future_d1_roi = stable_app_future_d1_roi
+        if roi_pred_calibrated > 0:
+            fused_app_future_d1_roi = 0.75 * stable_app_future_d1_roi + 0.25 * roi_pred_calibrated
+        month_end_d1_roi = fused_app_future_d1_roi if fused_app_future_d1_roi > 0 else planned_d1_roi
+        pred_only_daily_spend = (
+            round(max(spend_pred_calibrated, 0.0), 2)
+            if spend_pred_calibrated > 0
+            else solver_budget_b
+        )
+        pred_only_d1_roi = (
+            roi_pred_calibrated if roi_pred_calibrated > 0 else stable_anchor_d1_roi
+        )
 
-        # 用cohort增量口径重算月末ROI（替代启发式月末ROI）
+        # ① 稳定锚点：求解器(B)日耗 + 仅历史稳定 D1 锚点
         (
-            month_end_spend_cohort,
-            month_end_revenue_cohort,
-            month_end_roi_cohort,
-            month_end_roi_30d_total,
-            cross_month_carryover_revenue,
+            month_end_spend_cohort_stable,
+            month_end_revenue_cohort_stable,
+            month_end_roi_cohort_stable,
+            month_end_roi_30d_total_stable,
+            cross_month_carryover_revenue_stable,
         ) = _month_end_incremental_roi_for_app(
             app_id=app_id,
             month_start=month_start_dt,
@@ -767,8 +911,26 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             target_day=target_day_dt,
             month_spend_before_target=month_spend_so_far[app_id],
             historical_daily=app_daily_history,
-            planned_daily_spend=planned_total_budget,
-            planned_d1_roi=month_end_d1_roi,
+            planned_daily_spend=solver_budget_b,
+            planned_d1_roi=stable_anchor_d1_roi,
+            curve=release_curve,
+        )
+        # ② 纯预测模块：T+1 spend/roi_d1 校准值作为未来日耗与 D1（无 spend 预测时无法定义「纯预测日耗」，回退求解器日耗）
+        (
+            month_end_spend_cohort_pred_only,
+            month_end_revenue_cohort_pred_only,
+            month_end_roi_cohort_pred_only,
+            month_end_roi_30d_total_pred_only,
+            cross_month_carryover_revenue_pred_only,
+        ) = _month_end_incremental_roi_for_app(
+            app_id=app_id,
+            month_start=month_start_dt,
+            month_end=month_end_dt,
+            target_day=target_day_dt,
+            month_spend_before_target=month_spend_so_far[app_id],
+            historical_daily=app_daily_history,
+            planned_daily_spend=pred_only_daily_spend,
+            planned_d1_roi=pred_only_d1_roi,
             curve=release_curve,
         )
         (
@@ -801,17 +963,92 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             target_day=target_day_dt,
             month_spend_before_target=month_spend_so_far[app_id],
             historical_daily=app_daily_history,
-            planned_daily_spend=round(sum(x.suggested_budget for x in plan_b.suggestions), 2),
+            planned_daily_spend=solver_budget_b,
             planned_d1_roi=month_end_d1_roi,
             curve=release_curve,
         )
+        # ③ 融合：保守加权（与既有线上实验一致）
+        (
+            month_end_spend_cohort_fused,
+            month_end_revenue_cohort_fused,
+            month_end_roi_cohort_fused,
+            month_end_roi_30d_total_fused,
+            cross_month_carryover_revenue_fused,
+        ) = _month_end_incremental_roi_for_app(
+            app_id=app_id,
+            month_start=month_start_dt,
+            month_end=month_end_dt,
+            target_day=target_day_dt,
+            month_spend_before_target=month_spend_so_far[app_id],
+            historical_daily=app_daily_history,
+            planned_daily_spend=fused_budget,
+            planned_d1_roi=month_end_d1_roi,
+            curve=release_curve,
+        )
+
+        _canon = settings.app_last_day_canonical_month_end_roi
+        if _canon == "stable":
+            month_end_spend_cohort_c = month_end_spend_cohort_stable
+            month_end_revenue_cohort_c = month_end_revenue_cohort_stable
+            month_end_roi_cohort_c = month_end_roi_cohort_stable
+            month_end_roi_30d_total_c = month_end_roi_30d_total_stable
+            cross_month_carryover_revenue_c = cross_month_carryover_revenue_stable
+            planned_total_budget = solver_budget_b
+            app_future_d1_roi = stable_anchor_d1_roi
+        elif _canon == "pred_only":
+            month_end_spend_cohort_c = month_end_spend_cohort_pred_only
+            month_end_revenue_cohort_c = month_end_revenue_cohort_pred_only
+            month_end_roi_cohort_c = month_end_roi_cohort_pred_only
+            month_end_roi_30d_total_c = month_end_roi_30d_total_pred_only
+            cross_month_carryover_revenue_c = cross_month_carryover_revenue_pred_only
+            planned_total_budget = pred_only_daily_spend
+            app_future_d1_roi = pred_only_d1_roi
+        else:
+            month_end_spend_cohort_c = month_end_spend_cohort_fused
+            month_end_revenue_cohort_c = month_end_revenue_cohort_fused
+            month_end_roi_cohort_c = month_end_roi_cohort_fused
+            month_end_roi_30d_total_c = month_end_roi_30d_total_fused
+            cross_month_carryover_revenue_c = cross_month_carryover_revenue_fused
+            planned_total_budget = fused_budget
+            app_future_d1_roi = fused_app_future_d1_roi
+
+        month_end_roi_triad = {
+            "canonical": settings.app_last_day_canonical_month_end_roi,
+            "stable_anchor": {
+                "planned_daily_spend": solver_budget_b,
+                "planned_d1_roi": round(stable_anchor_d1_roi, 4),
+                "month_end_roi_prediction": round(month_end_roi_cohort_stable, 4),
+                "month_end_spend_prediction": round(month_end_spend_cohort_stable, 2),
+                "month_end_revenue_prediction": round(month_end_revenue_cohort_stable, 2),
+                "month_end_roi_30d_total": round(month_end_roi_30d_total_stable, 4),
+                "cross_month_carryover_revenue": round(cross_month_carryover_revenue_stable, 2),
+            },
+            "pred_module_only": {
+                "planned_daily_spend": pred_only_daily_spend,
+                "planned_d1_roi": round(pred_only_d1_roi, 4),
+                "month_end_roi_prediction": round(month_end_roi_cohort_pred_only, 4),
+                "month_end_spend_prediction": round(month_end_spend_cohort_pred_only, 2),
+                "month_end_revenue_prediction": round(month_end_revenue_cohort_pred_only, 2),
+                "month_end_roi_30d_total": round(month_end_roi_30d_total_pred_only, 4),
+                "cross_month_carryover_revenue": round(cross_month_carryover_revenue_pred_only, 2),
+            },
+            "fused": {
+                "planned_daily_spend": fused_budget,
+                "planned_d1_roi": round(month_end_d1_roi, 4),
+                "month_end_roi_prediction": round(month_end_roi_cohort_fused, 4),
+                "month_end_spend_prediction": round(month_end_spend_cohort_fused, 2),
+                "month_end_revenue_prediction": round(month_end_revenue_cohort_fused, 2),
+                "month_end_roi_30d_total": round(month_end_roi_30d_total_fused, 4),
+                "cross_month_carryover_revenue": round(cross_month_carryover_revenue_fused, 2),
+            },
+        }
         app_roi_attr = _app_month_roi_attribution(
             app_id=app_id,
             month_start=month_start_dt,
             target_day=target_day_dt,
-            month_end_spend=month_end_spend_cohort_b,
-            month_end_revenue=month_end_revenue_cohort_b,
-            cross_month_carryover_revenue=cross_month_carryover_revenue_b,
+            month_end_spend=month_end_spend_cohort_c,
+            month_end_revenue=month_end_revenue_cohort_c,
+            cross_month_carryover_revenue=cross_month_carryover_revenue_c,
             planned_daily_spend=planned_total_budget,
             app_future_d1_roi=app_future_d1_roi,
             historical_daily=app_daily_history,
@@ -823,16 +1060,23 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "target_day": target_day,
                 "app_id": app_id,
                 "mode": plan.mode,
+                "canonical_month_end_roi_source": settings.app_last_day_canonical_month_end_roi,
                 "actual_spend_last_day": round(target_actual[app_id]["spend"], 2),
                 "actual_revenue_last_day": round(target_actual[app_id]["revenue"], 2),
                 "planned_total_budget": planned_total_budget,
-                "month_end_roi_prediction": round(month_end_roi_cohort_b, 4),
-                "month_end_spend_prediction": round(month_end_spend_cohort_b, 2),
+                "planned_daily_spend_stable_anchor": solver_budget_b,
+                "planned_daily_spend_pred_only": pred_only_daily_spend,
+                "planned_daily_spend_fused": fused_budget,
+                "month_end_roi_prediction": round(month_end_roi_cohort_c, 4),
+                "month_end_roi_stable_anchor": round(month_end_roi_cohort_stable, 4),
+                "month_end_roi_pred_only": round(month_end_roi_cohort_pred_only, 4),
+                "month_end_roi_fused": round(month_end_roi_cohort_fused, 4),
+                "month_end_spend_prediction": round(month_end_spend_cohort_c, 2),
                 "month_end_roi_prediction_a": round(month_end_roi_cohort_a, 4),
                 "month_end_roi_prediction_b": round(month_end_roi_cohort_b, 4),
                 "ab_roi_delta_b_minus_a": round(month_end_roi_cohort_b - month_end_roi_cohort_a, 4),
-                "month_end_roi_30d_total": round(month_end_roi_30d_total_b, 4),
-                "cross_month_carryover_revenue": round(cross_month_carryover_revenue_b, 2),
+                "month_end_roi_30d_total": round(month_end_roi_30d_total_c, 4),
+                "cross_month_carryover_revenue": round(cross_month_carryover_revenue_c, 2),
                 "alert_count": len(all_alerts),
                 "roi_dominant_factor": app_roi_attr["dominant_factor"],
                 "roi_spend_factor_score": app_roi_attr["spend_factor_score"],
@@ -841,6 +1085,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "d1_anchor_raw_mean": round(plan.d1_anchor_raw_mean, 4),
                 "d1_anchor_calibrated_mean": round(plan.d1_anchor_calibrated_mean, 4),
                 "app_future_d1_roi": round(app_future_d1_roi, 4),
+                "spend_t1_pred_calibrated": round(spend_pred_calibrated, 2),
+                "roi_d1_t1_pred_calibrated": round(roi_pred_calibrated, 4),
                 "top_actions": top_actions,
             }
         )
@@ -850,11 +1096,15 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "target_day": target_day,
                 "app_id": app_id,
                 "mode": plan.mode,
-                "month_end_roi_prediction": round(month_end_roi_cohort_b, 4),
-                "month_end_spend_prediction": round(month_end_spend_cohort_b, 2),
-                "month_end_revenue_prediction": round(month_end_revenue_cohort_b, 2),
-                "month_end_roi_30d_total": round(month_end_roi_30d_total_b, 4),
-                "cross_month_carryover_revenue": round(cross_month_carryover_revenue_b, 2),
+                "canonical_month_end_roi_source": settings.app_last_day_canonical_month_end_roi,
+                "month_end_roi_prediction": round(month_end_roi_cohort_c, 4),
+                "month_end_roi_stable_anchor": round(month_end_roi_cohort_stable, 4),
+                "month_end_roi_pred_only": round(month_end_roi_cohort_pred_only, 4),
+                "month_end_roi_fused": round(month_end_roi_cohort_fused, 4),
+                "month_end_spend_prediction": round(month_end_spend_cohort_c, 2),
+                "month_end_revenue_prediction": round(month_end_revenue_cohort_c, 2),
+                "month_end_roi_30d_total": round(month_end_roi_30d_total_c, 4),
+                "cross_month_carryover_revenue": round(cross_month_carryover_revenue_c, 2),
                 "ab_compare": {
                     "A_raw_anchor": {
                         "month_end_roi_prediction": round(month_end_roi_cohort_a, 4),
@@ -876,6 +1126,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                     },
                     "roi_delta_b_minus_a": round(month_end_roi_cohort_b - month_end_roi_cohort_a, 4),
                 },
+                "month_end_roi_triad": month_end_roi_triad,
                 "today_history_revenue_estimate": plan.today_history_revenue_estimate,
                 "actual_spend_last_day": round(target_actual[app_id]["spend"], 2),
                 "actual_revenue_last_day": round(target_actual[app_id]["revenue"], 2),
@@ -885,6 +1136,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "d1_anchor_raw_mean": round(plan.d1_anchor_raw_mean, 4),
                 "d1_anchor_calibrated_mean": round(plan.d1_anchor_calibrated_mean, 4),
                 "app_future_d1_roi": round(app_future_d1_roi, 4),
+                "spend_t1_pred_calibrated": round(spend_pred_calibrated, 2),
+                "roi_d1_t1_pred_calibrated": round(roi_pred_calibrated, 4),
                 "roi_forecast_attribution": app_roi_attr,
                 "alerts": all_alerts,
                 "top_suggestions": [s.model_dump() for s in top_suggestions],
@@ -900,6 +1153,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
         "train_days": len(train_days),
         "target_day": target_day,
         "kpi": kpi,
+        "canonical_month_end_roi_source": settings.app_last_day_canonical_month_end_roi,
         "predicted_apps": len(predictions),
         "avg_predicted_month_end_roi": round(
             (sum(p["month_end_roi_prediction"] for p in predictions) / len(predictions)) if predictions else 0.0, 4
@@ -914,6 +1168,23 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             "A_raw_anchor_avg_month_end_roi": round(avg_roi_a, 4),
             "B_calibrated_anchor_avg_month_end_roi": round(avg_roi_b, 4),
             "roi_delta_b_minus_a": round(avg_roi_b - avg_roi_a, 4),
+        },
+        "month_end_roi_triad_summary": {
+            "avg_stable_anchor": round(
+                (sum(p["month_end_roi_stable_anchor"] for p in predictions) / len(predictions))
+                if predictions
+                else 0.0,
+                4,
+            ),
+            "avg_pred_only": round(
+                (sum(p["month_end_roi_pred_only"] for p in predictions) / len(predictions))
+                if predictions
+                else 0.0,
+                4,
+            ),
+            "avg_fused": round(
+                (sum(p["month_end_roi_fused"] for p in predictions) / len(predictions)) if predictions else 0.0, 4
+            ),
         },
         "avg_d1_anchor_raw_mean": round(
             (sum(p["d1_anchor_raw_mean"] for p in predictions) / len(predictions)) if predictions else 0.0, 4
@@ -938,7 +1209,14 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "actual_spend_last_day",
                 "actual_revenue_last_day",
                 "planned_total_budget",
+                "canonical_month_end_roi_source",
+                "planned_daily_spend_stable_anchor",
+                "planned_daily_spend_pred_only",
+                "planned_daily_spend_fused",
                 "month_end_roi_prediction",
+                "month_end_roi_stable_anchor",
+                "month_end_roi_pred_only",
+                "month_end_roi_fused",
                 "month_end_spend_prediction",
                 "month_end_roi_prediction_a",
                 "month_end_roi_prediction_b",
@@ -953,6 +1231,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "d1_anchor_raw_mean",
                 "d1_anchor_calibrated_mean",
                 "app_future_d1_roi",
+                "spend_t1_pred_calibrated",
+                "roi_d1_t1_pred_calibrated",
                 "top_actions",
             ],
         )

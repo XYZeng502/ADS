@@ -50,6 +50,8 @@ class Settings(BaseModel):
     # 与离线脚本稳定口径对齐：求解器对产品内各版位/槽位的「参考 D1」用消耗加权，
     # 与 `_weighted_slot_pred_d1`、月末组合锚点逻辑一致。「arithmetic_mean」保留旧算术平均，便于逐项对比误差。
     solver_slot_d1_normalize_mode: Literal["spend_weighted", "arithmetic_mean"] = "spend_weighted"
+    # 应用级回放/推荐表主用的「月末 ROI」cohort 口径（与 offline_backtest 三条分支对齐，只改此处即可）。
+    app_last_day_canonical_month_end_roi: Literal["stable", "pred_only", "fused"] = "fused"
 
 
 settings = Settings()

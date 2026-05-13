@@ -11,6 +11,8 @@ import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+from app.prediction_artifacts import validate_merged_daily_csv
+
 try:
     from lightgbm import LGBMRegressor
 except Exception:  # pragma: no cover
@@ -136,22 +138,25 @@ def _is_summer_winter_break(d: date) -> int:
     return 1 if d.month in (1, 2, 7, 8) else 0
 
 
-def _build_app_daily(input_csv: str) -> pd.DataFrame:
-    raw = pd.read_csv(input_csv, encoding="utf-8-sig")
-    raw["日期"] = pd.to_datetime(raw["日期"], errors="coerce")
-    raw = raw[raw["日期"].notna()].copy()
+def _build_app_daily(
+    input_csv: str,
+    min_spend_train: float = 0.0,
+    min_app_history_days: int = 0,
+) -> pd.DataFrame:
+    from app.data_cleaning import clean, to_app_daily as _to_app_daily, validate_columns as _validate_cols
 
-    for c in ["消耗金额", "首日广告收入", "曝光量", "点击量", "下载量", "激活人数(快应用新增用户数)"]:
-        raw[c] = pd.to_numeric(raw[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        raw[c] = raw[c].clip(lower=0.0)
+    raw = clean(Path(input_csv))
+    app_day = _to_app_daily(raw)
+    _validate_cols(app_day)
 
-    app_day = (
-        raw.groupby(["应用ID", "日期"], as_index=False)[
-            ["消耗金额", "首日广告收入", "曝光量", "点击量", "下载量", "激活人数(快应用新增用户数)"]
-        ]
-        .sum()
-        .sort_values(["应用ID", "日期"])
-    )
+    # 清洗：过滤低消耗样本（ROI 噪声极大）
+    if min_spend_train > 0:
+        app_day = app_day[app_day["消耗金额"] >= min_spend_train].copy()
+    # 清洗：过滤历史天数不足的应用（ROI 不稳定）
+    if min_app_history_days > 0:
+        day_counts = app_day.groupby("应用ID")["日期"].nunique()
+        keep_apps = day_counts[day_counts >= min_app_history_days].index
+        app_day = app_day[app_day["应用ID"].isin(keep_apps)].copy()
 
     app_day["roi_d1"] = np.where(app_day["消耗金额"] > 0, app_day["首日广告收入"] / app_day["消耗金额"], np.nan)
     app_day["act_per_spend"] = np.where(
@@ -464,6 +469,16 @@ def _tree_predict_log(
         model.fit(x_train, y_train)
     pred_log = model.predict(x_test)
     pred = _from_log1p(pred_log)
+
+    # Duan's smearing: log-transform 还原偏差校正
+    if len(train) > 10:
+        train_pred_log = model.predict(x_train)
+        train_residuals_log = y_train.to_numpy() - train_pred_log
+        smearing = float(np.mean(np.exp(train_residuals_log)))
+        # smearing 应接近 1.0；偏离过大说明 log 空间拟合差，不强制校正
+        if 0.8 <= smearing <= 1.25:
+            pred = pred * smearing
+
     pred = np.clip(pred, a_min=0.0, a_max=None)
     return pd.DataFrame(
         {
@@ -982,12 +997,19 @@ def main() -> None:
     )
     parser.add_argument("--retune-frequency-days", type=int, default=7, help="自动重寻参频率（天），默认每7天")
     parser.add_argument("--use-date-bucket-models", action="store_true", help="并行增加日期分桶模型分支")
+    parser.add_argument("--min-spend-train", type=float, default=0.0, help="训练最低日消耗阈值（如 5 可过滤噪声 ROI 样本）")
+    parser.add_argument("--min-app-history-days", type=int, default=0, help="应用最少历史天数（如 20 可过滤稀疏应用）")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    app_daily = _build_app_daily(args.input)
+    validate_merged_daily_csv(Path(args.input))
+    app_daily = _build_app_daily(
+        args.input,
+        min_spend_train=args.min_spend_train,
+        min_app_history_days=args.min_app_history_days,
+    )
     app_daily = _add_lags(app_daily, lags=[1, 2, 3, 7])
 
     selected_tree_models = [m.strip() for m in str(args.models).split(",") if m.strip()]
@@ -1040,6 +1062,8 @@ def main() -> None:
 
     report = {
         "target": "T+1 roi_d1",
+        "min_spend_train": float(args.min_spend_train),
+        "min_app_history_days": int(args.min_app_history_days),
         "include_log_target": bool(args.use_log_target),
         "include_hard_sample_weight": bool(args.use_hard_sample_weight),
         "include_split_models": bool(args.use_split_models),
