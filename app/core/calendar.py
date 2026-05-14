@@ -4,6 +4,12 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
+from chinese_calendar import (
+    is_holiday as _cn_is_holiday,
+    is_in_lieu as _cn_is_in_lieu,
+    is_workday as _cn_is_workday,
+)
+
 from app.schemas import DayType
 
 
@@ -66,14 +72,19 @@ class CalendarService:
         return None
 
     def is_holiday(self, day: date) -> bool:
+        # 法定假日窗口内（JSON 定义的假期区间）
         return self.holiday_window(day) is not None
 
     def is_adjusted_workday(self, day: date) -> bool:
-        return day in self._adjusted_workdays
+        # 调休上班日：周末/假期但 chinese_calendar 标记为工作日
+        return (day.weekday() >= 5 and _cn_is_workday(day)) or day in self._adjusted_workdays
+
+    def is_rest_day(self, day: date) -> bool:
+        # 任何休息日（周末+法定假日，排除调休上班）
+        return _cn_is_holiday(day) and not self.is_adjusted_workday(day)
 
     def classify_day(self, day: date) -> DayType:
-        # 优先级：节假日 > 电商节 > 寒暑假 > 周末 > 工作日
-        # 这样可避免节假日被“周末/寒暑假”覆盖
+        # 优先级：调休上班 > 法定假日 > 电商节 > 寒暑假 > 周末 > 工作日
         if self.is_adjusted_workday(day):
             return "workday"
         if self.is_holiday(day):
@@ -121,12 +132,16 @@ class CalendarService:
             "holiday_name": window.name if window else "",
             "holiday_display_name": window.display_name if window else "",
             "is_holiday": int(window is not None),
+            "is_rest_day": int(self.is_rest_day(day)),
             "is_adjusted_workday": int(self.is_adjusted_workday(day)),
+            "is_weekend": int(day.weekday() >= 5),
             "holiday_seq_index": holiday_seq_index,
             "holiday_days_remaining": holiday_days_remaining,
             "holiday_window_len": holiday_window_len,
             "is_last_holiday_day": int(window is not None and day == window.end),
-            "is_first_workday_after_holiday": int(not self.is_holiday(day) and self.is_holiday(day - timedelta(days=1))),
+            "is_first_workday_after_holiday": int(
+                _cn_is_workday(day) and self.is_holiday(day - timedelta(days=1))
+            ),
             "days_to_next_holiday": min(self.days_to_next_holiday(day), 30),
             "days_since_prev_holiday": min(self.days_since_prev_holiday(day), 30),
         }

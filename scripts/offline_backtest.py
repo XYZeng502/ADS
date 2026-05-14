@@ -158,6 +158,7 @@ def _load_t1_prediction_rows(target: str) -> List[Dict[str, str]]:
     else:
         spend_dir = _pick_existing(
             [
+                root / "model_parallel_spend_t1_v4",
                 root / "model_parallel_spend_t1_target_calendar_calibrated_app",
                 root / "model_parallel_spend_t1_split_online_fusion_script_verified",
                 root / "model_parallel_spend_t1",
@@ -756,6 +757,12 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "d1_roi": (app_day_rev / app_day_spend) if app_day_spend > 0 else 0.0,
             }
 
+    # 统计每个应用的训练天数（用于剔除样本过少的不成熟应用）
+    app_train_days: Dict[str, int] = {}
+    for (a_id, _) in app_daily_history:
+        app_train_days[a_id] = app_train_days.get(a_id, 0) + 1
+    min_train_days = max(settings.app_last_day_min_train_days, 1)
+
     # 上一日消耗作为今日波动基线（应用维度）
     prev_slot_spend = defaultdict(float)
     prev_total_spend = defaultdict(float)
@@ -783,6 +790,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
     # 只输出最后一天有投放的应用（每应用仅一条）
     for app_id in sorted(target_actual.keys()):
         if target_actual[app_id]["spend"] <= 0:
+            continue
+        if app_train_days.get(app_id, 0) < min_train_days:
             continue
         product_ids = [
             pid for (a, pid) in product_spend_total.keys() if a == app_id
@@ -1147,6 +1156,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
     output_dir.mkdir(parents=True, exist_ok=True)
     avg_roi_a = (sum(p["ab_compare"]["A_raw_anchor"]["month_end_roi_prediction"] for p in predictions) / len(predictions)) if predictions else 0.0
     avg_roi_b = (sum(p["ab_compare"]["B_calibrated_anchor"]["month_end_roi_prediction"] for p in predictions) / len(predictions)) if predictions else 0.0
+    target_apps_total = len(target_actual)
+    filtered_apps = target_apps_total - len(predictions)
     summary = {
         "task": "app_level_last_day_prediction",
         "input_file": str(csv_path),
@@ -1154,6 +1165,9 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
         "target_day": target_day,
         "kpi": kpi,
         "canonical_month_end_roi_source": settings.app_last_day_canonical_month_end_roi,
+        "min_train_days": min_train_days,
+        "target_apps_total": target_apps_total,
+        "filtered_apps": filtered_apps,
         "predicted_apps": len(predictions),
         "avg_predicted_month_end_roi": round(
             (sum(p["month_end_roi_prediction"] for p in predictions) / len(predictions)) if predictions else 0.0, 4

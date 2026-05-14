@@ -237,6 +237,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     root = _repo_root() / "outputs"
     roi_dir = _pick_existing(
         [
+            root / "model_parallel_roi_d1_v7_aligned",
             root / "model_parallel_roi_d1_default_weekly_v3",
             root / "model_parallel_roi_d1_default_weekly_v2",
             root / "model_parallel_roi_d1_default_weekly",
@@ -245,6 +246,9 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     )
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1_v9_composition",
+            root / "model_parallel_spend_t1_v8_filtered",
+            root / "model_parallel_spend_t1_v4",
             root / "model_parallel_spend_t1_target_calendar_calibrated_app",
             root / "model_parallel_spend_t1_split_online_fusion_script_verified",
         ]
@@ -258,7 +262,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     roi_pred_path = resolve_roi_predictions_csv(roi_dir) if roi_dir else None
     spend_pred_path = resolve_spend_predictions_csv(spend_dir) if spend_dir else None
 
-    spend_predictions = _read_csv_rows(spend_pred_path, 2000, from_end=True)
+    spend_predictions = _read_csv_rows(spend_pred_path, 50000, from_end=True)
     calendar = CalendarService()
     spend_calendar = {}
     for row in spend_predictions:
@@ -288,7 +292,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
         "roi": {
             "title": "T+1 ROI_D1 预测效果",
             "metrics": _read_csv_rows(roi_metrics_path, 100),
-            "predictions": _read_csv_rows(roi_pred_path, 2000, from_end=True),
+            "predictions": _read_csv_rows(roi_pred_path, 50000, from_end=True),
             "prediction_file": str(roi_pred_path.resolve()) if roi_pred_path and roi_pred_path.exists() else "",
             "source": str(roi_dir) if roi_dir else "",
             "stats": roi_stats["overall"] if roi_stats else None,
@@ -300,7 +304,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "report": _read_json(spend_dir / "report.json") if spend_dir else {},
             "predictions": spend_predictions,
             "prediction_file": str(spend_pred_path.resolve()) if spend_pred_path and spend_pred_path.exists() else "",
-            "baseline_predictions": _read_csv_rows(old_spend_path, 2000, from_end=True),
+            "baseline_predictions": _read_csv_rows(old_spend_path, 20000, from_end=True),
             "calendar": spend_calendar,
             "source": str(spend_dir) if spend_dir else "",
             "stats": spend_stats["overall"] if spend_stats else None,
@@ -412,6 +416,16 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .compact-metrics .metric {{ padding:10px 12px; border-radius:12px; }}
     .compact-metrics .metric .v {{ font-size:20px; }}
     .recommend-summary-title {{ margin:18px 0 8px; font-size:16px; font-weight:760; }}
+    .app-popup {{ position: fixed; z-index: 9999; background: #fff; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 16px 48px rgba(16,24,40,.18); padding: 16px; min-width: 540px; max-width: 620px; pointer-events: auto; }}
+    .app-popup-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
+    .app-popup-header b {{ font-size: 16px; color: var(--blue); }}
+    .app-popup-header .close-hint {{ font-size: 11px; color: var(--muted); }}
+    .app-popup-info {{ font-size: 12px; line-height: 1.55; color: var(--text); margin-bottom: 10px; }}
+    .app-popup-info .lbl {{ color: var(--muted); }}
+    .app-popup-charts {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .app-popup-chart {{ height: 200px; border: 1px solid var(--line); border-radius: 10px; }}
+    .popup-app-id {{ cursor: pointer; color: var(--blue); text-decoration: underline; text-underline-offset: 2px; }}
+    .popup-app-id:hover {{ color: #1d4ed8; }}
     @media (max-width: 1100px) {{ .shell {{ display:block; }} .topnav {{ position:static; flex-direction:row; margin-bottom:14px; }} .controls, .roi-controls, .grid4, .grid2, .charts, .trace-grid {{ grid-template-columns: 1fr; }} .hero {{ flex-direction: column; }} }}
   </style>
 </head>
@@ -502,12 +516,13 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
       <h2>预测明细 <span id="detailTitleSuffix" style="font-weight:400;color:var(--muted);font-size:14px;"></span></h2>
       <div class="hint" id="detailPageInfo"></div>
     </div>
-    <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center;">
+    <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <input type="text" id="detailAppSearch" placeholder="搜索应用ID…" style="width:160px;" />
       <button id="detailPrevBtn" disabled>上一页</button>
       <span id="detailPageLabel">-</span>
       <button id="detailNextBtn" disabled>下一页</button>
     </div>
-    <div class="table-wrap">
+    <div class="table-wrap" style="max-height:520px;">
       <table>
         <thead id="detailHead"></thead>
         <tbody id="detailBody"></tbody>
@@ -602,6 +617,18 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
 </div>
 </div>
 
+<div id="appHoverPopup" class="app-popup" style="display:none;">
+  <div class="app-popup-header">
+    <b id="popupAppId"></b>
+    <span class="close-hint">点击应用ID跳转详情 | 移开隐藏</span>
+  </div>
+  <div class="app-popup-info" id="popupInfo"></div>
+  <div class="app-popup-charts">
+    <div id="popupRoiChart" class="app-popup-chart"></div>
+    <div id="popupSpendChart" class="app-popup-chart"></div>
+  </div>
+</div>
+
 <script>
 const payload = {safe_payload_js};
 const initialView = {safe_initial_view_js};
@@ -613,6 +640,11 @@ const charts = {{
   scatter: echarts.init(document.getElementById('scatterChart')),
   error: echarts.init(document.getElementById('errorChart')),
 }};
+
+const _popupCharts = {{ roi: null, spend: null }};
+let _popupAppId = '';
+let _popupTimer = null;
+let _popupHideTimer = null;
 
 const fmt = (v, digits=2) => Number.isFinite(v) ? v.toFixed(digits) : '-';
 const pct = (v, digits=2) => Number.isFinite(v) ? (v * 100).toFixed(digits) + '%' : '-';
@@ -888,8 +920,6 @@ function renderAppMonthRoiTable() {{
     ['spendT1Calibrated', 'T+1 Spend(校准)'],
     ['roiD1T1Calibrated', 'T+1 ROI_D1(校准)'],
     ['priorityScore', '处理优先级'],
-    ['basis', '推荐依据'],
-    ['topActions', 'Top计划动作'],
   ];
   const headEl = document.getElementById('appRoiHead');
   const bodyEl = document.getElementById('appRoiBody');
@@ -911,7 +941,7 @@ function renderAppMonthRoiTable() {{
     const roiCls = r.roiGap >= 0 ? 'good' : 'bad';
     const actionCls = r.action.includes('收紧') || r.action.includes('控量') ? 'bad' : 'good';
     return `<tr>
-      <td>${{r.app}}</td>
+      <td class="popup-app-id" data-app="${{r.app}}">${{r.app}}</td>
       <td>${{r.targetDay}}</td>
       <td>${{r.canonicalLabel}}</td>
       <td class="${{roiCls}}">${{fmt(r.monthEndRoi,4)}}</td>
@@ -934,10 +964,30 @@ function renderAppMonthRoiTable() {{
       <td>${{fmt(r.spendT1Calibrated,2)}}</td>
       <td>${{fmt(r.roiD1T1Calibrated,4)}}</td>
       <td>${{fmt(r.priorityScore,2)}}</td>
-      <td class="basis">${{r.basis}}</td>
-      <td class="basis">${{r.topActions}}</td>
     </tr>`;
   }}).join('');
+
+  // event delegation for app hover popup + click navigation
+  bodyEl.querySelectorAll('td.popup-app-id').forEach(td => {{
+    const appId = td.dataset.app;
+    td.addEventListener('mouseenter', (evt) => {{
+      const row = appMonthRoiRows().find(r => r.app === appId);
+      if (row) showAppPopup(appId, row, evt);
+    }});
+    td.addEventListener('mouseleave', () => hideAppPopup());
+    td.addEventListener('click', () => {{
+      hideAppPopup(true);
+      selectedAppId = appId;
+      _chartAppId = '';
+      detailState = {{ appId: appId, page: 0, limit: 200, total: 0 }};
+      detailSort = {{ key: 'date', dir: 'asc' }};
+      document.getElementById('targetSel').value = 'spend';
+      setActiveView('predict');
+      document.getElementById('appSelectHint').style.display = '';
+      document.getElementById('appSelectText').textContent = '已选中应用 ' + appId + ' — 图表和明细均仅显示该应用数据';
+      render();
+    }});
+  }});
 }}
 
 let detailState = {{ appId: '', page: 0, limit: 200, total: 0 }};
@@ -1247,6 +1297,95 @@ function renderChartSeries(data, unit, target) {{
   }});
 }}
 
+function showAppPopup(appId, rowData, evt) {{
+  clearTimeout(_popupHideTimer);
+  const popup = document.getElementById('appHoverPopup');
+  popup.style.display = 'block';
+  positionPopup(evt);
+  if (_popupAppId === appId) return;
+  _popupAppId = appId;
+  document.getElementById('popupAppId').innerHTML = '<span class="popup-app-id" id="popupAppIdLink">' + appId + '</span>';
+  document.getElementById('popupAppIdLink').addEventListener('click', (e) => {{
+    e.stopPropagation();
+    hideAppPopup(true);
+    selectedAppId = appId;
+    _chartAppId = '';
+    detailState = {{ appId: appId, page: 0, limit: 200, total: 0 }};
+    detailSort = {{ key: 'date', dir: 'asc' }};
+    document.getElementById('targetSel').value = 'spend';
+    setActiveView('predict');
+    document.getElementById('appSelectHint').style.display = '';
+    document.getElementById('appSelectText').textContent = '已选中应用 ' + appId + ' — 图表和明细均仅显示该应用数据';
+    render();
+  }});
+  const basisText = rowData.basis || '-';
+  const topActionsText = rowData.topActions || '-';
+  document.getElementById('popupInfo').innerHTML =
+    '<div><span class="lbl">推荐依据：</span>' + basisText + '</div>' +
+    '<div style="margin-top:4px;"><span class="lbl">分场景推荐：</span>' + topActionsText + '</div>';
+
+  // init or re-use charts
+  if (!_popupCharts.roi) _popupCharts.roi = echarts.init(document.getElementById('popupRoiChart'));
+  if (!_popupCharts.spend) _popupCharts.spend = echarts.init(document.getElementById('popupSpendChart'));
+  _popupCharts.roi.setOption({{ title: {{ text: 'T+1 ROI_D1', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 16, top: 32, bottom: 22 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10}} }}, yAxis: {{ type:'value', name:'ROI', nameGap:28, axisLabel:{{fontSize:10}} }}, series: [] }});
+  _popupCharts.spend.setOption({{ title: {{ text: 'T+1 Spend', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 16, top: 32, bottom: 22 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10}} }}, yAxis: {{ type:'value', name:'消耗', nameGap:32, axisLabel:{{fontSize:10}} }}, series: [] }});
+
+  _popupCharts.roi.showLoading();
+  _popupCharts.spend.showLoading();
+  Promise.all([
+    fetch('/web/data/roi/app/' + encodeURIComponent(appId) + '/chart').then(r => r.json()).catch(() => []),
+    fetch('/web/data/spend/app/' + encodeURIComponent(appId) + '/chart').then(r => r.json()).catch(() => []),
+  ]).then(([roiData, spendData]) => {{
+    if (_popupAppId !== appId) return;
+    _renderPopupChart(_popupCharts.roi, roiData, 'ROI', false);
+    _renderPopupChart(_popupCharts.spend, spendData, '消耗', true);
+  }});
+}}
+
+function _renderPopupChart(chart, data, unit, isSpend) {{
+  chart.hideLoading();
+  const dates = data.map(x => x.date);
+  const actualName = isSpend ? '实际Spend' : '实际ROI';
+  const predName = isSpend ? '预测Spend' : '预测ROI';
+  chart.setOption({{
+    xAxis: {{ data: dates }},
+    series: [
+      {{ name: actualName, type: 'line', smooth: true, symbolSize: 3, data: data.map(x => x.actual) }},
+      {{ name: predName, type: 'line', smooth: true, symbolSize: 3, data: data.map(x => x.pred) }},
+    ],
+    color: ['#16a34a', '#2563eb'],
+    legend: {{ bottom: 2, textStyle: {{fontSize:10}} }},
+  }});
+}}
+
+function positionPopup(evt) {{
+  const popup = document.getElementById('appHoverPopup');
+  const pw = popup.offsetWidth;
+  const ph = popup.offsetHeight;
+  let left = evt.clientX + 14;
+  let top = evt.clientY - 12;
+  if (left + pw > window.innerWidth - 12) left = window.innerWidth - pw - 12;
+  if (top + ph > window.innerHeight - 12) top = window.innerHeight - ph - 12;
+  if (left < 4) left = 4;
+  if (top < 4) top = 4;
+  popup.style.left = left + 'px';
+  popup.style.top = top + 'px';
+}}
+
+function hideAppPopup(immediate) {{
+  const doHide = () => {{
+    document.getElementById('appHoverPopup').style.display = 'none';
+    _popupAppId = '';
+    if (_popupCharts.roi) {{ _popupCharts.roi.dispose(); _popupCharts.roi = null; }}
+    if (_popupCharts.spend) {{ _popupCharts.spend.dispose(); _popupCharts.spend = null; }}
+  }};
+  if (immediate) {{ doHide(); return; }}
+  _popupHideTimer = setTimeout(doHide, 200);
+}}
+
+document.getElementById('appHoverPopup').addEventListener('mouseenter', () => clearTimeout(_popupHideTimer));
+document.getElementById('appHoverPopup').addEventListener('mouseleave', hideAppPopup);
+
 function renderSummary(rows) {{
   const target = document.getElementById('targetSel').value;
   const m = calcMetrics(rows);
@@ -1274,10 +1413,14 @@ function renderTable(rows) {{
   // All-apps mode: in-memory pagination
   detailState.appId = '';
   const digits = target === 'roi' ? 4 : 2;
-  const enriched = rows.map(r => ({{
+  const appSearch = (document.getElementById('detailAppSearch')?.value || '').trim().toLowerCase();
+  let enriched = rows.map(r => ({{
     ...r,
     ape: r.actual > 1e-8 ? Math.abs((r.actual-r.pred)/r.actual) : 0,
   }}));
+  if (appSearch) {{
+    enriched = enriched.filter(r => String(r.app).toLowerCase().includes(appSearch));
+  }}
   const headers = target === 'roi'
     ? [['date','日期'], ['app','应用ID'], ['actual','实际 ROI_D1'], ['pred','预测 ROI_D1'], ['ape','APE'], ['model','模型']]
     : [['date','日期'], ['targetDate','T+1日期'], ['calendarLabel','日历标签'], ['app','应用ID'], ['actual','实际 Spend'],
@@ -1336,6 +1479,8 @@ function render() {{
 }});
 const appTableSearchEl = document.getElementById('appTableSearch');
 if (appTableSearchEl) appTableSearchEl.addEventListener('input', renderAppSummary);
+const detailAppSearchEl = document.getElementById('detailAppSearch');
+if (detailAppSearchEl) detailAppSearchEl.addEventListener('input', () => {{ detailState.page = 0; renderTable(currentRows()); }});
 const clearAppSelBtn = document.getElementById('clearAppSelBtn');
 if (clearAppSelBtn) clearAppSelBtn.addEventListener('click', () => {{
   selectedAppId = '';
@@ -1403,7 +1548,8 @@ function setActiveView(view) {{
   document.querySelectorAll('.navbtn').forEach(x => x.classList.toggle('active', x.dataset.view === view));
   document.getElementById('view-predict').classList.toggle('hidden', view !== 'predict');
   document.getElementById('view-recommend').classList.toggle('hidden', view !== 'recommend');
-  setTimeout(() => Object.values(charts).forEach(c => c.resize()), 0);
+  hideAppPopup(true);
+  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); }}, 0);
 }}
 document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
 const rb = document.getElementById('resetBtn');
@@ -1415,9 +1561,11 @@ if (rb) rb.addEventListener('click', () => {{
   detailSort = {{ key: 'date', dir: 'asc' }};
   document.getElementById('startDate').value = '';
   document.getElementById('endDate').value = '';
+  const das = document.getElementById('detailAppSearch');
+  if (das) das.value = '';
   render();
 }});
-window.addEventListener('resize', () => Object.values(charts).forEach(c => c.resize()));
+window.addEventListener('resize', () => {{ Object.values(charts).forEach(c => c.resize()); if (_popupCharts.roi) _popupCharts.roi.resize(); if (_popupCharts.spend) _popupCharts.spend.resize(); }});
 render();
 setActiveView(initialView);
 </script>
@@ -2135,6 +2283,7 @@ def _resolve_prediction_path(target: str) -> Path | None:
     if target == "roi":
         roi_dir = _pick_existing(
             [
+                root / "model_parallel_roi_d1_v7_aligned",
                 root / "model_parallel_roi_d1_default_weekly_v3",
                 root / "model_parallel_roi_d1_default_weekly_v2",
                 root / "model_parallel_roi_d1_default_weekly",
@@ -2146,6 +2295,9 @@ def _resolve_prediction_path(target: str) -> Path | None:
         return resolve_roi_predictions_csv(roi_dir)
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1_v9_composition",
+            root / "model_parallel_spend_t1_v8_filtered",
+            root / "model_parallel_spend_t1_v4",
             root / "model_parallel_spend_t1_target_calendar_calibrated_app",
             root / "model_parallel_spend_t1_split_online_fusion_script_verified",
         ]

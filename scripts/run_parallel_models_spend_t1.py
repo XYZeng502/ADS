@@ -12,6 +12,7 @@ from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, Ran
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+from app.config import settings
 from app.core.calendar import CalendarService
 from app.prediction_artifacts import validate_merged_daily_csv
 
@@ -44,6 +45,10 @@ class ModelResult:
 
 def _is_holiday(d: date) -> bool:
     return CALENDAR.is_holiday(d)
+
+
+def _is_rest_day(d: date) -> int:
+    return int(CALENDAR.is_rest_day(d))
 
 
 def _holiday_id(d: date) -> int:
@@ -97,11 +102,56 @@ def _build_key(df: pd.DataFrame, cols: List[str]) -> pd.Series:
     return out
 
 
+def _build_composition_features(raw: pd.DataFrame) -> pd.DataFrame:
+    """为每个应用-日期计算子组构成特征（不增加行数）。
+
+    返回 DataFrame (应用ID, 日期, traffic_n_unique, traffic_top1_pct, traffic_hhi, ...)
+    """
+    comp_dims = {
+        "traffic": "推广流量名称",
+        "scene": "流量场景名称",
+        "creative": "创意规格名称",
+        "billing": "计费方式",
+    }
+    available_dims = {k: v for k, v in comp_dims.items() if v in raw.columns}
+    if not available_dims:
+        return pd.DataFrame(columns=["应用ID", "日期"])
+
+    frames = []
+    for dim_key, dim_col in available_dims.items():
+        spend = raw.groupby(["应用ID", "日期", dim_col])["消耗金额"].sum().reset_index()
+        total = spend.groupby(["应用ID", "日期"])["消耗金额"].transform("sum")
+        spend["share"] = np.where(total > 1e-8, spend["消耗金额"] / total, 0.0)
+        agg = (
+            spend.groupby(["应用ID", "日期"])
+            .agg(**{
+                f"{dim_key}_top1_pct": ("share", "max"),
+                f"{dim_key}_hhi": ("share", lambda s: float((s**2).sum())),
+            })
+            .reset_index()
+        )
+        pos = spend[spend["消耗金额"] > 1e-8]
+        agg2 = pos.groupby(["应用ID", "日期"])[dim_col].nunique().reset_index()
+        agg2.columns = ["应用ID", "日期", f"{dim_key}_n_unique"]
+        agg = agg.merge(agg2, on=["应用ID", "日期"], how="left")
+        agg[f"{dim_key}_n_unique"] = agg[f"{dim_key}_n_unique"].fillna(0).astype(int)
+        frames.append(agg)
+
+    result = frames[0]
+    for f in frames[1:]:
+        result = result.merge(f, on=["应用ID", "日期"], how="outer")
+    for c in result.columns:
+        if c not in ("应用ID", "日期"):
+            result[c] = result[c].fillna(0.0 if "_pct" in c or "_hhi" in c else 0)
+    return result
+
+
 def _build_app_daily(
     input_csv: str,
     split_col: str,
     clean_group_cols: List[str],
     product_key_cols: List[str],
+    min_spend_train: float = 0.01,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     from app.data_cleaning import clean as _clean_csv
 
@@ -137,6 +187,13 @@ def _build_app_daily(
         .sum()
         .sort_values(group_cols)
     )
+
+    # 阶段2b：子组构成特征 — 在聚合前从 raw 计算各子维度的消耗分布
+    comp_df = _build_composition_features(raw)
+    df = df.merge(comp_df, on=["应用ID", "日期"], how="left")
+    for c in comp_df.columns:
+        if c not in ("应用ID", "日期") and c in df.columns:
+            df[c] = df[c].fillna(0)
     df["entity_id"] = _build_key(df, entity_cols)
     # 下游逻辑统一仍以 应用ID 作为实体键（此处映射到训练实体）
     df["应用ID"] = df["entity_id"]
@@ -144,13 +201,16 @@ def _build_app_daily(
         df["split_value"] = df[split_col].astype(str).fillna("未知")
     else:
         df["split_value"] = "ALL"
-    df["roi_d1"] = np.where(df["消耗金额"] > 0, df["首日广告收入"] / df["消耗金额"], 0.0)
+    if min_spend_train > 0:
+        df = df[df["消耗金额"] >= min_spend_train].copy()
+    df["roi_d1"] = np.where(df["消耗金额"] > 0, df["首日广告收入"] / df["消耗金额"], np.nan)
     df["ctr"] = np.where(df["曝光量"] > 0, df["点击量"] / df["曝光量"], 0.0)
     df["cvr_dl"] = np.where(df["点击量"] > 0, df["下载量"] / df["点击量"], 0.0)
     df["cvr_act"] = np.where(df["下载量"] > 0, df["激活人数(快应用新增用户数)"] / df["下载量"], 0.0)
     df["dow"] = df["日期"].dt.weekday
     df["is_fri_sat"] = df["dow"].isin([4, 5]).astype(int)
     df["is_holiday"] = df["日期"].dt.date.map(_is_holiday).astype(int)
+    df["is_rest_day"] = df["日期"].dt.date.map(_is_rest_day).astype(int)
     df["dom"] = df["日期"].dt.day
     df["month"] = df["日期"].dt.month
     df["week_of_month"] = ((df["dom"] - 1) // 7 + 1).clip(1, 5)
@@ -172,7 +232,7 @@ def _build_app_daily(
     df["holiday_window_len"] = df["日期"].dt.date.map(_holiday_window_len).astype(int)
     df["is_last_holiday_day"] = df["日期"].dt.date.map(_is_last_holiday_day).astype(int)
 
-    # T+1 spend 预测应使用“目标日”的日历属性，尤其是假期结束后的回落。
+    # T+1 spend 预测应使用"目标日"的日历属性，尤其是假期结束后的回落。
     target_dates = df["日期"].dt.date.map(lambda d: d + timedelta(days=1))
     df["target_dow"] = target_dates.map(lambda d: d.weekday()).astype(int)
     df["target_is_weekend"] = target_dates.map(lambda d: d.weekday() >= 5).astype(int)
@@ -203,6 +263,19 @@ def _build_app_daily(
     df["mtd_roi_d1"] = np.where(df["mtd_spend"] > 1e-8, df["mtd_revenue"] / df["mtd_spend"], 0.0)
     df["spend_ratio_1d"] = np.where(df["spend_lag_1"] > 1e-8, df["消耗金额"] / df["spend_lag_1"] - 1.0, 0.0)
     df["target_t1_spend"] = g["消耗金额"].shift(-1)
+    df["target_spend_ratio_t1"] = np.where(
+        df["消耗金额"] > 1e-8,
+        df["target_t1_spend"] / df["消耗金额"],
+        1.0,
+    )
+
+    # 过滤训练天数不足的应用
+    app_day_counts = df.groupby("应用ID")["日期"].nunique()
+    min_app_days = max(settings.app_last_day_min_train_days, 1)
+    valid_apps = set(app_day_counts[app_day_counts >= min_app_days].index)
+    apps_before = int(df["应用ID"].nunique())
+    df = df[df["应用ID"].isin(valid_apps)].copy()
+    apps_after = int(df["应用ID"].nunique())
 
     lag_cols = [c for c in df.columns if "lag_" in c or "roll_" in c] + [
         "spend_ratio_1d",
@@ -216,6 +289,10 @@ def _build_app_daily(
         "clean_groups_after": clean_after,
         "dropped_zero_spend_clean_groups": max(clean_before - clean_after, 0),
         "train_entities_after_clean": int(df["应用ID"].nunique()),
+        "min_app_days": min_app_days,
+        "apps_before_day_filter": apps_before,
+        "apps_after_day_filter": apps_after,
+        "apps_filtered_by_days": max(apps_before - apps_after, 0),
     }
     return df, meta
 
@@ -229,6 +306,7 @@ BASE_FEATURE_COLS = [
         "dow",
         "is_fri_sat",
         "is_holiday",
+        "is_rest_day",
         "dom",
         "month",
         "week_of_month",
@@ -275,6 +353,11 @@ BASE_FEATURE_COLS = [
         "roi_lag_3",
         "roi_lag_7",
         "spend_ratio_1d",
+        # 子组构成特征（流量/场景/创意/计费分布的丰富度与集中度）
+        "traffic_n_unique", "traffic_top1_pct", "traffic_hhi",
+        "scene_n_unique", "scene_top1_pct", "scene_hhi",
+        "creative_n_unique", "creative_top1_pct", "creative_hhi",
+        "billing_n_unique", "billing_top1_pct", "billing_hhi",
     ]
 
 CALENDAR_PACING_FEATURE_COLS = [
@@ -557,7 +640,9 @@ def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feat
     model.fit(x_train, y_train)
     pred = model.predict(x_test)
     if use_log_target:
-        pred = np.expm1(pred)
+        log_resid = y_train - model.predict(x_train)
+        smearing = float(np.clip(np.exp(log_resid).mean(), 0.8, 1.25))
+        pred = np.expm1(pred) * smearing
     pred = np.clip(pred, 0.0, None)
     pred = _apply_holiday_transition_calibration(test, pred)
     return pd.DataFrame({"日期": test["日期"].values, "应用ID": test["应用ID"].values, "y_true": y_test, "y_pred": pred, "model": label})
@@ -567,28 +652,41 @@ def _apply_holiday_transition_calibration(test_df: pd.DataFrame, pred: np.ndarra
     adjusted = np.asarray(pred, dtype=float).copy()
     current_spend = pd.to_numeric(test_df["消耗金额"], errors="coerce").fillna(0.0).to_numpy()
     roll3 = pd.to_numeric(test_df.get("spend_roll_mean_3", 0.0), errors="coerce").fillna(0.0).to_numpy()
+    roll7 = pd.to_numeric(test_df.get("spend_roll_mean_7", 0.0), errors="coerce").fillna(0.0).to_numpy()
     recent_ref = np.maximum(current_spend, roll3)
+    wider_ref = np.maximum(recent_ref, roll7)
 
     last_holiday_day = pd.to_numeric(test_df.get("target_is_last_holiday_day", 0), errors="coerce").fillna(0).to_numpy() == 1
     first_workday_after_holiday = (
         pd.to_numeric(test_df.get("target_is_first_workday_after_holiday", 0), errors="coerce").fillna(0).to_numpy() == 1
     )
 
-    # 假期最后一天通常延续假期内投放强度，避免被普通工作日/周内均值过度拉低。
     adjusted[last_holiday_day] = np.maximum(adjusted[last_holiday_day], recent_ref[last_holiday_day] * 0.80)
-    # 节后首个工作日常出现预算回撤，给模型外推值加上业务上限。
     adjusted[first_workday_after_holiday] = np.minimum(
         adjusted[first_workday_after_holiday],
         recent_ref[first_workday_after_holiday] * 0.45,
     )
 
-    # 节后周末校准：长假后第一个周末广告主常出现“报复性投放”，模型会低估；
-    # 同时也有部分app延续假期低价策略。综合：地板75% + 上限115%。
+    # Mid-holiday weekday floor: model treats holiday weekdays (Mon-Tue) as normal
+    # weekdays and underestimates. Weekend holidays are already predicted well.
+    # Only apply floor when the target is a holiday weekday that is NOT the last day.
+    target_is_holiday = pd.to_numeric(test_df.get("target_is_holiday", 0), errors="coerce").fillna(0).to_numpy() == 1
     target_is_weekend = pd.to_numeric(test_df.get("target_is_weekend", 0), errors="coerce").fillna(0).to_numpy() == 1
+    mid_holiday_weekday = target_is_holiday & ~target_is_weekend & ~last_holiday_day & ~first_workday_after_holiday
+    adjusted[mid_holiday_weekday] = np.maximum(adjusted[mid_holiday_weekday], wider_ref[mid_holiday_weekday] * 0.90)
+
+    # Post-holiday weekend calibration: wider_ref + tiered floors by recency
     days_since_holiday = pd.to_numeric(test_df.get("target_days_since_prev_holiday", 99), errors="coerce").fillna(99).to_numpy()
-    post_holiday_weekend = target_is_weekend & (days_since_holiday >= 1) & (days_since_holiday <= 7)
-    adjusted[post_holiday_weekend] = np.maximum(adjusted[post_holiday_weekend], recent_ref[post_holiday_weekend] * 0.75)
-    adjusted[post_holiday_weekend] = np.minimum(adjusted[post_holiday_weekend], recent_ref[post_holiday_weekend] * 1.15)
+
+    # First weekend day after holiday (days 3-4): strongest retaliatory surge
+    early_ph_weekend = target_is_weekend & (days_since_holiday >= 3) & (days_since_holiday <= 4)
+    adjusted[early_ph_weekend] = np.maximum(adjusted[early_ph_weekend], wider_ref[early_ph_weekend] * 0.90)
+    adjusted[early_ph_weekend] = np.minimum(adjusted[early_ph_weekend], wider_ref[early_ph_weekend] * 1.35)
+
+    # Rest of post-holiday week (days 5-7): normalizing
+    late_ph_weekend = target_is_weekend & (days_since_holiday >= 5) & (days_since_holiday <= 7)
+    adjusted[late_ph_weekend] = np.maximum(adjusted[late_ph_weekend], wider_ref[late_ph_weekend] * 0.80)
+    adjusted[late_ph_weekend] = np.minimum(adjusted[late_ph_weekend], wider_ref[late_ph_weekend] * 1.10)
 
     return np.clip(adjusted, 0.0, None)
 
@@ -840,6 +938,12 @@ def main() -> None:
         help="评估集过滤：仅统计 target_t1_spend >= 该阈值的样本",
     )
     parser.add_argument(
+        "--min-spend-train",
+        type=float,
+        default=0.01,
+        help="训练最低日消耗阈值（过滤低消耗噪声样本）",
+    )
+    parser.add_argument(
         "--reconcile-with-app-baseline",
         action="store_true",
         help="启用分流回聚合融合：需要提供 app 维度基线预测 CSV（列包含 日期/应用ID/y_true/y_pred）",
@@ -905,6 +1009,12 @@ def main() -> None:
         default="",
         help="逗号分隔覆盖默认四树模型；与应用级 T+1 融合建议 --split-col \"\" --product-key-cols 应用ID",
     )
+    parser.add_argument(
+        "--target-type",
+        choices=["absolute", "ratio"],
+        default="absolute",
+        help="预测目标类型：absolute=绝对spend值，ratio=t+1/t成长比例",
+    )
     args = parser.parse_args()
 
     validate_merged_daily_csv(Path(args.input))
@@ -928,7 +1038,10 @@ def main() -> None:
         split_col=args.split_col,
         clean_group_cols=clean_group_cols,
         product_key_cols=product_key_cols,
+        min_spend_train=float(args.min_spend_train),
     )
+    if args.target_type == "ratio":
+        df["target_t1_spend"] = df["target_spend_ratio_t1"]
     results = _run(
         df,
         min_train_days=args.min_train_days,
@@ -997,6 +1110,7 @@ def main() -> None:
         "clean_meta": clean_meta,
         "min_target_spend_train": float(args.min_target_spend_train),
         "min_target_spend_eval": float(args.min_target_spend_eval),
+        "min_spend_train": float(args.min_spend_train),
         "feature_set": args.feature_set,
         "feature_count": len(_feature_cols(args.feature_set)),
         "use_gpu": bool(args.use_gpu),

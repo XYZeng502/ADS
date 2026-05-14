@@ -11,7 +11,11 @@ import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
+from app.config import settings
+from app.core.calendar import CalendarService
 from app.prediction_artifacts import validate_merged_daily_csv
+
+CALENDAR = CalendarService()
 
 try:
     from lightgbm import LGBMRegressor
@@ -98,32 +102,12 @@ def _build_model(model_name: str, params: Optional[Dict[str, object]] = None) ->
     return None
 
 
-HOLIDAYS_2026 = {
-    # 元旦
-    date(2026, 1, 1),
-    date(2026, 1, 2),
-    date(2026, 1, 3),
-    # 春节（近似）
-    date(2026, 2, 16),
-    date(2026, 2, 17),
-    date(2026, 2, 18),
-    date(2026, 2, 19),
-    date(2026, 2, 20),
-    date(2026, 2, 21),
-    date(2026, 2, 22),
-    # 清明（近似）
-    date(2026, 4, 4),
-    date(2026, 4, 5),
-    date(2026, 4, 6),
-    # 劳动节（近似）
-    date(2026, 5, 1),
-    date(2026, 5, 2),
-    date(2026, 5, 3),
-}
-
-
 def _is_holiday(d: date) -> bool:
-    return d in HOLIDAYS_2026
+    return CALENDAR.is_holiday(d)
+
+
+def _is_rest_day(d: date) -> int:
+    return int(CALENDAR.is_rest_day(d))
 
 
 def _is_pre_holiday(d: date) -> int:
@@ -138,25 +122,112 @@ def _is_summer_winter_break(d: date) -> int:
     return 1 if d.month in (1, 2, 7, 8) else 0
 
 
+def _holiday_id(d: date) -> int:
+    return int(CALENDAR.features_for_day(d)["holiday_id"])
+
+
+def _holiday_seq_index(d: date) -> int:
+    return int(CALENDAR.features_for_day(d)["holiday_seq_index"])
+
+
+def _holiday_days_remaining(d: date) -> int:
+    return int(CALENDAR.features_for_day(d)["holiday_days_remaining"])
+
+
+def _holiday_window_len(d: date) -> int:
+    return int(CALENDAR.features_for_day(d)["holiday_window_len"])
+
+
+def _is_last_holiday_day(d: date) -> int:
+    return int(CALENDAR.features_for_day(d)["is_last_holiday_day"])
+
+
+def _is_first_workday_after_holiday(d: date) -> int:
+    return int(CALENDAR.features_for_day(d)["is_first_workday_after_holiday"])
+
+
+def _days_to_next_holiday(d: date) -> int:
+    return CALENDAR.days_to_next_holiday(d)
+
+
+def _days_since_prev_holiday(d: date) -> int:
+    return CALENDAR.days_since_prev_holiday(d)
+
+
+def _build_composition_features(raw: pd.DataFrame) -> pd.DataFrame:
+    """为每个应用-日期计算子组构成特征（不增加行数）。"""
+    comp_dims = {
+        "traffic": "推广流量名称",
+        "scene": "流量场景名称",
+        "creative": "创意规格名称",
+        "billing": "计费方式",
+    }
+    available_dims = {k: v for k, v in comp_dims.items() if v in raw.columns}
+    if not available_dims:
+        return pd.DataFrame(columns=["应用ID", "日期"])
+
+    frames = []
+    for dim_key, dim_col in available_dims.items():
+        spend = raw.groupby(["应用ID", "日期", dim_col])["消耗金额"].sum().reset_index()
+        total = spend.groupby(["应用ID", "日期"])["消耗金额"].transform("sum")
+        spend["share"] = np.where(total > 1e-8, spend["消耗金额"] / total, 0.0)
+        agg = (
+            spend.groupby(["应用ID", "日期"])
+            .agg(**{
+                f"{dim_key}_top1_pct": ("share", "max"),
+                f"{dim_key}_hhi": ("share", lambda s: float((s**2).sum())),
+            })
+            .reset_index()
+        )
+        pos = spend[spend["消耗金额"] > 1e-8]
+        agg2 = pos.groupby(["应用ID", "日期"])[dim_col].nunique().reset_index()
+        agg2.columns = ["应用ID", "日期", f"{dim_key}_n_unique"]
+        agg = agg.merge(agg2, on=["应用ID", "日期"], how="left")
+        agg[f"{dim_key}_n_unique"] = agg[f"{dim_key}_n_unique"].fillna(0).astype(int)
+        frames.append(agg)
+
+    result = frames[0]
+    for f in frames[1:]:
+        result = result.merge(f, on=["应用ID", "日期"], how="outer")
+    for c in result.columns:
+        if c not in ("应用ID", "日期"):
+            result[c] = result[c].fillna(0.0 if "_pct" in c or "_hhi" in c else 0)
+    return result
+
+
 def _build_app_daily(
     input_csv: str,
-    min_spend_train: float = 0.0,
+    min_spend_train: float = 2.0,
     min_app_history_days: int = 0,
 ) -> pd.DataFrame:
     from app.data_cleaning import clean, to_app_daily as _to_app_daily, validate_columns as _validate_cols
 
     raw = clean(Path(input_csv))
+
+    # 子组构成特征 — 在聚合前从 raw 计算
+    comp_df = _build_composition_features(raw)
     app_day = _to_app_daily(raw)
+    app_day = app_day.merge(comp_df, on=["应用ID", "日期"], how="left")
+    for c in comp_df.columns:
+        if c not in ("应用ID", "日期") and c in app_day.columns:
+            app_day[c] = app_day[c].fillna(0)
+
     _validate_cols(app_day)
 
     # 清洗：过滤低消耗样本（ROI 噪声极大）
     if min_spend_train > 0:
         app_day = app_day[app_day["消耗金额"] >= min_spend_train].copy()
+
     # 清洗：过滤历史天数不足的应用（ROI 不稳定）
-    if min_app_history_days > 0:
-        day_counts = app_day.groupby("应用ID")["日期"].nunique()
-        keep_apps = day_counts[day_counts >= min_app_history_days].index
-        app_day = app_day[app_day["应用ID"].isin(keep_apps)].copy()
+    if min_app_history_days <= 0:
+        min_app_history_days = max(settings.app_last_day_min_train_days, 1)
+    day_counts = app_day.groupby("应用ID")["日期"].nunique()
+    keep_apps = day_counts[day_counts >= min_app_history_days].index
+    apps_before = int(app_day["应用ID"].nunique())
+    app_day = app_day[app_day["应用ID"].isin(keep_apps)].copy()
+    apps_after = int(app_day["应用ID"].nunique())
+    if apps_before > apps_after:
+        print(f"[ROI] app filter: {apps_before} -> {apps_after} (min {min_app_history_days} days)")
 
     app_day["roi_d1"] = np.where(app_day["消耗金额"] > 0, app_day["首日广告收入"] / app_day["消耗金额"], np.nan)
     app_day["act_per_spend"] = np.where(
@@ -177,9 +248,27 @@ def _build_app_daily(
     app_day["dom"] = app_day["日期"].dt.day
     app_day["month"] = app_day["日期"].dt.month
     app_day["is_holiday"] = app_day["日期"].dt.date.map(_is_holiday).astype(int)
+    app_day["is_rest_day"] = app_day["日期"].dt.date.map(_is_rest_day).astype(int)
     app_day["pre_holiday"] = app_day["日期"].dt.date.map(_is_pre_holiday).astype(int)
     app_day["post_holiday"] = app_day["日期"].dt.date.map(_is_post_holiday).astype(int)
     app_day["summer_winter_break"] = app_day["日期"].dt.date.map(_is_summer_winter_break).astype(int)
+
+    # T+1 目标日节假日特征（与 spends 脚本口径一致）
+    target_dates = app_day["日期"].dt.date.map(lambda d: d + timedelta(days=1))
+    app_day["target_dow"] = target_dates.map(lambda d: d.weekday()).astype(int)
+    app_day["target_is_weekend"] = target_dates.map(lambda d: d.weekday() >= 5).astype(int)
+    app_day["target_is_holiday"] = target_dates.map(_is_holiday).astype(int)
+    app_day["target_holiday_id"] = target_dates.map(_holiday_id).astype(int)
+    app_day["target_holiday_seq_index"] = target_dates.map(_holiday_seq_index).astype(int)
+    app_day["target_holiday_days_remaining"] = target_dates.map(_holiday_days_remaining).astype(int)
+    app_day["target_holiday_window_len"] = target_dates.map(_holiday_window_len).astype(int)
+    app_day["target_is_last_holiday_day"] = target_dates.map(_is_last_holiday_day).astype(int)
+    app_day["target_days_to_next_holiday"] = target_dates.map(_days_to_next_holiday).clip(upper=30)
+    app_day["target_days_since_prev_holiday"] = target_dates.map(_days_since_prev_holiday).clip(upper=30)
+    app_day["target_is_pre_holiday_3d"] = app_day["target_days_to_next_holiday"].between(1, 3).astype(int)
+    app_day["target_is_post_holiday_1d"] = (app_day["target_days_since_prev_holiday"] == 1).astype(int)
+    app_day["target_is_post_holiday_3d"] = app_day["target_days_since_prev_holiday"].between(1, 3).astype(int)
+    app_day["target_is_first_workday_after_holiday"] = target_dates.map(_is_first_workday_after_holiday).astype(int)
 
     # 机制特征：变化率 + 稳定度
     g = app_day.groupby("应用ID", group_keys=False)
@@ -259,6 +348,28 @@ def _get_base_feature_cols() -> List[str]:
         "rev_per_act_d1_lag_2",
         "rev_per_act_d1_lag_3",
         "rev_per_act_d1_lag_7",
+        # 子组构成特征
+        "traffic_n_unique", "traffic_top1_pct", "traffic_hhi",
+        "scene_n_unique", "scene_top1_pct", "scene_hhi",
+        "creative_n_unique", "creative_top1_pct", "creative_hhi",
+        "billing_n_unique", "billing_top1_pct", "billing_hhi",
+        # 休息日特征（CalendarService + chinese_calendar）
+        "is_rest_day",
+        # T+1 目标日节假日特征
+        "target_dow",
+        "target_is_weekend",
+        "target_is_holiday",
+        "target_holiday_id",
+        "target_holiday_seq_index",
+        "target_holiday_days_remaining",
+        "target_holiday_window_len",
+        "target_is_last_holiday_day",
+        "target_days_to_next_holiday",
+        "target_days_since_prev_holiday",
+        "target_is_pre_holiday_3d",
+        "target_is_post_holiday_1d",
+        "target_is_post_holiday_3d",
+        "target_is_first_workday_after_holiday",
     ]
 
 
@@ -720,6 +831,7 @@ def _run_backtest_parallel(
     df: pd.DataFrame,
     alpha: float,
     min_train_days: int = 20,
+    eval_recent_days: Optional[int] = None,
     include_log_target: bool = False,
     include_hard_weight_models: bool = False,
     include_split_models: bool = False,
@@ -731,6 +843,8 @@ def _run_backtest_parallel(
 ) -> List[ModelResult]:
     all_dates = sorted(df["日期"].dropna().unique())
     candidate_cutoffs = all_dates[:-1]
+    if eval_recent_days is not None and eval_recent_days > 0 and len(candidate_cutoffs) > eval_recent_days:
+        candidate_cutoffs = candidate_cutoffs[-eval_recent_days:]
     tree_model_names = selected_tree_models or ["RandomForest", "GBDT", "ExtraTrees", "HistGB", "LightGBM", "XGBoost"]
     model_specs: List[Tuple[str, str, Optional[Dict[str, object]]]] = [(m, m, None) for m in tree_model_names]
     base_feature_cols = _get_base_feature_cols()
@@ -803,15 +917,20 @@ def _run_backtest_parallel(
 
     tuned_params_cache: Dict[str, Dict[str, object]] = {}
     last_retune_cutoff = None
-    for cutoff in candidate_cutoffs:
+    n_total = len(candidate_cutoffs)
+    for i, cutoff in enumerate(candidate_cutoffs):
         train = model_df[model_df["日期"] <= cutoff].copy()
         test = model_df[model_df["日期"] == (cutoff + np.timedelta64(1, "D"))].copy()
         if test.empty:
+            print(f"  [{i+1}/{n_total}] cutoff={pd.Timestamp(cutoff).date()} skip (no test)")
             continue
 
         train_days = train["日期"].nunique()
         if train_days < min_train_days:
+            print(f"  [{i+1}/{n_total}] cutoff={pd.Timestamp(cutoff).date()} skip (train_days={train_days} < {min_train_days})")
             continue
+
+        print(f"  [{i+1}/{n_total}] cutoff={pd.Timestamp(cutoff).date()} train={train_days}d test_apps={test['应用ID'].nunique()}")
 
         if tune_hard_buckets:
             need_retune = last_retune_cutoff is None
@@ -997,8 +1116,9 @@ def main() -> None:
     )
     parser.add_argument("--retune-frequency-days", type=int, default=7, help="自动重寻参频率（天），默认每7天")
     parser.add_argument("--use-date-bucket-models", action="store_true", help="并行增加日期分桶模型分支")
-    parser.add_argument("--min-spend-train", type=float, default=0.0, help="训练最低日消耗阈值（如 5 可过滤噪声 ROI 样本）")
+    parser.add_argument("--min-spend-train", type=float, default=2.0, help="训练最低日消耗阈值（过滤低消耗噪声 ROI，默认 2 元）")
     parser.add_argument("--min-app-history-days", type=int, default=0, help="应用最少历史天数（如 20 可过滤稀疏应用）")
+    parser.add_argument("--eval-recent-days", type=int, default=0, help="仅评估最近 N 天（0=全部），用于统一口径")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -1013,10 +1133,12 @@ def main() -> None:
     app_daily = _add_lags(app_daily, lags=[1, 2, 3, 7])
 
     selected_tree_models = [m.strip() for m in str(args.models).split(",") if m.strip()]
+    eval_recent = int(args.eval_recent_days) if args.eval_recent_days > 0 else None
     results = _run_backtest_parallel(
         df=app_daily,
         alpha=args.alpha,
         min_train_days=args.min_train_days,
+        eval_recent_days=eval_recent,
         include_log_target=args.use_log_target,
         include_hard_weight_models=args.use_hard_sample_weight,
         include_split_models=args.use_split_models,

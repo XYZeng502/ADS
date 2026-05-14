@@ -52,6 +52,8 @@ class Settings(BaseModel):
     solver_slot_d1_normalize_mode: Literal["spend_weighted", "arithmetic_mean"] = "spend_weighted"
     # 应用级回放/推荐表主用的「月末 ROI」cohort 口径（与 offline_backtest 三条分支对齐，只改此处即可）。
     app_last_day_canonical_month_end_roi: Literal["stable", "pred_only", "fused"] = "fused"
+    # 推荐模块：应用训练天数不足该阈值时，跳过该应用的预测与推荐
+    app_last_day_min_train_days: int = 30
 
 
 settings = Settings()
