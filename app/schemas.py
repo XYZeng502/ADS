@@ -65,11 +65,13 @@ class ProductDiagnosis(BaseModel):
     gap_to_target: float
     action: Literal["加量", "维持", "减量或观察"]
     improvement_window_days: int
+    trend: str = "stable"
+    cap_utilization: float = 0.0
 
 
 class RiskAlert(BaseModel):
     level: Literal["INFO", "WARN", "CRITICAL"]
-    category: Literal["PRODUCT_D1_DROP", "TRAFFIC_ANOMALY", "ROI_GUARD"]
+    category: Literal["PRODUCT_D1_DROP", "TRAFFIC_ANOMALY", "ROI_GUARD", "SPEND_DROP", "SPEND_SPIKE", "ROI_DECLINE_TREND", "CAP_PROXIMITY"]
     message: str
     product_id: Optional[str] = None
 

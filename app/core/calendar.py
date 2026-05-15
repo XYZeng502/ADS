@@ -98,10 +98,13 @@ class CalendarService:
         return "workday"
 
     def get_scale_factors(self) -> Dict[DayType, float]:
+        # 基于历史数据实证校准（加权 ROI 比）
+        # weekend: 1.104 → 1.10, holiday: 1.152 → 1.15
+        # shopping_festival / summer_winter 暂无数据覆盖，沿用预设值待验证
         return {
             "workday": 1.0,
-            "weekend": 1.08,
-            "holiday": 1.12,
+            "weekend": 1.10,
+            "holiday": 1.15,
             "shopping_festival": 1.15,
             "summer_winter": 1.10,
         }

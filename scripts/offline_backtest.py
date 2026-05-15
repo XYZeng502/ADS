@@ -875,6 +875,18 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             today_real_revenue=target_actual[app_id]["revenue"],
             today_predicted_revenue=pred_today_revenue,
         )
+        recent_spends = [
+            v["spend"]
+            for (a_id, d), v in sorted(app_daily_history.items(), key=lambda x: x[0][1])
+            if a_id == app_id
+        ][-settings.risk_spend_lookback_days - 1:-1]
+        if len(recent_spends) >= 3:
+            spend_alerts = risk.evaluate_spend_anomaly(
+                app_id=app_id,
+                current_spend=target_actual[app_id]["spend"],
+                recent_spends=recent_spends,
+            )
+            extra_alerts.extend(spend_alerts)
         all_alerts = [a.model_dump() for a in plan.alerts] + [a.model_dump() for a in extra_alerts]
         top_suggestions = sorted(plan.suggestions, key=lambda x: x.suggested_budget, reverse=True)[:8]
         solver_budget_b = round(sum(x.suggested_budget for x in plan_b.suggestions), 2)

@@ -26,6 +26,8 @@ bash scripts/run_web_8000.sh
 | `scripts/offline_backtest.py` | 离线回放 + 应用层月末推荐 |
 | `app/prediction_artifacts.py` | 预测产物路径解析 |
 | `app/core/calendar.py` | 节假日日历服务（chinese_calendar） |
+| `app/services/risk.py` | 风控服务：多维度告警 + 风险评分 |
+| `app/schemas.py` | Pydantic 数据模型（ProductDiagnosis, RiskAlert 等） |
 
 ## 数据
 
@@ -45,6 +47,22 @@ bash scripts/run_web_8000.sh
 `run_app_level_last_day_prediction` 基于历史数据为每个应用生成每日预算建议。
 - `app_last_day_min_train_days=30`, `app_last_day_canonical_month_end_roi="fused"`
 
+## 风控系统
+
+`RiskService` 提供多维度告警检测 + 综合风险评分（0-100）：
+
+| 告警类型 | 级别 | 触发条件 |
+|---------|------|---------|
+| `PRODUCT_D1_DROP` | WARN | 产品连续 N 天 D1 低于预测 90% |
+| `TRAFFIC_ANOMALY` | CRITICAL | 当日变现偏离预测 ≥20% |
+| `ROI_GUARD` | WARN | 月末 ROI 预测低于 KPI buffer |
+| `SPEND_DROP` | CRITICAL | 消耗骤降至近期均值 50% 以下（avg≥30 才触发） |
+| `SPEND_SPIKE` | WARN | 消耗骤升至近期均值 2.5x 以上（avg≥30 才触发） |
+| `ROI_DECLINE_TREND` | WARN | 连续 5 天 ROI 趋势下行 |
+| `CAP_PROXIMITY` | WARN | 计划预算达到 cap 的 85% |
+
+配置项均集中在 `app/config.py` 的 `Settings` 中。
+
 ## 最新模型版本
 
 | 版本 | 目录 | MAPE | 关键改动 |
@@ -56,10 +74,9 @@ Web fallback: ROI v9→v8→v7, Spend v12→v11。
 
 ## 未提交改动
 
-1. `app/config.py` — `app_last_day_min_train_days=30`
-2. `app/core/calendar.py` — 集成 chinese_calendar; is_rest_day
-3. `app/web.py` — 悬浮弹窗; 路径更新 v12/v9; 推荐模块可读性优化; 50000 行限制; f-string 转义修复
-4. `app/unified_daily.py` — 新增统一数据管线 + target_is_rest_day/target_is_adjusted_workday 特征
-5. `scripts/offline_backtest.py` — 30天过滤; 路径更新 v12/v9
-6. `scripts/run_parallel_models_spend_t1.py` — 统一底表 + target_is_rest_day + 校准函数调休修复 + XGBoost GPU
-7. `scripts/run_parallel_models_roi_d1.py` — 统一底表 + target_is_rest_day 同口径 + XGBoost GPU
+1. `app/config.py` — 新增风控参数（spend anomaly/ROI decline/cap proximity）+ scale 因子微调
+2. `app/core/calendar.py` — scale 因子基于实证校准：weekend 1.08→1.10, holiday 1.12→1.15
+3. `app/schemas.py` — ProductDiagnosis 加 trend/cap_utilization；RiskAlert 加 4 个新 category
+4. `app/services/risk.py` — 风控重构：拆分子方法 + 新增 spend_anomaly/roi_decline/cap_proximity/趋势判断/风险评分
+5. `app/web.py` — 六层决策面板（KPI/时间/配置/节奏/风控/决策排序）+ 优先级排序优化
+6. `scripts/offline_backtest.py` — 回测中接入 spend anomaly 检测

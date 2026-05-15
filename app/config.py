@@ -12,6 +12,12 @@ class Settings(BaseModel):
     risk_d1_drop_ratio: float = 0.9
     risk_revenue_deviation_threshold: float = 0.2
     risk_month_roi_guard_buffer: float = 0.03
+    risk_spend_drop_ratio: float = 0.5  # 消耗较近期均值骤降50%触发告警
+    risk_spend_spike_ratio: float = 2.5  # 消耗较近期均值骤升2.5x触发告警
+    risk_spend_lookback_days: int = 7
+    risk_spend_anomaly_min_avg_spend: float = 30.0  # 近期均值低于此阈值不触发消耗异常告警，过滤小消耗噪声
+    risk_roi_decline_days: int = 5  # 连续N天ROI趋势下行触发告警
+    risk_cap_utilization_threshold: float = 0.85  # 计划预算达到cap的85%触发预警
     kpi_release_gap_threshold: float = 0.03
     kpi_guard_gap_threshold: float = 0.02
     kpi_release_budget_ratio: float = 0.15

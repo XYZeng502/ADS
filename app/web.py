@@ -391,7 +391,27 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .s-ok {{ color:#15803d; background:#dcfce7; }}
     .s-warn {{ color:#a16207; background:#fef3c7; }}
     .s-critical {{ color:#b91c1c; background:#fee2e2; }}
+    .s-release {{ color:#7c3aed; background:#ede9fe; }}
     .trace-card ul {{ margin: 10px 0 0 16px; padding:0; color: var(--muted); line-height: 1.5; font-size: 12px; }}
+    .layer-panels {{ display: flex; flex-direction: column; gap: 8px; }}
+    .layer-panel {{ border: 1px solid var(--line); border-radius: 14px; background: #fff; overflow: hidden; }}
+    .layer-panel.open {{ border-color: var(--blue); box-shadow: 0 0 0 3px #dbeafe; }}
+    .layer-header {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; cursor: pointer; user-select: none; gap: 12px; }}
+    .layer-header:hover {{ background: #f8fafc; }}
+    .layer-header .layer-icon {{ font-size: 20px; width: 32px; text-align: center; flex-shrink: 0; }}
+    .layer-header .layer-name {{ font-weight: 700; font-size: 14px; flex-shrink: 0; }}
+    .layer-header .layer-summary {{ flex: 1; font-size: 12px; color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .layer-header .layer-status {{ font-size: 11px; border-radius: 999px; padding: 3px 10px; font-weight: 650; flex-shrink: 0; }}
+    .layer-header .layer-arrow {{ font-size: 12px; color: var(--muted); transition: transform 0.2s; flex-shrink: 0; }}
+    .layer-panel.open .layer-arrow {{ transform: rotate(180deg); }}
+    .layer-body {{ display: none; padding: 0 16px 16px; border-top: 1px solid var(--line); }}
+    .layer-panel.open .layer-body {{ display: block; }}
+    .layer-body table {{ font-size: 12px; }}
+    .layer-body table th {{ background: #f8fafc; font-size: 11px; }}
+    .layer-body .layer-stat {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }}
+    .layer-body .layer-stat-item {{ background: #f8fafc; border-radius: 10px; padding: 10px 12px; }}
+    .layer-body .layer-stat-item .sv {{ font-size: 20px; font-weight: 780; }}
+    .layer-body .layer-stat-item .sk {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }}
     th {{ color: var(--muted); font-weight: 650; background: #f8fafc; position: sticky; top: 0; }}
@@ -611,10 +631,10 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
       <div class="note" id="decisionNote"></div>
     </div>
     <div class="section-title" style="margin-top:16px;">
-      <h2>重点应用推荐依据</h2>
-      <div class="hint">按风险和动作优先级排序</div>
+      <h2>六层决策面板</h2>
+      <div class="hint">点击各层面板展开查看详情；选中应用后各层切换至该应用视角</div>
     </div>
-    <div class="trace-grid" id="traceCards"></div>
+    <div class="layer-panels" id="layerPanels"></div>
   </div>
 </div>
 </div>
@@ -833,10 +853,13 @@ function appMonthRoiRows() {{
       roiGap: monthEndRoi - kpi,
     }};
     const decision = appRoiDecision(row);
+    const absBudgetDelta = Math.abs(row.plannedBudget - row.actualSpend);
+    const spendWeight = Math.log1p(row.actualSpend);
     const priorityScore =
       Math.max(0, -row.roiGap) * 100 +
       row.alertCount * 8 +
-      Math.abs(decision.budgetChange) * 12 +
+      absBudgetDelta * 0.05 +
+      spendWeight * 3 +
       (row.dominantFactor === 'BALANCED' ? 1 : 2);
     return {{ ...row, ...decision, priorityScore }};
   }});
@@ -1251,32 +1274,146 @@ function renderBusinessSnapshot() {{
     </div>
   `;
 
-  const traceCards = [
-    ['KPI层', kpiOk ? 'OK' : 'WARN', [
-      `月末 ROI 预测均值 ${{fmt(avgRoi,4)}}` + (kpiOk ? ' 高于' : ' 低于') + ` KPI ${{fmt(kpi,4)}}，差距 ${{pct(Math.abs(avgRoi - kpi))}}`,
-      `覆盖 ${{rows.length}} 个应用，其中 ${{rows.filter(r=>r.monthEndRoi>=kpi).length}} 个达标`,
-    ]],
-    ['预测层', 'OK', [
-      `模型预测 ${{rows.length}} 个应用的 T+1 ROI，逐日汇总至月末`,
-      `偏差来源：单日预测误差累积 + 月末 spend 分布假设`,
-    ]],
-    ['推荐层', 'OK', [
-      `主要动作 <b>${{topAction[0]}}</b>，覆盖 ${{topAction[1]}} 个应用（${{fmt(topAction[1]/rows.length*100,1)}}%）`,
-      `次要动作：${{[...actionCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(1,3).map(x=>x[0]+\"(\"+x[1]+\"个)\").join('、') || '无'}}`,
-    ]],
-    ['风险层', riskRows.length ? 'WARN' : 'OK', [
-      `风险应用 ${{riskRows.length}} 个：` + (riskRows.length ? `${{riskRows.filter(r=>r.roiGap<0).length}} 个低于 KPI，${{riskRows.filter(r=>r.alertCount>0).length}} 个有历史告警` : '全部达标且无告警'),
-      riskRows.length ? `典型风险：${{riskRows.slice(0,3).map(r=>r.app+\"(ROI=\"+fmt(r.monthEndRoi,4)+\")\").join('、')}}` : '',
-    ].filter(Boolean)],
-    ['决策层', 'OK', [
-      `按 ROI 差距排序后，前 5 优先 ${{topRecommend ? '已列出' : '暂无'}}`,
-      `详细依据见下方「重点应用推荐依据」表格`,
-    ]],
+  // ---- 六层交互面板 ----
+  const aboveKpiCount = rows.filter(r => r.monthEndRoi >= kpi).length;
+  const belowKpiCount = rows.length - aboveKpiCount;
+  const factorEntries = [...factorCounts.entries()];
+
+  const layers = [
+    {{
+      id: 'kpi', icon: '🎯', name: 'KPI 层 — 做什么',
+      status: kpiOk ? 'OK' : 'WARN',
+      summary: `月末ROI均值 ${{fmt(avgRoi,4)}}` + (kpiOk ? ' ≥' : ' <') + ` KPI ${{fmt(kpi,4)}}，${{aboveKpiCount}}/${{rows.length}} 应用达标`,
+      body: `
+        <div class="layer-stat">
+          <div class="layer-stat-item"><div class="sv">${{fmt(avgRoi,4)}}</div><div class="sk">平均预测月末ROI</div></div>
+          <div class="layer-stat-item"><div class="sv">${{aboveKpiCount}}</div><div class="sk">达标应用数（ROI≥${{fmt(kpi,4)}}）</div></div>
+          <div class="layer-stat-item"><div class="sv" style="color:${{belowKpiCount > 0 ? 'var(--red)' : 'var(--green)'}}">${{belowKpiCount}}</div><div class="sk">未达标应用数</div></div>
+          <div class="layer-stat-item"><div class="sv">${{pct(avgRoi - kpi)}}</div><div class="sk">相对KPI差距</div></div>
+        </div>
+        <div class="hint" style="margin-bottom:8px;">偏差主因分布（按应用数）</div>
+        <table><thead><tr><th>主因</th><th>应用数</th><th>占比</th><th>含义</th></tr></thead><tbody>
+          ${{factorEntries.sort((a,b)=>b[1]-a[1]).map(([k,v]) => {{
+            const meaning = {{SPEND:'消耗主导',D1_ANCHOR:'D1锚点主导',CURVE:'长尾曲线主导',BALANCED:'多因子均衡'}}[k] || k;
+            return `<tr><td><b>${{k}}</b></td><td>${{v}}</td><td>${{fmt(v/rows.length*100,1)}}%</td><td>${{meaning}}</td></tr>`;
+          }}).join('')}}
+        </tbody></table>
+      `
+    }},
+    {{
+      id: 'time', icon: '📅', name: '时间层 — 什么时候冲',
+      status: 'INFO',
+      summary: '日历驱动：周末/节假日/调休日识别 + scale因子调节预算节奏',
+      body: `
+        <div class="plain-note" style="margin-bottom:12px;">时间层根据次日类型（工作日/周末/节假日/寒暑假/电商节）自动调整预算 scale 因子，在流量高峰期适度放量。</div>
+        <table><thead><tr><th>日期类型</th><th>scale 因子</th><th>策略</th></tr></thead><tbody>
+          <tr><td>工作日</td><td>1.00</td><td>基准节奏，均匀消耗</td></tr>
+          <tr><td>周末</td><td>1.08</td><td>流量高约8%，适度多投</td></tr>
+          <tr><td>节假日</td><td>1.12</td><td>流量高且持续多天，提前蓄量</td></tr>
+          <tr><td>寒暑假</td><td>1.10</td><td>持续时间长，长期预算规划窗口</td></tr>
+          <tr><td>电商节</td><td>1.15</td><td>ECPM高，高变现窗口可多投</td></tr>
+        </tbody></table>
+        <div class="hint" style="margin-top:8px;">scale 因子当前为经验预设值，待历史数据回测校准。</div>
+      `
+    }},
+    {{
+      id: 'alloc', icon: '📊', name: '配置层 — 钱分给谁',
+      status: 'OK',
+      summary: `主要动作 <b>${{topAction[0]}}</b>（${{topAction[1]}}个应用）；全局ROI池化，A级补贴C级`,
+      body: `
+        <div class="layer-stat">
+          <div class="layer-stat-item"><div class="sv">${{totalPlan.toFixed(0)}}</div><div class="sk">今日计划预算总额</div></div>
+          <div class="layer-stat-item"><div class="sv">${{topAction[0]}}</div><div class="sk">主要推荐动作</div></div>
+          <div class="layer-stat-item"><div class="sv">${{topAction[1]}}</div><div class="sk">覆盖应用数（${{fmt(topAction[1]/rows.length*100,1)}}%）</div></div>
+          <div class="layer-stat-item"><div class="sv">${{actionCounts.size}}</div><div class="sk">动作种类数</div></div>
+        </div>
+        <div class="hint" style="margin-bottom:8px;">动作分布详情</div>
+        <table><thead><tr><th>动作</th><th>应用数</th><th>占比</th></tr></thead><tbody>
+          ${{[...actionCounts.entries()].sort((a,b)=>b[1]-a[1]).map(([k,v]) => `<tr><td>${{k}}</td><td>${{v}}</td><td>${{fmt(v/rows.length*100,1)}}%</td></tr>`).join('')}}
+        </tbody></table>
+      `
+    }},
+    {{
+      id: 'rhythm', icon: '🔄', name: '节奏层 — 月内每天怎么排',
+      status: avgRoi >= kpi + 0.05 ? 'RELEASE' : 'OK',
+      summary: avgRoi >= kpi + 0.05
+        ? `盈余充足（ROI盈余 ${{pct(avgRoi - kpi - 0.05)}}），可切换规模最大化模式`
+        : '盈余不足，维持达标优先节奏；月末根据累计ROI动态切换',
+      body: `
+        <div class="layer-stat">
+          <div class="layer-stat-item"><div class="sv">${{pct(avgRoi - kpi)}}</div><div class="sk">ROI盈余（>5pp可释放）</div></div>
+          <div class="layer-stat-item"><div class="sv">${{totalMonthSpend.toFixed(0)}}</div><div class="sk">预测月末总消耗</div></div>
+          <div class="layer-stat-item"><div class="sv">${{rows.filter(r => (r.mode||'').toUpperCase() === 'SCALE').length}}</div><div class="sk">放量模式应用数</div></div>
+          <div class="layer-stat-item"><div class="sv">${{rows.filter(r => (r.mode||'').toUpperCase() === 'GUARD').length}}</div><div class="sk">保守模式应用数</div></div>
+        </div>
+        <div class="plain-note">U型节奏：月初冲量 → 月中平稳 → 月末在盈余充足时释放跨月蓄力。当前月末释放触发阈值 = KPI + 5pp = ${{fmt(kpi + 0.05, 4)}}。</div>
+      `
+    }},
+    {{
+      id: 'risk', icon: '🛡️', name: '风控层 — 出了偏差怎么办',
+      status: riskRows.length ? 'WARN' : 'OK',
+      summary: riskRows.length
+        ? `${{riskRows.length}} 个风险应用（${{riskRows.filter(r=>r.roiGap<0).length}} 个低于KPI，${{riskRows.filter(r=>r.alertCount>0).length}} 个有告警）`
+        : '全部应用达标且无告警，暂无风险',
+      body: riskRows.length ? `
+        <table><thead><tr><th>应用ID</th><th>月末ROI</th><th>ROI差距</th><th>告警数</th><th>建议动作</th></tr></thead><tbody>
+          ${{riskRows.slice(0, 15).map(r => `<tr>
+            <td><b>${{r.app}}</b></td>
+            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
+            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{pct(r.roiGap)}}</td>
+            <td>${{r.alertCount}}</td>
+            <td><span class="pill ${{r.action.includes('控量')||r.action.includes('收紧') ? 'bad' : 'good'}}">${{r.action}}</span></td>
+          </tr>`).join('')}}
+        </tbody></table>
+        ${{riskRows.length > 15 ? `<div class="hint" style="margin-top:8px;">仅展示前 15 个，共 ${{riskRows.length}} 个风险应用</div>` : ''}}
+        <div class="hint" style="margin-top:8px;">风险检测：D1连续下滑 | ROI趋势下行 | 消耗骤降/骤升 | Cap逼近 | 流量偏离 ±20% | 月末ROI警戒</div>
+      ` : '<div class="note-body" style="color:#15803d;padding: 8px 0;">✅ 当前全部应用达标且无告警</div>'
+    }},
+    {{
+      id: 'decision', icon: '🧭', name: '决策排序层 — 先定什么后定什么',
+      status: 'OK',
+      summary: `按ROI差距排序，前5优先：${{topRecommend ? '已列出' : '暂无'}}；产品×时间联合求解`,
+      body: `
+        <div class="plain-note" style="margin-bottom:12px;">当前求解路径：先产品比例分配 → 再按节假日微调（方案B）。未来可升级为产品×时间联合求解（方案C，需Gurobi/PuLP）。</div>
+        <div class="hint" style="margin-bottom:8px;">优先处理应用（按ROI差距绝对值排序，前10）</div>
+        <table><thead><tr><th>优先级</th><th>应用ID</th><th>月末ROI</th><th>ROI差距</th><th>建议动作</th></tr></thead><tbody>
+          ${{[...rows].sort((a,b)=>Math.abs(b.roiGap)-Math.abs(a.roiGap)).slice(0, 10).map((r, i) => `<tr>
+            <td>${{i + 1}}</td>
+            <td><b>${{r.app}}</b></td>
+            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
+            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{pct(r.roiGap)}}</td>
+            <td><span class="pill ${{r.action.includes('控量')||r.action.includes('收紧') ? 'bad' : 'good'}}">${{r.action}}</span></td>
+          </tr>`).join('')}}
+        </tbody></table>
+      `
+    }},
   ];
-  document.getElementById('traceCards').innerHTML = traceCards.map(([title, status, findings]) => {{
-    const cls = status === 'CRITICAL' ? 's-critical' : (status === 'WARN' ? 's-warn' : 's-ok');
-    return `<div class="trace-card"><div class="t"><span>${{title}}</span><span class="s ${{cls}}">${{status}}</span></div><ul>${{findings.map(x=>`<li>${{x}}</li>`).join('')}}</ul></div>`;
+
+  document.getElementById('layerPanels').innerHTML = layers.map(l => {{
+    const cls = l.status === 'CRITICAL' ? 's-critical' : (l.status === 'WARN' ? 's-warn' : (l.status === 'RELEASE' ? 's-release' : 's-ok'));
+    return `<div class="layer-panel" id="lp-${{l.id}}">
+      <div class="layer-header" data-layer="${{l.id}}">
+        <span class="layer-icon">${{l.icon}}</span>
+        <span class="layer-name">${{l.name}}</span>
+        <span class="layer-summary">${{l.summary}}</span>
+        <span class="layer-status s ${{cls}}">${{l.status}}</span>
+        <span class="layer-arrow">▼</span>
+      </div>
+      <div class="layer-body">${{l.body}}</div>
+    </div>`;
   }}).join('');
+
+  // toggle expand/collapse
+  document.querySelectorAll('.layer-header').forEach(h => {{
+    h.addEventListener('click', () => {{
+      const panel = h.parentElement;
+      const wasOpen = panel.classList.contains('open');
+      // close all
+      document.querySelectorAll('.layer-panel.open').forEach(p => p.classList.remove('open'));
+      // open clicked (unless it was open)
+      if (!wasOpen) panel.classList.add('open');
+    }});
+  }});
 }}
 
 function renderCharts(rows) {{
