@@ -71,6 +71,9 @@ external/
 *.sqlite
 *.sqlite3
 
+# ML 训练临时文件
+catboost_info/
+
 # data：默认忽略；仅保留业务日历配置（CalendarService 依赖）
 /data/*
 !/data/business_calendar_2026.json
