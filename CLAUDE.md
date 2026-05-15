@@ -49,8 +49,8 @@ bash scripts/run_web_8000.sh
 
 | 版本 | 目录 | MAPE | 关键改动 |
 |------|------|------|---------|
-| ROI v9 | `model_parallel_roi_d1_v9_unified` | 29.15% | 统一底表 + target_is_rest_day 调休修复 + XGBoost GPU |
-| Spend v12 | `model_parallel_spend_t1_v12_unified` | 60.80% | 统一底表 + target_is_rest_day 调休修复 + XGBoost GPU |
+| ROI v9 | `model_parallel_roi_d1_v9_unified` | 29.15% | 统一底表 + target_is_rest_day + 交互特征 + XGBoost GPU |
+| Spend v12 | `model_parallel_spend_t1_v12_unified` | 59.26% | 统一底表 + target_is_rest_day + 交互特征 + XGBoost GPU |
 
 Web fallback: ROI v9→v8→v7, Spend v12→v11。
 

@@ -24,6 +24,11 @@ try:
 except Exception:  # pragma: no cover
     XGBRegressor = None
 
+try:
+    from catboost import CatBoostRegressor
+except Exception:  # pragma: no cover
+    CatBoostRegressor = None
+
 
 @dataclass
 class ModelResult:
@@ -102,6 +107,18 @@ def _build_model(model_name: str, params: Optional[Dict[str, object]] = None, us
         if use_gpu:
             xgb_kwargs["device"] = "cuda"
         return XGBRegressor(**xgb_kwargs)
+    if model_name == "CatBoost":
+        if CatBoostRegressor is None:
+            return None
+        cb_kwargs = dict(
+            iterations=500,
+            learning_rate=0.03,
+            depth=6,
+            random_seed=42,
+            verbose=0,
+            thread_count=4,
+        )
+        return CatBoostRegressor(**cb_kwargs)
     return None
 
 
@@ -167,6 +184,13 @@ def _get_base_feature_cols() -> List[str]:
         "target_is_post_holiday_1d",
         "target_is_post_holiday_3d",
         "target_is_first_workday_after_holiday",
+        # 交互特征 + app label
+        "spend_x_is_rest_day",
+        "spend_lag1_x_target_rest",
+        "spend_lag1_x_target_holiday",
+        "spend_ratio_x_target_rest",
+        "roi_lag1_x_target_rest",
+        "app_label",
     ]
 
 
@@ -659,7 +683,7 @@ def _run_backtest_parallel(
     candidate_cutoffs = all_dates[:-1]
     if eval_recent_days is not None and eval_recent_days > 0 and len(candidate_cutoffs) > eval_recent_days:
         candidate_cutoffs = candidate_cutoffs[-eval_recent_days:]
-    tree_model_names = selected_tree_models or ["RandomForest", "GBDT", "ExtraTrees", "HistGB", "LightGBM", "XGBoost"]
+    tree_model_names = selected_tree_models or ["RandomForest", "GBDT", "ExtraTrees", "HistGB", "LightGBM", "XGBoost", "CatBoost"]
     model_specs: List[Tuple[str, str, Optional[Dict[str, object]]]] = [(m, m, None) for m in tree_model_names]
     base_feature_cols = _get_base_feature_cols()
     preds_by_model = {"EWMA": []}

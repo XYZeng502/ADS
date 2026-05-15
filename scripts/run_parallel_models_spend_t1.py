@@ -25,6 +25,11 @@ try:
 except Exception:  # pragma: no cover
     XGBRegressor = None
 
+try:
+    from catboost import CatBoostRegressor
+except Exception:  # pragma: no cover
+    CatBoostRegressor = None
+
 
 @dataclass
 class ModelResult:
@@ -96,6 +101,12 @@ BASE_FEATURE_COLS = [
         "scene_n_unique", "scene_top1_pct", "scene_hhi",
         "creative_n_unique", "creative_top1_pct", "creative_hhi",
         "billing_n_unique", "billing_top1_pct", "billing_hhi",
+        # 交互特征 + app label
+        "spend_x_is_rest_day",
+        "spend_lag1_x_target_rest",
+        "spend_lag1_x_target_holiday",
+        "spend_ratio_x_target_rest",
+        "app_label",
     ]
 
 CALENDAR_PACING_FEATURE_COLS = [
@@ -139,6 +150,11 @@ CALENDAR_PACING_FEATURE_COLS = [
     "mtd_spend",
     "mtd_revenue",
     "mtd_roi_d1",
+    "spend_x_is_rest_day",
+    "spend_lag1_x_target_rest",
+    "spend_lag1_x_target_holiday",
+    "spend_ratio_x_target_rest",
+    "app_label",
 ]
 
 
@@ -186,6 +202,18 @@ def _build_model(name: str, use_gpu: bool = False) -> Optional[object]:
         if use_gpu:
             xgb_kwargs["device"] = "cuda"
         return XGBRegressor(**xgb_kwargs)
+    if name == "CatBoost":
+        if CatBoostRegressor is None:
+            return None
+        cb_kwargs = dict(
+            iterations=500,
+            learning_rate=0.03,
+            depth=6,
+            random_seed=42,
+            verbose=0,
+            thread_count=4,
+        )
+        return CatBoostRegressor(**cb_kwargs)
     return None
 
 
@@ -790,7 +818,7 @@ def main() -> None:
         if not tree_override:
             tree_override = ["ExtraTrees"]
     if not tree_override:
-        tree_override = ["XGBoost"]
+        tree_override = ["XGBoost", "CatBoost"]
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -298,6 +298,16 @@ def build_unified_daily(
         1.0,
     )
 
+    # ---- 交互特征：休息日 × 消耗模式 ----
+    df["spend_x_is_rest_day"] = df["消耗金额"] * df["is_rest_day"]
+    df["spend_lag1_x_target_rest"] = df["spend_lag_1"] * df["target_is_rest_day"]
+    df["spend_lag1_x_target_holiday"] = df["spend_lag_1"] * df["target_is_holiday"]
+    df["spend_ratio_x_target_rest"] = df["spend_ratio_1d"] * df["target_is_rest_day"]
+    df["roi_lag1_x_target_rest"] = df["roi_lag_1"] * df["target_is_rest_day"]
+
+    # ---- app label encoding ----
+    df["app_label"] = df["应用ID"].astype("category").cat.codes
+
     # ---- 清理 ----
     fill_cols = [c for c in df.columns if "lag_" in c or "roll_" in c or "ratio_" in c
                  or c in ("month_progress", "mtd_roi_d1", "roi_d1_std_7", "roi_d1_iqr_7",
