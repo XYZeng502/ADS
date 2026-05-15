@@ -237,24 +237,19 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     root = _repo_root() / "outputs"
     roi_dir = _pick_existing(
         [
-            root / "model_parallel_roi_d1_v7_aligned",
-            root / "model_parallel_roi_d1_default_weekly_v3",
-            root / "model_parallel_roi_d1_default_weekly_v2",
-            root / "model_parallel_roi_d1_default_weekly",
-            root / "model_parallel_roi_d1",
+            root / "model_parallel_roi_d1_v9_unified",
+            root / "model_parallel_roi_d1_v8_001",
+            root / "model_parallel_roi_d1_v7_001",
         ]
     )
     spend_dir = _pick_existing(
         [
-            root / "model_parallel_spend_t1_v9_composition",
-            root / "model_parallel_spend_t1_v8_filtered",
-            root / "model_parallel_spend_t1_v4",
-            root / "model_parallel_spend_t1_target_calendar_calibrated_app",
-            root / "model_parallel_spend_t1_split_online_fusion_script_verified",
+            root / "model_parallel_spend_t1_v12_unified",
+            root / "model_parallel_spend_t1_v11_001",
         ]
     )
     date_feature_dir = root / "model_parallel_spend_t1_date_features_lgbm"
-    old_spend_path = root / "model_parallel_spend_t1_split_online_fusion_script_verified" / "predictions_reconciled.csv"
+    old_spend_path = root / "model_parallel_spend_t1_v12_unified" / "predictions_XGBoost_log.csv"
     app_month_roi_path = root / "app_level_last_day_suggestions.csv"
     app_month_roi_summary = _read_json(root / "app_level_last_day_prediction.json")
 
@@ -382,6 +377,13 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .chart {{ height: 360px; border: 1px solid var(--line); border-radius: 16px; background: #fff; }}
     .wide {{ height: 330px; }}
     .note {{ background: #fffbeb; border: 1px solid #fde68a; color: #92400e; padding: 12px 14px; border-radius: 14px; line-height: 1.6; }}
+    .note-section {{ padding: 6px 0; }}
+    .note-section + .note-section {{ border-top: 1px solid #fde68a; margin-top: 4px; padding-top: 10px; }}
+    .note-label {{ font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }}
+    .note-body {{ color: #78350f; }}
+    .note-list {{ margin: 4px 0 0 18px; padding: 0; }}
+    .note-list li {{ margin-bottom: 3px; }}
+    .note-list-risk {{ color: #b91c1c; }}
     .trace-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }}
     .trace-card {{ border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: #fff; min-height: 132px; }}
     .trace-card .t {{ display:flex; justify-content:space-between; gap:8px; align-items:center; font-weight:700; }}
@@ -772,15 +774,20 @@ function appRoiDecision(r) {{
     action = '保守控量';
   }}
 
+  const actionTexts = {{
+    '正常放量': '放量',
+    '小幅放量': '小幅放量',
+    '维持现状': '维持',
+    '保守控量': '控量',
+    '暂停投放': '暂停',
+  }};
   const basis = [
-    `主决策月末ROI=${{fmt(r.monthEndRoi,4)}}（口径=${{r.canonicalLabel}}），对照KPI=${{fmt(kpiT,4)}}，差距=${{pct(gap)}}；cohort增量口径，与单日D1类KPI不同标尺；求解器模式 ${{mode || '-'}}；主口径唯一配置项见 app/config.py settings.app_last_day_canonical_month_end_roi`,
-    `三条对照：稳定锚点=${{fmt(r.monthEndRoiStable,4)}}，纯预测模块=${{fmt(r.monthEndRoiPredOnly,4)}}，融合=${{fmt(r.monthEndRoiFused,4)}}`,
-    `未来日耗(三套)：稳定=${{fmt(r.plannedDailyStable,2)}}，纯预测=${{fmt(r.plannedDailyPredOnly,2)}}，融合=${{fmt(r.plannedDailyFused,2)}}；昨日实际消耗=${{fmt(r.actualSpend,2)}}，主用计划预算=${{fmt(r.plannedBudget,2)}}，预算变化=${{pct(budgetChange)}}`,
-    `T+1 校准输入：spend=${{fmt(r.spendT1Calibrated,2)}}，roi_d1=${{fmt(r.roiD1T1Calibrated,4)}}`,
-    `风险告警=${{alertCount}}，偏差主因=${{r.dominantFactor}}`,
-    `D1锚点 raw=${{fmt(r.d1Raw,4)}} → calibrated=${{fmt(r.d1Calibrated,4)}}`,
-  ].join('；');
-  return {{ action, basis, budgetChange }};
+    `月末ROI ${{fmt(r.monthEndRoi,4)}} vs KPI ${{fmt(kpiT,4)}}（${{pct(gap)}}）`,
+    `预算 ${{fmt(r.plannedBudget,2)}}（变化${{pct(budgetChange)}}）| 昨日消耗 ${{fmt(r.actualSpend,2)}}`,
+    `模式 ${{mode || '-'}} | 告警 ${{alertCount}} | ${{r.dominantFactor}}`,
+  ].join('<br>');
+  const actionLabel = actionTexts[action] || action;
+  return {{ action: actionLabel, basis, budgetChange }};
 }}
 
 function appMonthRoiRows() {{
@@ -821,6 +828,8 @@ function appMonthRoiRows() {{
       spendT1Calibrated: num(r.spend_t1_pred_calibrated),
       roiD1T1Calibrated: num(r.roi_d1_t1_pred_calibrated),
       topActions: r.top_actions || '',
+      topSuggestionsRaw: r.top_suggestions || '',
+      alertsRaw: r.alerts || '',
       roiGap: monthEndRoi - kpi,
     }};
     const decision = appRoiDecision(row);
@@ -1212,20 +1221,57 @@ function renderBusinessSnapshot() {{
   }});
 
   const topRecommend = [...rows].sort((a,b)=>Math.abs(b.roiGap)-Math.abs(a.roiGap)).slice(0, 5)
-    .map(r => `<li><b>应用 ${{r.app}}</b>：${{r.action}}；${{r.basis}}</li>`).join('');
-  const riskList = riskRows.slice(0, 5).map(r => `<li>应用 ${{r.app}}：月末ROI=${{fmt(r.monthEndRoi,4)}}，告警=${{r.alertCount}}，建议=${{r.action}}</li>`).join('');
+    .map(r => `<li><b>${{r.app}}</b>：${{r.action}}；${{r.basis}}</li>`).join('');
+  const riskList = riskRows.slice(0, 5).map(r => `<li>${{r.app}}：ROI=${{fmt(r.monthEndRoi,4)}}，告警${{r.alertCount}}次，建议${{r.action}}</li>`).join('');
+
+  const kpiOk = avgRoi >= kpi;
+  const kpiStatusCls = kpiOk ? 's-ok' : 's-warn';
+  const kpiStatusText = kpiOk ? '达标' : '未达标';
+  const kpiGapText = kpiOk ? `超出 ${{pct(avgRoi - kpi)}}` : `差距 ${{pct(kpi - avgRoi)}}`;
+
   document.getElementById('decisionNote').innerHTML = `
-    <b>业务结论：</b> 基于历史 CSV 的应用层月末 ROI 预测，平均预测月末 ROI=${{fmt(avgRoi,4)}}，相对 KPI=${{pct(avgRoi-kpi)}}。<br/>
-    <b>重点推荐：</b><ul>${{topRecommend}}</ul>
-    <b>风险应用：</b><ul>${{riskList || '<li>暂无风险应用</li>'}}</ul>
+    <div class="note-section">
+      <div class="note-label">KPI 状态</div>
+      <div class="note-body">
+        平均月末 ROI = <b>${{fmt(avgRoi,4)}}</b>，KPI = <b>${{fmt(kpi,4)}}</b>，
+        <span class="s ${{kpiStatusCls}}">${{kpiStatusText}}</span>
+        （${{kpiGapText}}）
+      </div>
+    </div>
+    <div class="note-section">
+      <div class="note-label">重点推荐</div>
+      <ol class="note-list">${{topRecommend || '<li>暂无推荐</li>'}}</ol>
+    </div>
+    <div class="note-section">
+      <div class="note-label">风险提示</div>
+      ${{riskRows.length
+        ? `<ol class="note-list note-list-risk">${{riskList}}</ol>`
+        : '<div class="note-body" style="color:#15803d;">暂无风险应用</div>'
+      }}
+    </div>
   `;
 
   const traceCards = [
-    ['KPI层', avgRoi >= kpi ? 'OK' : 'WARN', [`平均预测月末ROI=${{fmt(avgRoi,4)}}，KPI=${{fmt(kpi,4)}}。`]],
-    ['预测层', 'OK', [`覆盖 ${{rows.length}} 个应用；偏差主因分布来自应用层 attribution。`]],
-    ['推荐层', 'OK', [`主要动作=${{topAction[0]}}，覆盖 ${{topAction[1]}} 个应用。`]],
-    ['风险层', riskRows.length ? 'WARN' : 'OK', [`风险应用数=${{riskRows.length}}，判定依据为告警或低于KPI。`]],
-    ['解释层', 'OK', ['每个应用的推荐依据已在预测模块表格中按行展开。']],
+    ['KPI层', kpiOk ? 'OK' : 'WARN', [
+      `月末 ROI 预测均值 ${{fmt(avgRoi,4)}}` + (kpiOk ? ' 高于' : ' 低于') + ` KPI ${{fmt(kpi,4)}}，差距 ${{pct(Math.abs(avgRoi - kpi))}}`,
+      `覆盖 ${{rows.length}} 个应用，其中 ${{rows.filter(r=>r.monthEndRoi>=kpi).length}} 个达标`,
+    ]],
+    ['预测层', 'OK', [
+      `模型预测 ${{rows.length}} 个应用的 T+1 ROI，逐日汇总至月末`,
+      `偏差来源：单日预测误差累积 + 月末 spend 分布假设`,
+    ]],
+    ['推荐层', 'OK', [
+      `主要动作 <b>${{topAction[0]}}</b>，覆盖 ${{topAction[1]}} 个应用（${{fmt(topAction[1]/rows.length*100,1)}}%）`,
+      `次要动作：${{[...actionCounts.entries()].sort((a,b)=>b[1]-a[1]).slice(1,3).map(x=>x[0]+\"(\"+x[1]+\"个)\").join('、') || '无'}}`,
+    ]],
+    ['风险层', riskRows.length ? 'WARN' : 'OK', [
+      `风险应用 ${{riskRows.length}} 个：` + (riskRows.length ? `${{riskRows.filter(r=>r.roiGap<0).length}} 个低于 KPI，${{riskRows.filter(r=>r.alertCount>0).length}} 个有历史告警` : '全部达标且无告警'),
+      riskRows.length ? `典型风险：${{riskRows.slice(0,3).map(r=>r.app+\"(ROI=\"+fmt(r.monthEndRoi,4)+\")\").join('、')}}` : '',
+    ].filter(Boolean)],
+    ['决策层', 'OK', [
+      `按 ROI 差距排序后，前 5 优先 ${{topRecommend ? '已列出' : '暂无'}}`,
+      `详细依据见下方「重点应用推荐依据」表格`,
+    ]],
   ];
   document.getElementById('traceCards').innerHTML = traceCards.map(([title, status, findings]) => {{
     const cls = status === 'CRITICAL' ? 's-critical' : (status === 'WARN' ? 's-warn' : 's-ok');
@@ -1318,11 +1364,39 @@ function showAppPopup(appId, rowData, evt) {{
     document.getElementById('appSelectText').textContent = '已选中应用 ' + appId + ' — 图表和明细均仅显示该应用数据';
     render();
   }});
-  const basisText = rowData.basis || '-';
-  const topActionsText = rowData.topActions || '-';
+  // 解析 Python 风格字符串 → 提取基本信息
+  const parsePythonList = (s) => {{
+    if (!s || s === '-') return [];
+    try {{ return JSON.parse(s.replace(/'/g, '"').replace(/None/g, 'null').replace(/True/g, 'true').replace(/False/g, 'false')); }} catch(e) {{ return []; }}
+  }};
+  const alertsList = parsePythonList(rowData.alertsRaw || '');
+  const suggestionsList = parsePythonList(rowData.topSuggestionsRaw || '');
+
+  let alertsHtml = '';
+  if (alertsList.length > 0) {{
+    alertsHtml = '<div style="margin-top:4px;font-size:11px;color:#dc2626;">';
+    alertsList.forEach(a => {{
+      alertsHtml += '<div>' + (a.level||'') + ': ' + (a.message||'') + '</div>';
+    }});
+    alertsHtml += '</div>';
+  }}
+
+  let suggestionsHtml = '';
+  if (suggestionsList.length > 0) {{
+    suggestionsHtml = '<div style="margin-top:4px;font-size:11px;line-height:1.5;">';
+    suggestionsList.slice(0, 3).forEach(s => {{
+      suggestionsHtml += '<div>' + (s.slot||'') + ' | 预算' + (s.suggested_budget||'-') + ' | ROI ' + (s.expected_roi||'-') + '</div>';
+    }});
+    suggestionsHtml += '</div>';
+  }}
+
+  const actionLabel = rowData.action || '-';
   document.getElementById('popupInfo').innerHTML =
-    '<div><span class="lbl">推荐依据：</span>' + basisText + '</div>' +
-    '<div style="margin-top:4px;"><span class="lbl">分场景推荐：</span>' + topActionsText + '</div>';
+    '<div style="font-size:13px;font-weight:600;margin-bottom:4px;">决策: <span style="color:' + (actionLabel.includes('控')||actionLabel.includes('停') ? '#dc2626' : '#16a34a') + '">' + actionLabel + '</span></div>' +
+    '<div style="font-size:11px;line-height:1.55;color:var(--muted);">' + (rowData.basis || '-') + '</div>' +
+    alertsHtml +
+    '<div style="margin-top:4px;font-size:11px;color:var(--muted);">分场景推荐:</div>' +
+    suggestionsHtml;
 
   // init or re-use charts
   if (!_popupCharts.roi) _popupCharts.roi = echarts.init(document.getElementById('popupRoiChart'));
@@ -2283,11 +2357,9 @@ def _resolve_prediction_path(target: str) -> Path | None:
     if target == "roi":
         roi_dir = _pick_existing(
             [
-                root / "model_parallel_roi_d1_v7_aligned",
-                root / "model_parallel_roi_d1_default_weekly_v3",
-                root / "model_parallel_roi_d1_default_weekly_v2",
-                root / "model_parallel_roi_d1_default_weekly",
-                root / "model_parallel_roi_d1",
+                root / "model_parallel_roi_d1_v9_unified",
+                root / "model_parallel_roi_d1_v8_001",
+                root / "model_parallel_roi_d1_v7_001",
             ]
         )
         if roi_dir is None:
@@ -2295,11 +2367,8 @@ def _resolve_prediction_path(target: str) -> Path | None:
         return resolve_roi_predictions_csv(roi_dir)
     spend_dir = _pick_existing(
         [
-            root / "model_parallel_spend_t1_v9_composition",
-            root / "model_parallel_spend_t1_v8_filtered",
-            root / "model_parallel_spend_t1_v4",
-            root / "model_parallel_spend_t1_target_calendar_calibrated_app",
-            root / "model_parallel_spend_t1_split_online_fusion_script_verified",
+            root / "model_parallel_spend_t1_v12_unified",
+            root / "model_parallel_spend_t1_v11_001",
         ]
     )
     if spend_dir is None:

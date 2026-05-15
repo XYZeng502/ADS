@@ -2,7 +2,6 @@ import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -13,27 +12,18 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from app.config import settings
-from app.core.calendar import CalendarService
 from app.prediction_artifacts import validate_merged_daily_csv
+from app.unified_daily import build_unified_daily
 
 try:
     from lightgbm import LGBMRegressor
 except Exception:  # pragma: no cover
     LGBMRegressor = None
 
-
-CALENDAR = CalendarService()
-
-DEFAULT_CLEAN_GROUP_COLS = [
-    "应用ID",
-    "推广流量",
-    "推广流量名称",
-    "流量场景",
-    "流量场景名称",
-    "创意规格",
-    "创意规格名称",
-]
-DEFAULT_PRODUCT_KEY_COLS = ["应用ID", "推广流量名称"]
+try:
+    from xgboost import XGBRegressor
+except Exception:  # pragma: no cover
+    XGBRegressor = None
 
 
 @dataclass
@@ -41,260 +31,6 @@ class ModelResult:
     model_name: str
     metrics: Dict[str, float]
     prediction_df: pd.DataFrame
-
-
-def _is_holiday(d: date) -> bool:
-    return CALENDAR.is_holiday(d)
-
-
-def _is_rest_day(d: date) -> int:
-    return int(CALENDAR.is_rest_day(d))
-
-
-def _holiday_id(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_id"])
-
-
-def _holiday_seq_index(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_seq_index"])
-
-
-def _holiday_days_remaining(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_days_remaining"])
-
-
-def _holiday_window_len(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_window_len"])
-
-
-def _is_last_holiday_day(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["is_last_holiday_day"])
-
-
-def _is_first_workday_after_holiday(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["is_first_workday_after_holiday"])
-
-
-def _days_to_next_holiday(d: date) -> int:
-    return CALENDAR.days_to_next_holiday(d)
-
-
-def _days_since_prev_holiday(d: date) -> int:
-    return CALENDAR.days_since_prev_holiday(d)
-
-
-def _normalize_cols(raw_cols: List[str]) -> List[str]:
-    seen = set()
-    cols: List[str] = []
-    for c in raw_cols:
-        c2 = str(c).strip()
-        if not c2 or c2 in seen:
-            continue
-        seen.add(c2)
-        cols.append(c2)
-    return cols
-
-
-def _build_key(df: pd.DataFrame, cols: List[str]) -> pd.Series:
-    out = df[cols[0]].astype(str).fillna("")
-    for c in cols[1:]:
-        out = out + "|" + df[c].astype(str).fillna("")
-    return out
-
-
-def _build_composition_features(raw: pd.DataFrame) -> pd.DataFrame:
-    """为每个应用-日期计算子组构成特征（不增加行数）。
-
-    返回 DataFrame (应用ID, 日期, traffic_n_unique, traffic_top1_pct, traffic_hhi, ...)
-    """
-    comp_dims = {
-        "traffic": "推广流量名称",
-        "scene": "流量场景名称",
-        "creative": "创意规格名称",
-        "billing": "计费方式",
-    }
-    available_dims = {k: v for k, v in comp_dims.items() if v in raw.columns}
-    if not available_dims:
-        return pd.DataFrame(columns=["应用ID", "日期"])
-
-    frames = []
-    for dim_key, dim_col in available_dims.items():
-        spend = raw.groupby(["应用ID", "日期", dim_col])["消耗金额"].sum().reset_index()
-        total = spend.groupby(["应用ID", "日期"])["消耗金额"].transform("sum")
-        spend["share"] = np.where(total > 1e-8, spend["消耗金额"] / total, 0.0)
-        agg = (
-            spend.groupby(["应用ID", "日期"])
-            .agg(**{
-                f"{dim_key}_top1_pct": ("share", "max"),
-                f"{dim_key}_hhi": ("share", lambda s: float((s**2).sum())),
-            })
-            .reset_index()
-        )
-        pos = spend[spend["消耗金额"] > 1e-8]
-        agg2 = pos.groupby(["应用ID", "日期"])[dim_col].nunique().reset_index()
-        agg2.columns = ["应用ID", "日期", f"{dim_key}_n_unique"]
-        agg = agg.merge(agg2, on=["应用ID", "日期"], how="left")
-        agg[f"{dim_key}_n_unique"] = agg[f"{dim_key}_n_unique"].fillna(0).astype(int)
-        frames.append(agg)
-
-    result = frames[0]
-    for f in frames[1:]:
-        result = result.merge(f, on=["应用ID", "日期"], how="outer")
-    for c in result.columns:
-        if c not in ("应用ID", "日期"):
-            result[c] = result[c].fillna(0.0 if "_pct" in c or "_hhi" in c else 0)
-    return result
-
-
-def _build_app_daily(
-    input_csv: str,
-    split_col: str,
-    clean_group_cols: List[str],
-    product_key_cols: List[str],
-    min_spend_train: float = 0.01,
-) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    from app.data_cleaning import clean as _clean_csv
-
-    raw = _clean_csv(Path(input_csv))
-
-    split_col = str(split_col or "").strip()
-    clean_group_cols = _normalize_cols(clean_group_cols or DEFAULT_CLEAN_GROUP_COLS)
-    product_key_cols = _normalize_cols(product_key_cols or DEFAULT_PRODUCT_KEY_COLS)
-    needed = sorted(set(clean_group_cols + product_key_cols + ([split_col] if split_col else [])))
-    for c in needed:
-        if c not in raw.columns:
-            raise ValueError(f"输入数据缺少聚合字段: {c}")
-        raw[c] = raw[c].fillna("未知").astype(str)
-
-    # 阶段1：细粒度清洗（全时段总消耗为0的实体剔除）
-    clean_key = _build_key(raw, clean_group_cols)
-    clean_spend = (
-        pd.DataFrame({"clean_key": clean_key, "消耗金额": raw["消耗金额"]})
-        .groupby("clean_key", as_index=False)["消耗金额"]
-        .sum()
-        .rename(columns={"消耗金额": "total_spend"})
-    )
-    valid_clean_keys = set(clean_spend[clean_spend["total_spend"] > 0]["clean_key"].tolist())
-    clean_before = int(clean_spend.shape[0])
-    raw = raw[clean_key.isin(valid_clean_keys)].copy()
-    clean_after = len(valid_clean_keys)
-
-    # 阶段2：按训练实体聚合（并可再按 split_col 分流）
-    entity_cols = list(dict.fromkeys(product_key_cols + ([split_col] if split_col else [])))
-    group_cols = entity_cols + ["日期"]
-    df = (
-        raw.groupby(group_cols, as_index=False)[["消耗金额", "首日广告收入", "曝光量", "点击量", "下载量", "激活人数(快应用新增用户数)"]]
-        .sum()
-        .sort_values(group_cols)
-    )
-
-    # 阶段2b：子组构成特征 — 在聚合前从 raw 计算各子维度的消耗分布
-    comp_df = _build_composition_features(raw)
-    df = df.merge(comp_df, on=["应用ID", "日期"], how="left")
-    for c in comp_df.columns:
-        if c not in ("应用ID", "日期") and c in df.columns:
-            df[c] = df[c].fillna(0)
-    df["entity_id"] = _build_key(df, entity_cols)
-    # 下游逻辑统一仍以 应用ID 作为实体键（此处映射到训练实体）
-    df["应用ID"] = df["entity_id"]
-    if split_col:
-        df["split_value"] = df[split_col].astype(str).fillna("未知")
-    else:
-        df["split_value"] = "ALL"
-    if min_spend_train > 0:
-        df = df[df["消耗金额"] >= min_spend_train].copy()
-    df["roi_d1"] = np.where(df["消耗金额"] > 0, df["首日广告收入"] / df["消耗金额"], np.nan)
-    df["ctr"] = np.where(df["曝光量"] > 0, df["点击量"] / df["曝光量"], 0.0)
-    df["cvr_dl"] = np.where(df["点击量"] > 0, df["下载量"] / df["点击量"], 0.0)
-    df["cvr_act"] = np.where(df["下载量"] > 0, df["激活人数(快应用新增用户数)"] / df["下载量"], 0.0)
-    df["dow"] = df["日期"].dt.weekday
-    df["is_fri_sat"] = df["dow"].isin([4, 5]).astype(int)
-    df["is_holiday"] = df["日期"].dt.date.map(_is_holiday).astype(int)
-    df["is_rest_day"] = df["日期"].dt.date.map(_is_rest_day).astype(int)
-    df["dom"] = df["日期"].dt.day
-    df["month"] = df["日期"].dt.month
-    df["week_of_month"] = ((df["dom"] - 1) // 7 + 1).clip(1, 5)
-    df["days_in_month"] = df["日期"].dt.days_in_month
-    df["days_to_month_end"] = df["days_in_month"] - df["dom"]
-    df["month_progress"] = df["dom"] / df["days_in_month"].replace(0, np.nan)
-    df["is_month_start_3d"] = (df["dom"] <= 3).astype(int)
-    df["is_month_end_3d"] = (df["days_to_month_end"] <= 2).astype(int)
-    df["is_month_end_7d"] = (df["days_to_month_end"] <= 6).astype(int)
-    df["is_month_end_10d"] = (df["days_to_month_end"] <= 9).astype(int)
-    df["days_to_next_holiday"] = df["日期"].dt.date.map(_days_to_next_holiday).clip(upper=30)
-    df["days_since_prev_holiday"] = df["日期"].dt.date.map(_days_since_prev_holiday).clip(upper=30)
-    df["is_pre_holiday_3d"] = df["days_to_next_holiday"].between(1, 3).astype(int)
-    df["is_post_holiday_3d"] = df["days_since_prev_holiday"].between(1, 3).astype(int)
-    df["is_summer_winter_break"] = df["month"].isin([1, 2, 7, 8]).astype(int)
-    df["holiday_id"] = df["日期"].dt.date.map(_holiday_id).astype(int)
-    df["holiday_seq_index"] = df["日期"].dt.date.map(_holiday_seq_index).astype(int)
-    df["holiday_days_remaining"] = df["日期"].dt.date.map(_holiday_days_remaining).astype(int)
-    df["holiday_window_len"] = df["日期"].dt.date.map(_holiday_window_len).astype(int)
-    df["is_last_holiday_day"] = df["日期"].dt.date.map(_is_last_holiday_day).astype(int)
-
-    # T+1 spend 预测应使用"目标日"的日历属性，尤其是假期结束后的回落。
-    target_dates = df["日期"].dt.date.map(lambda d: d + timedelta(days=1))
-    df["target_dow"] = target_dates.map(lambda d: d.weekday()).astype(int)
-    df["target_is_weekend"] = target_dates.map(lambda d: d.weekday() >= 5).astype(int)
-    df["target_is_holiday"] = target_dates.map(_is_holiday).astype(int)
-    df["target_holiday_id"] = target_dates.map(_holiday_id).astype(int)
-    df["target_holiday_seq_index"] = target_dates.map(_holiday_seq_index).astype(int)
-    df["target_holiday_days_remaining"] = target_dates.map(_holiday_days_remaining).astype(int)
-    df["target_holiday_window_len"] = target_dates.map(_holiday_window_len).astype(int)
-    df["target_is_last_holiday_day"] = target_dates.map(_is_last_holiday_day).astype(int)
-    df["target_days_to_next_holiday"] = target_dates.map(_days_to_next_holiday).clip(upper=30)
-    df["target_days_since_prev_holiday"] = target_dates.map(_days_since_prev_holiday).clip(upper=30)
-    df["target_is_pre_holiday_3d"] = df["target_days_to_next_holiday"].between(1, 3).astype(int)
-    df["target_is_post_holiday_1d"] = (df["target_days_since_prev_holiday"] == 1).astype(int)
-    df["target_is_post_holiday_3d"] = df["target_days_since_prev_holiday"].between(1, 3).astype(int)
-    df["target_is_first_workday_after_holiday"] = target_dates.map(_is_first_workday_after_holiday).astype(int)
-
-    g = df.groupby("应用ID")
-    for lag in [1, 2, 3, 7]:
-        df[f"spend_lag_{lag}"] = g["消耗金额"].shift(lag)
-        df[f"roi_lag_{lag}"] = g["roi_d1"].shift(lag)
-    for window in [3, 7]:
-        shifted_spend = g["消耗金额"].shift(1)
-        df[f"spend_roll_mean_{window}"] = shifted_spend.groupby(df["应用ID"]).rolling(window, min_periods=1).mean().reset_index(level=0, drop=True)
-        df[f"spend_roll_std_{window}"] = shifted_spend.groupby(df["应用ID"]).rolling(window, min_periods=2).std().reset_index(level=0, drop=True)
-    month_key = df["日期"].dt.to_period("M")
-    df["mtd_spend"] = df.groupby(["应用ID", month_key])["消耗金额"].cumsum()
-    df["mtd_revenue"] = df.groupby(["应用ID", month_key])["首日广告收入"].cumsum()
-    df["mtd_roi_d1"] = np.where(df["mtd_spend"] > 1e-8, df["mtd_revenue"] / df["mtd_spend"], 0.0)
-    df["spend_ratio_1d"] = np.where(df["spend_lag_1"] > 1e-8, df["消耗金额"] / df["spend_lag_1"] - 1.0, 0.0)
-    df["target_t1_spend"] = g["消耗金额"].shift(-1)
-    df["target_spend_ratio_t1"] = np.where(
-        df["消耗金额"] > 1e-8,
-        df["target_t1_spend"] / df["消耗金额"],
-        1.0,
-    )
-
-    # 过滤训练天数不足的应用
-    app_day_counts = df.groupby("应用ID")["日期"].nunique()
-    min_app_days = max(settings.app_last_day_min_train_days, 1)
-    valid_apps = set(app_day_counts[app_day_counts >= min_app_days].index)
-    apps_before = int(df["应用ID"].nunique())
-    df = df[df["应用ID"].isin(valid_apps)].copy()
-    apps_after = int(df["应用ID"].nunique())
-
-    lag_cols = [c for c in df.columns if "lag_" in c or "roll_" in c] + [
-        "spend_ratio_1d",
-        "month_progress",
-        "mtd_roi_d1",
-    ]
-    for c in lag_cols:
-        df[c] = df[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    meta = {
-        "clean_groups_before": clean_before,
-        "clean_groups_after": clean_after,
-        "dropped_zero_spend_clean_groups": max(clean_before - clean_after, 0),
-        "train_entities_after_clean": int(df["应用ID"].nunique()),
-        "min_app_days": min_app_days,
-        "apps_before_day_filter": apps_before,
-        "apps_after_day_filter": apps_after,
-        "apps_filtered_by_days": max(apps_before - apps_after, 0),
-    }
-    return df, meta
 
 
 BASE_FEATURE_COLS = [
@@ -328,6 +64,8 @@ BASE_FEATURE_COLS = [
         "is_last_holiday_day",
         "target_dow",
         "target_is_weekend",
+        "target_is_rest_day",
+        "target_is_adjusted_workday",
         "target_is_holiday",
         "target_holiday_id",
         "target_holiday_seq_index",
@@ -380,6 +118,8 @@ CALENDAR_PACING_FEATURE_COLS = [
     "is_last_holiday_day",
     "target_dow",
     "target_is_weekend",
+    "target_is_rest_day",
+    "target_is_adjusted_workday",
     "target_is_holiday",
     "target_holiday_id",
     "target_holiday_seq_index",
@@ -430,6 +170,22 @@ def _build_model(name: str, use_gpu: bool = False) -> Optional[object]:
         if use_gpu:
             kwargs["device"] = "cuda"
         return LGBMRegressor(**kwargs)
+    if name == "XGBoost":
+        if XGBRegressor is None:
+            return None
+        xgb_kwargs = dict(
+            n_estimators=500,
+            learning_rate=0.03,
+            max_depth=6,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            objective="reg:squarederror",
+            random_state=42,
+            n_jobs=4,
+        )
+        if use_gpu:
+            xgb_kwargs["device"] = "cuda"
+        return XGBRegressor(**xgb_kwargs)
     return None
 
 
@@ -637,7 +393,11 @@ def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feat
     if use_log_target:
         y_train = np.log1p(y_train)
         label = f"{name}_log"
-    model.fit(x_train, y_train)
+    sample_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
+    try:
+        model.fit(x_train, y_train, sample_weight=sample_weight)
+    except TypeError:
+        model.fit(x_train, y_train)
     pred = model.predict(x_test)
     if use_log_target:
         log_resid = y_train - model.predict(x_train)
@@ -672,21 +432,22 @@ def _apply_holiday_transition_calibration(test_df: pd.DataFrame, pred: np.ndarra
     # Only apply floor when the target is a holiday weekday that is NOT the last day.
     target_is_holiday = pd.to_numeric(test_df.get("target_is_holiday", 0), errors="coerce").fillna(0).to_numpy() == 1
     target_is_weekend = pd.to_numeric(test_df.get("target_is_weekend", 0), errors="coerce").fillna(0).to_numpy() == 1
+    target_is_rest_day = pd.to_numeric(test_df.get("target_is_rest_day", 0), errors="coerce").fillna(0).to_numpy() == 1
     mid_holiday_weekday = target_is_holiday & ~target_is_weekend & ~last_holiday_day & ~first_workday_after_holiday
     adjusted[mid_holiday_weekday] = np.maximum(adjusted[mid_holiday_weekday], wider_ref[mid_holiday_weekday] * 0.90)
 
-    # Post-holiday weekend calibration: wider_ref + tiered floors by recency
+    # Post-holiday weekend calibration: use target_is_rest_day to exclude 调休补班
     days_since_holiday = pd.to_numeric(test_df.get("target_days_since_prev_holiday", 99), errors="coerce").fillna(99).to_numpy()
 
-    # First weekend day after holiday (days 3-4): strongest retaliatory surge
-    early_ph_weekend = target_is_weekend & (days_since_holiday >= 3) & (days_since_holiday <= 4)
-    adjusted[early_ph_weekend] = np.maximum(adjusted[early_ph_weekend], wider_ref[early_ph_weekend] * 0.90)
-    adjusted[early_ph_weekend] = np.minimum(adjusted[early_ph_weekend], wider_ref[early_ph_weekend] * 1.35)
+    # First real rest day after holiday (days 3-4): strongest retaliatory surge
+    early_ph_rest = target_is_rest_day & ~target_is_holiday & (days_since_holiday >= 3) & (days_since_holiday <= 4)
+    adjusted[early_ph_rest] = np.maximum(adjusted[early_ph_rest], wider_ref[early_ph_rest] * 0.90)
+    adjusted[early_ph_rest] = np.minimum(adjusted[early_ph_rest], wider_ref[early_ph_rest] * 1.35)
 
     # Rest of post-holiday week (days 5-7): normalizing
-    late_ph_weekend = target_is_weekend & (days_since_holiday >= 5) & (days_since_holiday <= 7)
-    adjusted[late_ph_weekend] = np.maximum(adjusted[late_ph_weekend], wider_ref[late_ph_weekend] * 0.80)
-    adjusted[late_ph_weekend] = np.minimum(adjusted[late_ph_weekend], wider_ref[late_ph_weekend] * 1.10)
+    late_ph_rest = target_is_rest_day & ~target_is_holiday & (days_since_holiday >= 5) & (days_since_holiday <= 7)
+    adjusted[late_ph_rest] = np.maximum(adjusted[late_ph_rest], wider_ref[late_ph_rest] * 0.80)
+    adjusted[late_ph_rest] = np.minimum(adjusted[late_ph_rest], wider_ref[late_ph_rest] * 1.10)
 
     return np.clip(adjusted, 0.0, None)
 
@@ -830,66 +591,67 @@ def _run(
 
     _enc_app_avg_spend = "app_avg_spend"
     _enc_app_avg_roi = "app_avg_roi_d1"
-    for _, bucket in df.groupby("split_value"):
-        model_df = bucket.sort_values(["应用ID", "日期"]).reset_index(drop=True).copy()
-        # 向量化 expanding-window 目标编码替代 app dummies（无泄漏）
-        grp_spend = model_df.groupby("应用ID")["target_t1_spend"]
-        model_df[_enc_app_avg_spend] = (
-            grp_spend.cumsum().sub(model_df["target_t1_spend"])
+    # 统一底表已无 split_value；直接使用全量 df
+    model_df = df.sort_values(["应用ID", "日期"]).reset_index(drop=True).copy()
+    model_df["split_value"] = "ALL"
+    # 向量化 expanding-window 目标编码替代 app dummies（无泄漏）
+    grp_spend = model_df.groupby("应用ID")["target_t1_spend"]
+    model_df[_enc_app_avg_spend] = (
+        grp_spend.cumsum().sub(model_df["target_t1_spend"])
+        / grp_spend.cumcount().clip(lower=1)
+    )
+    model_df[_enc_app_avg_spend] = model_df[_enc_app_avg_spend].fillna(model_df["target_t1_spend"].median())
+    if "roi_d1" in model_df.columns:
+        grp_roi = model_df.groupby("应用ID")["roi_d1"]
+        model_df[_enc_app_avg_roi] = (
+            grp_roi.cumsum().sub(model_df["roi_d1"])
             / grp_spend.cumcount().clip(lower=1)
         )
-        model_df[_enc_app_avg_spend] = model_df[_enc_app_avg_spend].fillna(model_df["target_t1_spend"].median())
-        if "roi_d1" in model_df.columns:
-            grp_roi = model_df.groupby("应用ID")["roi_d1"]
-            model_df[_enc_app_avg_roi] = (
-                grp_roi.cumsum().sub(model_df["roi_d1"])
-                / grp_spend.cumcount().clip(lower=1)
-            )
-            model_df[_enc_app_avg_roi] = model_df[_enc_app_avg_roi].fillna(model_df["roi_d1"].median())
-            enc_feats = [_enc_app_avg_spend, _enc_app_avg_roi]
-        else:
-            enc_feats = [_enc_app_avg_spend]
-        feats_all = feats + enc_feats
+        model_df[_enc_app_avg_roi] = model_df[_enc_app_avg_roi].fillna(model_df["roi_d1"].median())
+        enc_feats = [_enc_app_avg_spend, _enc_app_avg_roi]
+    else:
+        enc_feats = [_enc_app_avg_spend]
+    feats_all = feats + enc_feats
 
-        dates = sorted(model_df["日期"].dropna().unique())
-        cutoffs = list(dates[:-1])
-        if eval_recent_days is not None and eval_recent_days > 0 and len(cutoffs) > eval_recent_days:
-            cutoffs = cutoffs[-eval_recent_days:]
-        n_cutoffs = len(cutoffs)
-        for i, cutoff in enumerate(cutoffs):
-            t_cutoff = pd.Timestamp(cutoff)
-            next_day = cutoff + np.timedelta64(1, "D")
-            train = model_df[model_df["日期"] <= t_cutoff].copy()
-            test = model_df[model_df["日期"] == next_day].copy()
-            if min_target_spend_train > 0:
-                train = train[train["target_t1_spend"] >= min_target_spend_train].copy()
-            if min_target_spend_eval > 0:
-                test = test[test["target_t1_spend"] >= min_target_spend_eval].copy()
-            if test.empty or train["日期"].nunique() < min_train_days:
-                continue
-            print(f"  [{i+1}/{n_cutoffs}] cutoff={t_cutoff.date()} train={len(train)} test={len(test)}", flush=True)
-            ew = _ewma_spend(train, test, alpha)
-            if not ew.empty:
-                preds_by_model["EWMA"].append(ew)
-            if not skip_baseline_two_stage:
-                br = _baseline_residual_predict(train, test, feats_all)
-                if not br.empty:
-                    preds_by_model["BaselineResidual"].append(br)
-                ts = _two_stage_regime_predict(train, test, feats_all)
-                if not ts.empty:
-                    preds_by_model["TwoStageRegime"].append(ts)
-            max_workers = max(2, min(8, len(models) * (2 if use_log_target else 1)))
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = {}
-                for m in models:
-                    futures[ex.submit(_tree_predict, m, train, test, feats_all, False, use_gpu)] = m
-                    if use_log_target:
-                        futures[ex.submit(_tree_predict, m, train, test, feats_all, True, use_gpu)] = f"{m}_log"
-                for fut in as_completed(futures):
-                    name = futures[fut]
-                    pred_df = fut.result()
-                    if not pred_df.empty:
-                        preds_by_model[name].append(pred_df)
+    dates = sorted(model_df["日期"].dropna().unique())
+    cutoffs = list(dates[:-1])
+    if eval_recent_days is not None and eval_recent_days > 0 and len(cutoffs) > eval_recent_days:
+        cutoffs = cutoffs[-eval_recent_days:]
+    n_cutoffs = len(cutoffs)
+    for i, cutoff in enumerate(cutoffs):
+        t_cutoff = pd.Timestamp(cutoff)
+        next_day = cutoff + np.timedelta64(1, "D")
+        train = model_df[model_df["日期"] <= t_cutoff].copy()
+        test = model_df[model_df["日期"] == next_day].copy()
+        if min_target_spend_train > 0:
+            train = train[train["target_t1_spend"] >= min_target_spend_train].copy()
+        if min_target_spend_eval > 0:
+            test = test[test["target_t1_spend"] >= min_target_spend_eval].copy()
+        if test.empty or train["日期"].nunique() < min_train_days:
+            continue
+        print(f"  [{i+1}/{n_cutoffs}] cutoff={t_cutoff.date()} train={len(train)} test={len(test)}", flush=True)
+        ew = _ewma_spend(train, test, alpha)
+        if not ew.empty:
+            preds_by_model["EWMA"].append(ew)
+        if not skip_baseline_two_stage:
+            br = _baseline_residual_predict(train, test, feats_all)
+            if not br.empty:
+                preds_by_model["BaselineResidual"].append(br)
+            ts = _two_stage_regime_predict(train, test, feats_all)
+            if not ts.empty:
+                preds_by_model["TwoStageRegime"].append(ts)
+        max_workers = max(2, min(8, len(models) * (2 if use_log_target else 1)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {}
+            for m in models:
+                futures[ex.submit(_tree_predict, m, train, test, feats_all, False, use_gpu)] = m
+                if use_log_target:
+                    futures[ex.submit(_tree_predict, m, train, test, feats_all, True, use_gpu)] = f"{m}_log"
+            for fut in as_completed(futures):
+                name = futures[fut]
+                pred_df = fut.result()
+                if not pred_df.empty:
+                    preds_by_model[name].append(pred_df)
 
     results: List[ModelResult] = []
     for name, frames in preds_by_model.items():
@@ -912,18 +674,18 @@ def main() -> None:
     parser.add_argument("--use-log-target", action="store_true", help="增加 log1p(spend) 分支")
     parser.add_argument(
         "--split-col",
-        default="推广流量名称",
-        help="按该字段分流后训练 spend（例如：推广流量名称 或 流量场景名称）",
+        default="",
+        help="（已废弃-统一底表不区分分流）",
     )
     parser.add_argument(
         "--clean-group-cols",
-        default=",".join(DEFAULT_CLEAN_GROUP_COLS),
-        help="细粒度清洗字段（逗号分隔），仅用于清洗全时段零消耗实体",
+        default="",
+        help="（已废弃-统一底表内置清洗）",
     )
     parser.add_argument(
         "--product-key-cols",
-        default=",".join(DEFAULT_PRODUCT_KEY_COLS),
-        help="训练实体字段（逗号分隔），在清洗后按该维度聚合",
+        default="",
+        help="（已废弃-统一底表内置实体定义）",
     )
     parser.add_argument(
         "--min-target-spend-train",
@@ -1021,24 +783,20 @@ def main() -> None:
 
     eval_recent: Optional[int] = int(args.eval_recent_days) if args.eval_recent_days > 0 else None
     tree_override: Optional[List[str]] = [x.strip() for x in str(args.tree_models).split(",") if x.strip()] or None
-    skip_bs = False
+    skip_bs = True
     if args.fast:
         if eval_recent is None:
             eval_recent = 40
         if not tree_override:
             tree_override = ["ExtraTrees"]
-        skip_bs = True
+    if not tree_override:
+        tree_override = ["XGBoost"]
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    clean_group_cols = _normalize_cols(str(args.clean_group_cols).split(","))
-    product_key_cols = _normalize_cols(str(args.product_key_cols).split(","))
-    df, clean_meta = _build_app_daily(
+    df, clean_meta = build_unified_daily(
         args.input,
-        split_col=args.split_col,
-        clean_group_cols=clean_group_cols,
-        product_key_cols=product_key_cols,
-        min_spend_train=float(args.min_spend_train),
+        min_spend_train=2.0,
     )
     if args.target_type == "ratio":
         df["target_t1_spend"] = df["target_spend_ratio_t1"]
@@ -1100,17 +858,13 @@ def main() -> None:
 
     report = {
         "target": "T+1 spend",
+        "unified_data": True,
         "fast_mode": bool(args.fast),
         "eval_recent_days": eval_recent,
         "tree_models": tree_override,
         "skip_baseline_two_stage": skip_bs,
-        "split_col": args.split_col,
-        "clean_group_cols": clean_group_cols,
-        "product_key_cols": product_key_cols,
         "clean_meta": clean_meta,
-        "min_target_spend_train": float(args.min_target_spend_train),
-        "min_target_spend_eval": float(args.min_target_spend_eval),
-        "min_spend_train": float(args.min_spend_train),
+        "min_spend_train": 2.0,
         "feature_set": args.feature_set,
         "feature_count": len(_feature_cols(args.feature_set)),
         "use_gpu": bool(args.use_gpu),

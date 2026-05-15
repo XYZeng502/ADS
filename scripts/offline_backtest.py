@@ -146,10 +146,11 @@ def _load_t1_prediction_rows(target: str) -> List[Dict[str, str]]:
     if target == "roi":
         roi_dir = _pick_existing(
             [
+                root / "model_parallel_roi_d1_v9_unified",
+                root / "model_parallel_roi_d1_v8_001",
+                root / "model_parallel_roi_d1_v7_001",
+                root / "model_parallel_roi_d1_v7_aligned",
                 root / "model_parallel_roi_d1_default_weekly_v3",
-                root / "model_parallel_roi_d1_default_weekly_v2",
-                root / "model_parallel_roi_d1_default_weekly",
-                root / "model_parallel_roi_d1",
             ]
         )
         if roi_dir is None:
@@ -158,10 +159,10 @@ def _load_t1_prediction_rows(target: str) -> List[Dict[str, str]]:
     else:
         spend_dir = _pick_existing(
             [
-                root / "model_parallel_spend_t1_v4",
-                root / "model_parallel_spend_t1_target_calendar_calibrated_app",
-                root / "model_parallel_spend_t1_split_online_fusion_script_verified",
-                root / "model_parallel_spend_t1",
+                root / "model_parallel_spend_t1_v12_unified",
+                root / "model_parallel_spend_t1_v11_001",
+                root / "model_parallel_spend_t1_v10_001",
+                root / "model_parallel_spend_t1_v9_composition",
             ]
         )
         if spend_dir is None:
@@ -694,6 +695,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
     target_month = target_day[:7]
     prev_day = all_days[-2]
     target_day_dt = datetime.strptime(target_day, "%Y-%m-%d").date()
+    display_day_dt = target_day_dt + timedelta(days=1)  # 推荐日期指向「明天」
     month_start_dt = target_day_dt.replace(day=1)
     # next month first day - 1
     if month_start_dt.month == 12:
@@ -854,7 +856,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
         context = ClientContext(
             client_id=app_id,
             client_name=f"应用{app_id}",
-            date=datetime.strptime(target_day, "%Y-%m-%d").date(),
+            date=display_day_dt,
             month_spend_so_far=month_spend_so_far[app_id],
             month_revenue_so_far=month_rev_so_far[app_id],
             kpi_roi=kpi,

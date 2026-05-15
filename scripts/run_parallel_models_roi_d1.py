@@ -2,7 +2,6 @@ import argparse
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,10 +11,8 @@ from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, His
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from app.config import settings
-from app.core.calendar import CalendarService
 from app.prediction_artifacts import validate_merged_daily_csv
-
-CALENDAR = CalendarService()
+from app.unified_daily import build_unified_daily
 
 try:
     from lightgbm import LGBMRegressor
@@ -43,7 +40,7 @@ def _from_log1p(y: np.ndarray) -> np.ndarray:
     return np.expm1(y)
 
 
-def _build_model(model_name: str, params: Optional[Dict[str, object]] = None) -> Optional[object]:
+def _build_model(model_name: str, params: Optional[Dict[str, object]] = None, use_gpu: bool = False) -> Optional[object]:
     p = params or {}
     if model_name == "RandomForest":
         return RandomForestRegressor(
@@ -78,7 +75,7 @@ def _build_model(model_name: str, params: Optional[Dict[str, object]] = None) ->
     if model_name == "LightGBM":
         if LGBMRegressor is None:
             return None
-        return LGBMRegressor(
+        kwargs = dict(
             n_estimators=int(p.get("n_estimators", 500)),
             learning_rate=float(p.get("learning_rate", 0.03)),
             num_leaves=int(p.get("num_leaves", 31)),
@@ -86,10 +83,13 @@ def _build_model(model_name: str, params: Optional[Dict[str, object]] = None) ->
             colsample_bytree=0.9,
             random_state=42,
         )
+        if use_gpu:
+            kwargs["device"] = "cuda"
+        return LGBMRegressor(**kwargs)
     if model_name == "XGBoost":
         if XGBRegressor is None:
             return None
-        return XGBRegressor(
+        xgb_kwargs = dict(
             n_estimators=500,
             learning_rate=0.03,
             max_depth=6,
@@ -99,215 +99,10 @@ def _build_model(model_name: str, params: Optional[Dict[str, object]] = None) ->
             random_state=42,
             n_jobs=4,
         )
+        if use_gpu:
+            xgb_kwargs["device"] = "cuda"
+        return XGBRegressor(**xgb_kwargs)
     return None
-
-
-def _is_holiday(d: date) -> bool:
-    return CALENDAR.is_holiday(d)
-
-
-def _is_rest_day(d: date) -> int:
-    return int(CALENDAR.is_rest_day(d))
-
-
-def _is_pre_holiday(d: date) -> int:
-    return 1 if _is_holiday(d + timedelta(days=1)) else 0
-
-
-def _is_post_holiday(d: date) -> int:
-    return 1 if _is_holiday(d - timedelta(days=1)) else 0
-
-
-def _is_summer_winter_break(d: date) -> int:
-    return 1 if d.month in (1, 2, 7, 8) else 0
-
-
-def _holiday_id(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_id"])
-
-
-def _holiday_seq_index(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_seq_index"])
-
-
-def _holiday_days_remaining(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_days_remaining"])
-
-
-def _holiday_window_len(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["holiday_window_len"])
-
-
-def _is_last_holiday_day(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["is_last_holiday_day"])
-
-
-def _is_first_workday_after_holiday(d: date) -> int:
-    return int(CALENDAR.features_for_day(d)["is_first_workday_after_holiday"])
-
-
-def _days_to_next_holiday(d: date) -> int:
-    return CALENDAR.days_to_next_holiday(d)
-
-
-def _days_since_prev_holiday(d: date) -> int:
-    return CALENDAR.days_since_prev_holiday(d)
-
-
-def _build_composition_features(raw: pd.DataFrame) -> pd.DataFrame:
-    """为每个应用-日期计算子组构成特征（不增加行数）。"""
-    comp_dims = {
-        "traffic": "推广流量名称",
-        "scene": "流量场景名称",
-        "creative": "创意规格名称",
-        "billing": "计费方式",
-    }
-    available_dims = {k: v for k, v in comp_dims.items() if v in raw.columns}
-    if not available_dims:
-        return pd.DataFrame(columns=["应用ID", "日期"])
-
-    frames = []
-    for dim_key, dim_col in available_dims.items():
-        spend = raw.groupby(["应用ID", "日期", dim_col])["消耗金额"].sum().reset_index()
-        total = spend.groupby(["应用ID", "日期"])["消耗金额"].transform("sum")
-        spend["share"] = np.where(total > 1e-8, spend["消耗金额"] / total, 0.0)
-        agg = (
-            spend.groupby(["应用ID", "日期"])
-            .agg(**{
-                f"{dim_key}_top1_pct": ("share", "max"),
-                f"{dim_key}_hhi": ("share", lambda s: float((s**2).sum())),
-            })
-            .reset_index()
-        )
-        pos = spend[spend["消耗金额"] > 1e-8]
-        agg2 = pos.groupby(["应用ID", "日期"])[dim_col].nunique().reset_index()
-        agg2.columns = ["应用ID", "日期", f"{dim_key}_n_unique"]
-        agg = agg.merge(agg2, on=["应用ID", "日期"], how="left")
-        agg[f"{dim_key}_n_unique"] = agg[f"{dim_key}_n_unique"].fillna(0).astype(int)
-        frames.append(agg)
-
-    result = frames[0]
-    for f in frames[1:]:
-        result = result.merge(f, on=["应用ID", "日期"], how="outer")
-    for c in result.columns:
-        if c not in ("应用ID", "日期"):
-            result[c] = result[c].fillna(0.0 if "_pct" in c or "_hhi" in c else 0)
-    return result
-
-
-def _build_app_daily(
-    input_csv: str,
-    min_spend_train: float = 2.0,
-    min_app_history_days: int = 0,
-) -> pd.DataFrame:
-    from app.data_cleaning import clean, to_app_daily as _to_app_daily, validate_columns as _validate_cols
-
-    raw = clean(Path(input_csv))
-
-    # 子组构成特征 — 在聚合前从 raw 计算
-    comp_df = _build_composition_features(raw)
-    app_day = _to_app_daily(raw)
-    app_day = app_day.merge(comp_df, on=["应用ID", "日期"], how="left")
-    for c in comp_df.columns:
-        if c not in ("应用ID", "日期") and c in app_day.columns:
-            app_day[c] = app_day[c].fillna(0)
-
-    _validate_cols(app_day)
-
-    # 清洗：过滤低消耗样本（ROI 噪声极大）
-    if min_spend_train > 0:
-        app_day = app_day[app_day["消耗金额"] >= min_spend_train].copy()
-
-    # 清洗：过滤历史天数不足的应用（ROI 不稳定）
-    if min_app_history_days <= 0:
-        min_app_history_days = max(settings.app_last_day_min_train_days, 1)
-    day_counts = app_day.groupby("应用ID")["日期"].nunique()
-    keep_apps = day_counts[day_counts >= min_app_history_days].index
-    apps_before = int(app_day["应用ID"].nunique())
-    app_day = app_day[app_day["应用ID"].isin(keep_apps)].copy()
-    apps_after = int(app_day["应用ID"].nunique())
-    if apps_before > apps_after:
-        print(f"[ROI] app filter: {apps_before} -> {apps_after} (min {min_app_history_days} days)")
-
-    app_day["roi_d1"] = np.where(app_day["消耗金额"] > 0, app_day["首日广告收入"] / app_day["消耗金额"], np.nan)
-    app_day["act_per_spend"] = np.where(
-        app_day["消耗金额"] > 0, app_day["激活人数(快应用新增用户数)"] / app_day["消耗金额"], np.nan
-    )
-    app_day["rev_per_act_d1"] = np.where(
-        app_day["激活人数(快应用新增用户数)"] > 0,
-        app_day["首日广告收入"] / app_day["激活人数(快应用新增用户数)"],
-        np.nan,
-    )
-    app_day["ctr"] = np.where(app_day["曝光量"] > 0, app_day["点击量"] / app_day["曝光量"], 0.0)
-    app_day["cvr_dl"] = np.where(app_day["点击量"] > 0, app_day["下载量"] / app_day["点击量"], 0.0)
-    app_day["cvr_act"] = np.where(app_day["下载量"] > 0, app_day["激活人数(快应用新增用户数)"] / app_day["下载量"], 0.0)
-    app_day["dow"] = app_day["日期"].dt.weekday
-    app_day["is_weekend"] = (app_day["dow"] >= 5).astype(int)
-    # 业务口径：周五+周六常为特殊流量日
-    app_day["is_fri_sat"] = app_day["dow"].isin([4, 5]).astype(int)
-    app_day["dom"] = app_day["日期"].dt.day
-    app_day["month"] = app_day["日期"].dt.month
-    app_day["is_holiday"] = app_day["日期"].dt.date.map(_is_holiday).astype(int)
-    app_day["is_rest_day"] = app_day["日期"].dt.date.map(_is_rest_day).astype(int)
-    app_day["pre_holiday"] = app_day["日期"].dt.date.map(_is_pre_holiday).astype(int)
-    app_day["post_holiday"] = app_day["日期"].dt.date.map(_is_post_holiday).astype(int)
-    app_day["summer_winter_break"] = app_day["日期"].dt.date.map(_is_summer_winter_break).astype(int)
-
-    # T+1 目标日节假日特征（与 spends 脚本口径一致）
-    target_dates = app_day["日期"].dt.date.map(lambda d: d + timedelta(days=1))
-    app_day["target_dow"] = target_dates.map(lambda d: d.weekday()).astype(int)
-    app_day["target_is_weekend"] = target_dates.map(lambda d: d.weekday() >= 5).astype(int)
-    app_day["target_is_holiday"] = target_dates.map(_is_holiday).astype(int)
-    app_day["target_holiday_id"] = target_dates.map(_holiday_id).astype(int)
-    app_day["target_holiday_seq_index"] = target_dates.map(_holiday_seq_index).astype(int)
-    app_day["target_holiday_days_remaining"] = target_dates.map(_holiday_days_remaining).astype(int)
-    app_day["target_holiday_window_len"] = target_dates.map(_holiday_window_len).astype(int)
-    app_day["target_is_last_holiday_day"] = target_dates.map(_is_last_holiday_day).astype(int)
-    app_day["target_days_to_next_holiday"] = target_dates.map(_days_to_next_holiday).clip(upper=30)
-    app_day["target_days_since_prev_holiday"] = target_dates.map(_days_since_prev_holiday).clip(upper=30)
-    app_day["target_is_pre_holiday_3d"] = app_day["target_days_to_next_holiday"].between(1, 3).astype(int)
-    app_day["target_is_post_holiday_1d"] = (app_day["target_days_since_prev_holiday"] == 1).astype(int)
-    app_day["target_is_post_holiday_3d"] = app_day["target_days_since_prev_holiday"].between(1, 3).astype(int)
-    app_day["target_is_first_workday_after_holiday"] = target_dates.map(_is_first_workday_after_holiday).astype(int)
-
-    # 机制特征：变化率 + 稳定度
-    g = app_day.groupby("应用ID", group_keys=False)
-    app_day["spend_lag_1_raw"] = g["消耗金额"].shift(1)
-    app_day["spend_lag_3_mean_raw"] = g["消耗金额"].rolling(3, min_periods=2).mean().reset_index(level=0, drop=True)
-    app_day["spend_ratio_1d"] = np.where(
-        app_day["spend_lag_1_raw"] > 1e-8, app_day["消耗金额"] / app_day["spend_lag_1_raw"] - 1.0, np.nan
-    )
-    app_day["spend_ratio_3d"] = np.where(
-        app_day["spend_lag_3_mean_raw"] > 1e-8, app_day["消耗金额"] / app_day["spend_lag_3_mean_raw"] - 1.0, np.nan
-    )
-
-    app_day["roi_d1_std_7"] = g["roi_d1"].rolling(7, min_periods=3).std().reset_index(level=0, drop=True)
-    roi_q75 = g["roi_d1"].rolling(7, min_periods=3).quantile(0.75).reset_index(level=0, drop=True)
-    roi_q25 = g["roi_d1"].rolling(7, min_periods=3).quantile(0.25).reset_index(level=0, drop=True)
-    app_day["roi_d1_iqr_7"] = roi_q75 - roi_q25
-    app_day["roi_d1_range_7"] = (
-        g["roi_d1"].rolling(7, min_periods=3).max().reset_index(level=0, drop=True)
-        - g["roi_d1"].rolling(7, min_periods=3).min().reset_index(level=0, drop=True)
-    )
-
-    for c in ["act_per_spend", "rev_per_act_d1", "spend_ratio_1d", "spend_ratio_3d", "roi_d1_std_7", "roi_d1_iqr_7", "roi_d1_range_7"]:
-        app_day[c] = app_day[c].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    app_day = app_day.drop(columns=["spend_lag_1_raw", "spend_lag_3_mean_raw"])
-    return app_day
-
-
-def _add_lags(df: pd.DataFrame, lags: List[int]) -> pd.DataFrame:
-    out = df.copy()
-    for lag in lags:
-        out[f"roi_d1_lag_{lag}"] = out.groupby("应用ID")["roi_d1"].shift(lag)
-        out[f"spend_lag_{lag}"] = out.groupby("应用ID")["消耗金额"].shift(lag)
-        out[f"act_per_spend_lag_{lag}"] = out.groupby("应用ID")["act_per_spend"].shift(lag)
-        out[f"rev_per_act_d1_lag_{lag}"] = out.groupby("应用ID")["rev_per_act_d1"].shift(lag)
-    out["target_t1_roi_d1"] = out.groupby("应用ID")["roi_d1"].shift(-1)
-    out["target_t1_act_per_spend"] = out.groupby("应用ID")["act_per_spend"].shift(-1)
-    out["target_t1_rev_per_act_d1"] = out.groupby("应用ID")["rev_per_act_d1"].shift(-1)
-    return out
 
 
 def _get_base_feature_cols() -> List[str]:
@@ -329,7 +124,7 @@ def _get_base_feature_cols() -> List[str]:
         "is_holiday",
         "pre_holiday",
         "post_holiday",
-        "summer_winter_break",
+        "is_summer_winter_break",
         "dom",
         "month",
         "roi_d1_lag_1",
@@ -358,6 +153,8 @@ def _get_base_feature_cols() -> List[str]:
         # T+1 目标日节假日特征
         "target_dow",
         "target_is_weekend",
+        "target_is_rest_day",
+        "target_is_adjusted_workday",
         "target_is_holiday",
         "target_holiday_id",
         "target_holiday_seq_index",
@@ -413,13 +210,14 @@ def _tree_predict(
     feature_cols: List[str],
     use_hard_sample_weight: bool = False,
     model_params: Optional[Dict[str, object]] = None,
+    use_gpu: bool = False,
 ) -> pd.DataFrame:
     train = train_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     test = test_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     if train.empty or test.empty:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
 
-    model = _build_model(model_name, model_params)
+    model = _build_model(model_name, model_params, use_gpu=use_gpu)
     if model is None:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
 
@@ -428,6 +226,7 @@ def _tree_predict(
     x_test = test[feature_cols]
     y_test = test["target_t1_roi_d1"]
 
+    spend_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
     if use_hard_sample_weight:
         train = train.copy()
         app_scale = train.groupby("应用ID", as_index=False)["消耗金额"].median().rename(columns={"消耗金额": "app_median_spend"})
@@ -439,6 +238,7 @@ def _tree_predict(
         sample_weight = np.ones(len(train), dtype=float)
         sample_weight += (train["spend_bucket"].astype(str) == "Q1_low").astype(float) * 0.6
         sample_weight += (train["app_scale_bucket"].astype(str) == "Q2").astype(float) * 0.5
+        sample_weight = sample_weight * spend_weight
         x_train = train[feature_cols]
         y_train = train["target_t1_roi_d1"]
         try:
@@ -446,7 +246,10 @@ def _tree_predict(
         except TypeError:
             model.fit(x_train, y_train)
     else:
-        model.fit(x_train, y_train)
+        try:
+            model.fit(x_train, y_train, sample_weight=spend_weight)
+        except TypeError:
+            model.fit(x_train, y_train)
     pred = model.predict(x_test)
     return pd.DataFrame(
         {
@@ -466,6 +269,7 @@ def _tree_predict_split(
     feature_cols: List[str],
     use_log_target: bool = False,
     model_params: Optional[Dict[str, object]] = None,
+    use_gpu: bool = False,
 ) -> pd.DataFrame:
     train = train_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     test = test_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
@@ -482,7 +286,7 @@ def _tree_predict_split(
     for part_name, tr, te in [("low", train_low, test_low), ("high", train_high, test_high)]:
         if tr.empty or te.empty:
             continue
-        model = _build_model(model_name, model_params)
+        model = _build_model(model_name, model_params, use_gpu=use_gpu)
         if model is None:
             continue
         x_train = tr[feature_cols]
@@ -544,13 +348,14 @@ def _tree_predict_log(
     feature_cols: List[str],
     use_hard_sample_weight: bool = False,
     model_params: Optional[Dict[str, object]] = None,
+    use_gpu: bool = False,
 ) -> pd.DataFrame:
     train = train_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     test = test_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     if train.empty or test.empty:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
 
-    model = _build_model(model_name, model_params)
+    model = _build_model(model_name, model_params, use_gpu=use_gpu)
     if model is None:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
 
@@ -559,6 +364,7 @@ def _tree_predict_log(
     x_test = test[feature_cols]
     y_test = test["target_t1_roi_d1"]
 
+    spend_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
     if use_hard_sample_weight:
         train = train.copy()
         app_scale = train.groupby("应用ID", as_index=False)["消耗金额"].median().rename(columns={"消耗金额": "app_median_spend"})
@@ -570,6 +376,7 @@ def _tree_predict_log(
         sample_weight = np.ones(len(train), dtype=float)
         sample_weight += (train["spend_bucket"].astype(str) == "Q1_low").astype(float) * 0.6
         sample_weight += (train["app_scale_bucket"].astype(str) == "Q2").astype(float) * 0.5
+        sample_weight = sample_weight * spend_weight
         x_train = train[feature_cols]
         y_train = _to_log1p(train["target_t1_roi_d1"])
         try:
@@ -577,7 +384,10 @@ def _tree_predict_log(
         except TypeError:
             model.fit(x_train, y_train)
     else:
-        model.fit(x_train, y_train)
+        try:
+            model.fit(x_train, y_train, sample_weight=spend_weight)
+        except TypeError:
+            model.fit(x_train, y_train)
     pred_log = model.predict(x_test)
     pred = _from_log1p(pred_log)
 
@@ -609,6 +419,7 @@ def _tree_predict_decomp(
     feature_cols: List[str],
     use_log_component: bool = False,
     model_params: Optional[Dict[str, object]] = None,
+    use_gpu: bool = False,
 ) -> pd.DataFrame:
     need_cols = feature_cols + ["target_t1_roi_d1", "target_t1_act_per_spend", "target_t1_rev_per_act_d1"]
     train = train_df.dropna(subset=need_cols).copy()
@@ -616,8 +427,8 @@ def _tree_predict_decomp(
     if train.empty or test.empty:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
 
-    model_a = _build_model(model_name, model_params)
-    model_r = _build_model(model_name, model_params)
+    model_a = _build_model(model_name, model_params, use_gpu=use_gpu)
+    model_r = _build_model(model_name, model_params, use_gpu=use_gpu)
     if model_a is None or model_r is None:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
 
@@ -662,6 +473,7 @@ def _tree_predict_date_bucket(
     use_log_target: bool = False,
     model_params: Optional[Dict[str, object]] = None,
     min_bucket_samples: int = 40,
+    use_gpu: bool = False,
 ) -> pd.DataFrame:
     train = train_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     test = test_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
@@ -671,7 +483,7 @@ def _tree_predict_date_bucket(
     train["date_bucket"] = _date_bucket_label(train)
     test["date_bucket"] = _date_bucket_label(test)
 
-    global_model = _build_model(model_name, model_params)
+    global_model = _build_model(model_name, model_params, use_gpu=use_gpu)
     if global_model is None:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
     y_train_global = train["target_t1_roi_d1"]
@@ -683,7 +495,7 @@ def _tree_predict_date_bucket(
     for b, g in train.groupby("date_bucket"):
         if len(g) < min_bucket_samples:
             continue
-        m = _build_model(model_name, model_params)
+        m = _build_model(model_name, model_params, use_gpu=use_gpu)
         if m is None:
             continue
         yb = g["target_t1_roi_d1"]
@@ -781,6 +593,7 @@ def _tune_params_for_hard_buckets(
     model_name: str,
     df: pd.DataFrame,
     feature_cols: List[str],
+    use_gpu: bool = False,
 ) -> Optional[Dict[str, object]]:
     if model_name not in {"ExtraTrees", "GBDT"}:
         return None
@@ -815,7 +628,7 @@ def _tune_params_for_hard_buckets(
     best_params = None
     best_score = float("inf")
     for p in grid:
-        model = _build_model(model_name, p)
+        model = _build_model(model_name, p, use_gpu=use_gpu)
         if model is None:
             continue
         model.fit(train[feature_cols], train["target_t1_roi_d1"])
@@ -840,6 +653,7 @@ def _run_backtest_parallel(
     tune_hard_buckets: bool = True,
     retune_frequency_days: int = 7,
     include_date_bucket_models: bool = False,
+    use_gpu: bool = False,
 ) -> List[ModelResult]:
     all_dates = sorted(df["日期"].dropna().unique())
     candidate_cutoffs = all_dates[:-1]
@@ -940,7 +754,7 @@ def _run_backtest_parallel(
             if need_retune:
                 new_cache = dict(tuned_params_cache)
                 for m in tree_model_names:
-                    p = _tune_params_for_hard_buckets(m, train, feature_cols)
+                    p = _tune_params_for_hard_buckets(m, train, feature_cols, use_gpu=use_gpu)
                     if p is not None:
                         new_cache[m] = p
                 tuned_params_cache = new_cache
@@ -961,10 +775,10 @@ def _run_backtest_parallel(
                 preds_by_model["EWMA_log"].append(ewma_log_pred)
 
         # Tree models parallel
-        available_models = [(label, base, p) for label, base, p in model_specs_for_cutoff if _build_model(base, p) is not None]
+        available_models = [(label, base, p) for label, base, p in model_specs_for_cutoff if _build_model(base, p, use_gpu=use_gpu) is not None]
         with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
             futures = {
-                ex.submit(_tree_predict, base, train, test, feature_cols, False, p): label for label, base, p in available_models
+                ex.submit(_tree_predict, base, train, test, feature_cols, False, p, use_gpu): label for label, base, p in available_models
             }
             for fut in as_completed(futures):
                 name = futures[fut]
@@ -975,7 +789,7 @@ def _run_backtest_parallel(
         if include_hard_weight_models:
             with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                 futures = {
-                    ex.submit(_tree_predict, base, train, test, feature_cols, True, p): label
+                    ex.submit(_tree_predict, base, train, test, feature_cols, True, p, use_gpu): label
                     for label, base, p in available_models
                 }
                 for fut in as_completed(futures):
@@ -987,7 +801,7 @@ def _run_backtest_parallel(
         if include_log_target:
             with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                 futures = {
-                    ex.submit(_tree_predict_log, base, train, test, feature_cols, False, p): label
+                    ex.submit(_tree_predict_log, base, train, test, feature_cols, False, p, use_gpu): label
                     for label, base, p in available_models
                 }
                 for fut in as_completed(futures):
@@ -999,7 +813,7 @@ def _run_backtest_parallel(
             if include_hard_weight_models:
                 with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                     futures = {
-                        ex.submit(_tree_predict_log, base, train, test, feature_cols, True, p): label
+                        ex.submit(_tree_predict_log, base, train, test, feature_cols, True, p, use_gpu): label
                         for label, base, p in available_models
                     }
                     for fut in as_completed(futures):
@@ -1011,7 +825,7 @@ def _run_backtest_parallel(
         if include_split_models:
             with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                 futures = {
-                    ex.submit(_tree_predict_split, base, train, test, feature_cols, False, p): label
+                    ex.submit(_tree_predict_split, base, train, test, feature_cols, False, p, use_gpu): label
                     for label, base, p in available_models
                 }
                 for fut in as_completed(futures):
@@ -1023,7 +837,7 @@ def _run_backtest_parallel(
             if include_log_target:
                 with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                     futures = {
-                        ex.submit(_tree_predict_split, base, train, test, feature_cols, True, p): label
+                        ex.submit(_tree_predict_split, base, train, test, feature_cols, True, p, use_gpu): label
                         for label, base, p in available_models
                     }
                     for fut in as_completed(futures):
@@ -1035,7 +849,7 @@ def _run_backtest_parallel(
         if include_decomp_models:
             with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                 futures = {
-                    ex.submit(_tree_predict_decomp, base, train, test, feature_cols, False, p): label
+                    ex.submit(_tree_predict_decomp, base, train, test, feature_cols, False, p, use_gpu): label
                     for label, base, p in available_models
                 }
                 for fut in as_completed(futures):
@@ -1047,7 +861,7 @@ def _run_backtest_parallel(
             if include_log_target:
                 with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                     futures = {
-                        ex.submit(_tree_predict_decomp, base, train, test, feature_cols, True, p): label
+                        ex.submit(_tree_predict_decomp, base, train, test, feature_cols, True, p, use_gpu): label
                         for label, base, p in available_models
                     }
                     for fut in as_completed(futures):
@@ -1059,7 +873,7 @@ def _run_backtest_parallel(
         if include_date_bucket_models:
             with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                 futures = {
-                    ex.submit(_tree_predict_date_bucket, base, train, test, feature_cols, False, p): label
+                    ex.submit(_tree_predict_date_bucket, base, train, test, feature_cols, False, p, use_gpu): label
                     for label, base, p in available_models
                 }
                 for fut in as_completed(futures):
@@ -1071,7 +885,7 @@ def _run_backtest_parallel(
             if include_log_target:
                 with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                     futures = {
-                        ex.submit(_tree_predict_date_bucket, base, train, test, feature_cols, True, p): label
+                        ex.submit(_tree_predict_date_bucket, base, train, test, feature_cols, True, p, use_gpu): label
                         for label, base, p in available_models
                     }
                     for fut in as_completed(futures):
@@ -1105,8 +919,8 @@ def main() -> None:
     parser.add_argument("--use-decomp-models", action="store_true", help="并行增加两阶段分解模型分支")
     parser.add_argument(
         "--models",
-        default="RandomForest,GBDT,ExtraTrees,HistGB,LightGBM,XGBoost",
-        help="逗号分隔的树模型列表，如 ExtraTrees,GBDT",
+        default="XGBoost",
+        help="逗号分隔的树模型列表，如 XGBoost,LightGBM",
     )
     parser.add_argument(
         "--tune-hard-buckets",
@@ -1116,7 +930,8 @@ def main() -> None:
     )
     parser.add_argument("--retune-frequency-days", type=int, default=7, help="自动重寻参频率（天），默认每7天")
     parser.add_argument("--use-date-bucket-models", action="store_true", help="并行增加日期分桶模型分支")
-    parser.add_argument("--min-spend-train", type=float, default=2.0, help="训练最低日消耗阈值（过滤低消耗噪声 ROI，默认 2 元）")
+    parser.add_argument("--min-spend-train", type=float, default=0.01, help="训练最低日消耗阈值（过滤低消耗噪声，默认 0.01）")
+    parser.add_argument("--use-gpu", action="store_true", help="LightGBM/XGBoost 使用 GPU 加速（需 CUDA）")
     parser.add_argument("--min-app-history-days", type=int, default=0, help="应用最少历史天数（如 20 可过滤稀疏应用）")
     parser.add_argument("--eval-recent-days", type=int, default=0, help="仅评估最近 N 天（0=全部），用于统一口径")
     args = parser.parse_args()
@@ -1125,12 +940,10 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     validate_merged_daily_csv(Path(args.input))
-    app_daily = _build_app_daily(
+    app_daily, _ = build_unified_daily(
         args.input,
-        min_spend_train=args.min_spend_train,
-        min_app_history_days=args.min_app_history_days,
+        min_spend_train=2.0,
     )
-    app_daily = _add_lags(app_daily, lags=[1, 2, 3, 7])
 
     selected_tree_models = [m.strip() for m in str(args.models).split(",") if m.strip()]
     eval_recent = int(args.eval_recent_days) if args.eval_recent_days > 0 else None
@@ -1147,6 +960,7 @@ def main() -> None:
         tune_hard_buckets=args.tune_hard_buckets,
         retune_frequency_days=args.retune_frequency_days,
         include_date_bucket_models=args.use_date_bucket_models,
+        use_gpu=args.use_gpu,
     )
     if not results:
         raise ValueError("未得到有效模型结果，请检查数据覆盖与训练窗口。")
@@ -1184,8 +998,9 @@ def main() -> None:
 
     report = {
         "target": "T+1 roi_d1",
-        "min_spend_train": float(args.min_spend_train),
-        "min_app_history_days": int(args.min_app_history_days),
+        "unified_data": True,
+        "min_spend_train": 2.0,
+        "min_app_history_days": 30,
         "include_log_target": bool(args.use_log_target),
         "include_hard_sample_weight": bool(args.use_hard_sample_weight),
         "include_split_models": bool(args.use_split_models),
