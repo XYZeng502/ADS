@@ -103,6 +103,7 @@ def _build_model(model_name: str, params: Optional[Dict[str, object]] = None, us
             objective="reg:squarederror",
             random_state=42,
             n_jobs=4,
+            enable_categorical=True,
         )
         if use_gpu:
             xgb_kwargs["device"] = "cuda"
@@ -227,6 +228,16 @@ def _ewma_predict(train_df: pd.DataFrame, test_df: pd.DataFrame, alpha: float) -
     return pd.DataFrame(preds)
 
 
+def _prepare_categorical(x_train: pd.DataFrame, x_test: pd.DataFrame):
+    """CatBoost: convert app_label to category dtype and return cat_features."""
+    cat_cols = [c for c in ["app_label"] if c in x_train.columns]
+    if cat_cols:
+        for c in cat_cols:
+            x_train[c] = x_train[c].astype("category")
+            x_test[c] = x_test[c].astype("category")
+    return cat_cols
+
+
 def _tree_predict(
     model_name: str,
     train_df: pd.DataFrame,
@@ -250,6 +261,12 @@ def _tree_predict(
     x_test = test[feature_cols]
     y_test = test["target_t1_roi_d1"]
 
+    fit_kw: dict = {}
+    if model_name == "CatBoost":
+        cat_cols = _prepare_categorical(x_train, x_test)
+        if cat_cols:
+            fit_kw["cat_features"] = cat_cols
+
     spend_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
     if use_hard_sample_weight:
         train = train.copy()
@@ -265,15 +282,20 @@ def _tree_predict(
         sample_weight = sample_weight * spend_weight
         x_train = train[feature_cols]
         y_train = train["target_t1_roi_d1"]
+        fit_kw: dict = {}
+        if model_name == "CatBoost":
+            cat_cols = _prepare_categorical(x_train, x_test)
+            if cat_cols:
+                fit_kw["cat_features"] = cat_cols
         try:
-            model.fit(x_train, y_train, sample_weight=sample_weight)
+            model.fit(x_train, y_train, sample_weight=sample_weight, **fit_kw)
         except TypeError:
-            model.fit(x_train, y_train)
+            model.fit(x_train, y_train, **fit_kw)
     else:
         try:
-            model.fit(x_train, y_train, sample_weight=spend_weight)
+            model.fit(x_train, y_train, sample_weight=spend_weight, **fit_kw)
         except TypeError:
-            model.fit(x_train, y_train)
+            model.fit(x_train, y_train, **fit_kw)
     pred = model.predict(x_test)
     return pd.DataFrame(
         {
@@ -315,10 +337,15 @@ def _tree_predict_split(
             continue
         x_train = tr[feature_cols]
         y_train = tr["target_t1_roi_d1"]
+        x_te = te[feature_cols]
         if use_log_target:
             y_train = _to_log1p(y_train)
-        model.fit(x_train, y_train)
-        pred = model.predict(te[feature_cols])
+        fit_kw: dict = {}
+        if model_name == "CatBoost" and "app_label" in x_train.columns:
+            _prepare_categorical(x_train, x_te)
+            fit_kw["cat_features"] = ["app_label"]
+        model.fit(x_train, y_train, **fit_kw)
+        pred = model.predict(x_te)
         if use_log_target:
             pred = np.clip(_from_log1p(pred), a_min=0.0, a_max=None)
         pred_parts.append(
@@ -388,6 +415,12 @@ def _tree_predict_log(
     x_test = test[feature_cols]
     y_test = test["target_t1_roi_d1"]
 
+    fit_kw: dict = {}
+    if model_name == "CatBoost":
+        cat_cols = _prepare_categorical(x_train, x_test)
+        if cat_cols:
+            fit_kw["cat_features"] = cat_cols
+
     spend_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
     if use_hard_sample_weight:
         train = train.copy()
@@ -403,15 +436,20 @@ def _tree_predict_log(
         sample_weight = sample_weight * spend_weight
         x_train = train[feature_cols]
         y_train = _to_log1p(train["target_t1_roi_d1"])
+        fit_kw: dict = {}
+        if model_name == "CatBoost":
+            cat_cols = _prepare_categorical(x_train, x_test)
+            if cat_cols:
+                fit_kw["cat_features"] = cat_cols
         try:
-            model.fit(x_train, y_train, sample_weight=sample_weight)
+            model.fit(x_train, y_train, sample_weight=sample_weight, **fit_kw)
         except TypeError:
-            model.fit(x_train, y_train)
+            model.fit(x_train, y_train, **fit_kw)
     else:
         try:
-            model.fit(x_train, y_train, sample_weight=spend_weight)
+            model.fit(x_train, y_train, sample_weight=spend_weight, **fit_kw)
         except TypeError:
-            model.fit(x_train, y_train)
+            model.fit(x_train, y_train, **fit_kw)
     pred_log = model.predict(x_test)
     pred = _from_log1p(pred_log)
 
@@ -461,12 +499,17 @@ def _tree_predict_decomp(
     y_a = train["target_t1_act_per_spend"].clip(lower=0.0)
     y_r = train["target_t1_rev_per_act_d1"].clip(lower=0.0)
 
+    fit_kw: dict = {}
+    if model_name == "CatBoost" and "app_label" in x_train.columns:
+        _prepare_categorical(x_train, x_test)
+        fit_kw["cat_features"] = ["app_label"]
+
     if use_log_component:
         y_a = _to_log1p(y_a)
         y_r = _to_log1p(y_r)
 
-    model_a.fit(x_train, y_a)
-    model_r.fit(x_train, y_r)
+    model_a.fit(x_train, y_a, **fit_kw)
+    model_r.fit(x_train, y_r, **fit_kw)
     pred_a = model_a.predict(x_test)
     pred_r = model_r.predict(x_test)
     if use_log_component:

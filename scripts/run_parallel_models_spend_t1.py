@@ -198,6 +198,7 @@ def _build_model(name: str, use_gpu: bool = False) -> Optional[object]:
             objective="reg:squarederror",
             random_state=42,
             n_jobs=4,
+            enable_categorical=True,
         )
         if use_gpu:
             xgb_kwargs["device"] = "cuda"
@@ -413,19 +414,29 @@ def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feat
     model = _build_model(name, use_gpu=use_gpu)
     if model is None:
         return pd.DataFrame(columns=["日期", "应用ID", "y_true", "y_pred", "model"])
-    x_train = train[feats]
+    x_train = train[feats].copy()
     y_train = train["target_t1_spend"].clip(lower=0.0)
-    x_test = test[feats]
+    x_test = test[feats].copy()
     y_test = test["target_t1_spend"].values
     label = name
     if use_log_target:
         y_train = np.log1p(y_train)
         label = f"{name}_log"
+
+    # CatBoost 内建 categorical encoding for app_label
+    cat_cols = [c for c in ["app_label"] if c in x_train.columns]
+    fit_kwargs = {}
+    if name == "CatBoost" and cat_cols:
+        for c in cat_cols:
+            x_train[c] = x_train[c].astype("category")
+            x_test[c] = x_test[c].astype("category")
+        fit_kwargs["cat_features"] = cat_cols
+
     sample_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
     try:
-        model.fit(x_train, y_train, sample_weight=sample_weight)
+        model.fit(x_train, y_train, sample_weight=sample_weight, **fit_kwargs)
     except TypeError:
-        model.fit(x_train, y_train)
+        model.fit(x_train, y_train, **fit_kwargs)
     pred = model.predict(x_test)
     if use_log_target:
         log_resid = y_train - model.predict(x_train)
