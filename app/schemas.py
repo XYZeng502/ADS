@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 
 SlotType = Literal["store", "union", "smart"]
-DayType = Literal["workday", "weekend", "holiday", "shopping_festival", "summer_winter"]
+DayType = Literal["workday", "weekend", "holiday", "summer_winter"]
 BusinessLayerStatus = Literal["OK", "WARN", "CRITICAL"]
 
 

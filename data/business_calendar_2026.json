@@ -11,10 +11,5 @@
     {"id": 5, "name": "dragon_boat", "display_name": "端午节", "start": "2026-06-19", "end": "2026-06-21"},
     {"id": 6, "name": "national_day", "display_name": "国庆节", "start": "2026-10-01", "end": "2026-10-07"}
   ],
-  "adjusted_workdays": [],
-  "shopping_days": [
-    {"name": "618", "date": "2026-06-18"},
-    {"name": "double_11", "date": "2026-11-11"},
-    {"name": "double_12", "date": "2026-12-12"}
-  ]
+  "adjusted_workdays": []
 }

@@ -70,7 +70,7 @@ class RuleEngine:
                 )
             )
 
-        if day_type in {"holiday", "shopping_festival", "summer_winter"}:
+        if day_type in {"holiday", "summer_winter"}:
             hits.append(
                 RuleHit(
                     rule_id="R5_TIME_WINDOW_BONUS",

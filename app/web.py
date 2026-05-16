@@ -1305,13 +1305,12 @@ function renderBusinessSnapshot() {{
       status: 'INFO',
       summary: '日历驱动：周末/节假日/调休日识别 + scale因子调节预算节奏',
       body: `
-        <div class="plain-note" style="margin-bottom:12px;">时间层根据次日类型（工作日/周末/节假日/寒暑假/电商节）自动调整预算 scale 因子，在流量高峰期适度放量。</div>
+        <div class="plain-note" style="margin-bottom:12px;">时间层根据次日类型（工作日/周末/节假日/寒暑假）自动调整预算 scale 因子，在流量高峰期适度放量。</div>
         <table><thead><tr><th>日期类型</th><th>scale 因子</th><th>策略</th></tr></thead><tbody>
           <tr><td>工作日</td><td>1.00</td><td>基准节奏，均匀消耗</td></tr>
           <tr><td>周末</td><td>1.08</td><td>流量高约8%，适度多投</td></tr>
           <tr><td>节假日</td><td>1.12</td><td>流量高且持续多天，提前蓄量</td></tr>
           <tr><td>寒暑假</td><td>1.10</td><td>持续时间长，长期预算规划窗口</td></tr>
-          <tr><td>电商节</td><td>1.15</td><td>ECPM高，高变现窗口可多投</td></tr>
         </tbody></table>
         <div class="hint" style="margin-top:8px;">scale 因子当前为经验预设值，待历史数据回测校准。</div>
       `

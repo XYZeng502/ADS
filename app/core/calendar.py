@@ -49,16 +49,12 @@ class CalendarService:
             date.fromisoformat(str(x))
             for x in raw.get("adjusted_workdays", [])
         }
-        self._shopping_days = {
-            date.fromisoformat(str(x["date"]))
-            for x in raw.get("shopping_days", [])
-        }
 
     @staticmethod
     def _load_calendar(calendar_path: Path) -> dict:
         if calendar_path.exists():
             return json.loads(calendar_path.read_text(encoding="utf-8"))
-        return {"holiday_windows": [], "adjusted_workdays": [], "shopping_days": []}
+        return {"holiday_windows": [], "adjusted_workdays": []}
 
     @staticmethod
     def _is_summer_winter(day: date) -> bool:
@@ -84,13 +80,11 @@ class CalendarService:
         return _cn_is_holiday(day) and not self.is_adjusted_workday(day)
 
     def classify_day(self, day: date) -> DayType:
-        # 优先级：调休上班 > 法定假日 > 电商节 > 寒暑假 > 周末 > 工作日
+        # 优先级：调休上班 > 法定假日 > 寒暑假 > 周末 > 工作日
         if self.is_adjusted_workday(day):
             return "workday"
         if self.is_holiday(day):
             return "holiday"
-        if day in self._shopping_days:
-            return "shopping_festival"
         if self._is_summer_winter(day):
             return "summer_winter"
         if day.weekday() >= 5:
@@ -100,12 +94,11 @@ class CalendarService:
     def get_scale_factors(self) -> Dict[DayType, float]:
         # 基于历史数据实证校准（加权 ROI 比）
         # weekend: 1.104 → 1.10, holiday: 1.152 → 1.15
-        # shopping_festival / summer_winter 暂无数据覆盖，沿用预设值待验证
+        # summer_winter 暂无数据覆盖，沿用预设值待验证
         return {
             "workday": 1.0,
             "weekend": 1.10,
             "holiday": 1.15,
-            "shopping_festival": 1.15,
             "summer_winter": 1.10,
         }
 
