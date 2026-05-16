@@ -809,6 +809,10 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
     month_spend_so_far = defaultdict(float)
     month_rev_so_far = defaultdict(float)
     app_daily_history: Dict[Tuple[str, str], Dict[str, float]] = {}
+    app_d1_total = defaultdict(float)
+    app_d3_total = defaultdict(float)
+    app_d7_total = defaultdict(float)
+    app_d30_total = defaultdict(float)
 
     for day in train_days:
         day_data = nested[day]
@@ -825,6 +829,12 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                         p_d1 += agg.d1_revenue
                         app_day_spend += agg.spend
                         app_day_rev += agg.d1_revenue
+
+                        # per-app 曲线累积
+                        app_d1_total[app_id] += agg.d1_revenue
+                        app_d3_total[app_id] += agg.d3_revenue
+                        app_d7_total[app_id] += agg.d7_revenue
+                        app_d30_total[app_id] += agg.d30_revenue
 
                         key = (app_id, product_uid, slot)
                         slot_stats[key]["spend"] += agg.spend
@@ -871,6 +881,23 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 for _, agg in slot_map.items():
                     target_actual[app_id]["spend"] += agg.spend
                     target_actual[app_id]["revenue"] += agg.d1_revenue
+
+    # 构建 per-app 释放曲线
+    app_totals = {
+        app_id: {
+            "d1": app_d1_total[app_id],
+            "d3": app_d3_total[app_id],
+            "d7": app_d7_total[app_id],
+            "d30": app_d30_total[app_id],
+        }
+        for app_id in app_d1_total
+    }
+    per_app_curves = _build_all_per_app_curves(
+        app_totals=app_totals,
+        app_train_days=app_train_days,
+        min_train_days=min_train_days,
+    )
+    print(f"  Per-app 曲线: {len(per_app_curves)}/{len(app_totals)} 个 app 构建成功")
 
     predictions = []
     suggestion_rows = []
@@ -1042,6 +1069,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             planned_d1_roi=pred_only_d1_roi,
             curve=release_curve,
         )
+        app_curve = per_app_curves.get(app_id, release_curve)
         (
             month_end_spend_cohort_a,
             month_end_revenue_cohort_a,
@@ -1057,7 +1085,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             historical_daily=app_daily_history,
             planned_daily_spend=round(sum(x.suggested_budget for x in plan_a.suggestions), 2),
             planned_d1_roi=month_end_d1_roi,
-            curve=release_curve,
+            curve=app_curve,
         )
         (
             month_end_spend_cohort_b,
@@ -1074,7 +1102,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             historical_daily=app_daily_history,
             planned_daily_spend=solver_budget_b,
             planned_d1_roi=month_end_d1_roi,
-            curve=release_curve,
+            curve=app_curve,
         )
         # ③ 融合：保守加权（与既有线上实验一致）
         (
