@@ -184,6 +184,25 @@ def _build_all_per_app_curves(
     return curves
 
 
+def _save_per_app_curves(curves: Dict[str, Dict[int, float]]) -> Path:
+    """
+    保存 per-app 释放曲线到 JSON 文件，供在线 predictor 使用。
+    """
+    output_path = Path("outputs/per_app_release_curves.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # 将 int key 转为 str 以符合 JSON 规范
+    serializable = {
+        app_id: {str(d): m for d, m in curve.items()}
+        for app_id, curve in curves.items()
+    }
+    output_path.write_text(
+        json.dumps(serializable, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"  Per-app 曲线已保存: {output_path} ({len(curves)} apps)")
+    return output_path
+
+
 def _curve_value(curve: Dict[int, float], age_day: int) -> float:
     """
     cumulative multiplier F(age):
@@ -1417,6 +1436,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                     "attribution_details": attr.get("details"),
                 }
             )
+
+    _save_per_app_curves(per_app_curves)
 
     return {
         "summary_file": str(summary_file),
