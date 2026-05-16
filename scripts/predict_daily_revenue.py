@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-_CSV_PATH = Path("data/daily_merged.csv")
+_CSV_PATH = Path("daily_merged.csv")
 _OUTPUT_DIR = Path("outputs")
 _CURVE_PATH = Path("outputs/per_app_release_curves.json")
 
@@ -134,3 +134,62 @@ def predict_daily_revenues(
             })
 
     return rows
+
+
+def save_predictions(rows: List[Dict], output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["日期", "应用ID", "y_true", "y_pred", "days_since_start"])
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"预测结果已保存: {output_path} ({len(rows)} rows)")
+    return output_path
+
+
+def compute_mape(rows: List[Dict], min_days: int = 30) -> Dict[str, float]:
+    """按 app 计算 MAPE，仅统计 days_since_start >= min_days 的行。"""
+    app_errors: Dict[str, List[float]] = defaultdict(list)
+    for r in rows:
+        if r["days_since_start"] < min_days:
+            continue
+        if r["y_true"] > 0:
+            ape = abs(r["y_true"] - r["y_pred"]) / r["y_true"]
+            app_errors[r["应用ID"]].append(ape)
+
+    per_app = {}
+    for app_id, apes in sorted(app_errors.items()):
+        if apes:
+            per_app[app_id] = round(sum(apes) / len(apes) * 100, 2)
+
+    all_apes = [a for apes in app_errors.values() for a in apes]
+    overall = round(sum(all_apes) / len(all_apes) * 100, 2) if all_apes else 0.0
+
+    print(f"\nMAPE (days>={min_days}): overall={overall}%")
+    print(f"Per-app MAPE (top 5 by sample count):")
+    sorted_apps = sorted(app_errors.items(), key=lambda x: len(x[1]), reverse=True)[:5]
+    for app_id, apes in sorted_apps:
+        print(f"  {app_id}: {per_app[app_id]}% ({len(apes)} samples)")
+    return {"overall": overall, "per_app": per_app}
+
+
+def main():
+    csv_path = _CSV_PATH
+    output_path = _OUTPUT_DIR / "daily_revenue_predictions.csv"
+
+    print("加载数据...")
+    data = load_app_daily(csv_path)
+    print(f"  {len(data)} apps")
+
+    print("加载释放曲线...")
+    curves = load_curves(_CURVE_PATH)
+    print(f"  {len(curves)} per-app curves")
+
+    print("预测每日收入...")
+    rows = predict_daily_revenues(data, curves)
+
+    save_predictions(rows, output_path)
+    compute_mape(rows, min_days=30)
+
+
+if __name__ == "__main__":
+    main()
