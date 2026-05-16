@@ -327,8 +327,8 @@ class PredictorService:
         # 今日增量 = spend * d1 * [F(age)-F(age-1)]
         history_revenue = 0.0
         for age in range(2, elapsed_days + 2):
-            f_t = cls._release_multiplier(age)
-            f_prev = cls._release_multiplier(age - 1)
+            f_t = cls._release_multiplier_for_app(age, context.client_id)
+            f_prev = cls._release_multiplier_for_app(age - 1, context.client_id)
             delta = max(f_t - f_prev, 0.0)
             history_revenue += avg_daily_spend * d1_anchor * delta
 
