@@ -33,6 +33,8 @@ def _run_with_d1_calibration(orchestrator: DailyOrchestrator, context: ClientCon
 class SlotAgg:
     spend: float = 0.0
     d1_revenue: float = 0.0
+    d3_revenue: float = 0.0
+    d7_revenue: float = 0.0
     d30_revenue: float = 0.0
 
 
@@ -446,6 +448,8 @@ def load_aggregates(csv_path: Path):
             agg: SlotAgg = nested[day][adv][product][slot]
             agg.spend += to_float(row.get("消耗金额", "0"))
             agg.d1_revenue += to_float(row.get("首日广告收入", "0"))
+            agg.d3_revenue += to_float(row.get("3日累计变现金额", "0"))
+            agg.d7_revenue += to_float(row.get("7日累计变现金额", "0"))
             agg.d30_revenue += to_float(row.get("30日累计变现金额", "0"))
 
     return nested
@@ -468,6 +472,8 @@ def load_aggregates_app_level(csv_path: Path):
             agg: SlotAgg = nested[day][app][adv][product][slot]
             agg.spend += to_float(row.get("消耗金额", "0"))
             agg.d1_revenue += to_float(row.get("首日广告收入", "0"))
+            agg.d3_revenue += to_float(row.get("3日累计变现金额", "0"))
+            agg.d7_revenue += to_float(row.get("7日累计变现金额", "0"))
             agg.d30_revenue += to_float(row.get("30日累计变现金额", "0"))
     return nested
 
