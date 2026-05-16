@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlencode
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
+from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app.core.calendar import CalendarService
@@ -321,7 +322,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
 
 def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predict") -> HTMLResponse:
     safe_payload_js = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    safe_initial_view_js = json.dumps(initial_view if initial_view in {"predict", "recommend"} else "predict")
+    safe_initial_view_js = json.dumps(initial_view if initial_view in {"predict", "recommend", "daily-revenue"} else "predict")
     page = f"""
 <!doctype html>
 <html lang="zh-CN">
@@ -465,6 +466,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     <div class="nav-title">业务模块</div>
     <button class="navbtn active" id="predictNav" data-view="predict">预测模块</button>
     <button class="navbtn" id="recommendNav" data-view="recommend">推荐模块</button>
+    <button class="navbtn" id="dailyRevenueNav" data-view="daily-revenue">每日收入验证</button>
   </div>
 
   <div class="view" id="view-predict">
@@ -637,6 +639,22 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     <div class="layer-panels" id="layerPanels"></div>
   </div>
 </div>
+
+<div class="view hidden" id="view-daily-revenue">
+  <div class="panel">
+    <div class="section-title">
+      <h2>每日买量收入验证</h2>
+      <div class="hint">预测 vs 实际每日总收入，支持按应用筛选</div>
+    </div>
+    <div style="margin-bottom:8px;">
+      <input type="text" id="drAppSearch" placeholder="搜索应用ID…" style="width:160px;" />
+      <button onclick="loadDailyRevenueChart()" type="button">查询</button>
+    </div>
+    <div id="dailyRevenueChart" style="width:100%;height:400px;border:1px solid var(--line);border-radius:16px;background:#fff;"></div>
+    <div id="dailyRevenueStats" style="margin-top:8px;"></div>
+  </div>
+</div>
+
 </div>
 
 <div id="appHoverPopup" class="app-popup" style="display:none;">
@@ -1758,10 +1776,72 @@ function setActiveView(view) {{
   document.querySelectorAll('.navbtn').forEach(x => x.classList.toggle('active', x.dataset.view === view));
   document.getElementById('view-predict').classList.toggle('hidden', view !== 'predict');
   document.getElementById('view-recommend').classList.toggle('hidden', view !== 'recommend');
+  document.getElementById('view-daily-revenue').classList.toggle('hidden', view !== 'daily-revenue');
   hideAppPopup(true);
-  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); }}, 0);
+  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') loadDailyRevenueChart(); }}, 0);
 }}
 document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
+
+async function loadDailyRevenueChart() {{
+  const appId = document.getElementById('drAppSearch').value.trim();
+  const params = appId ? `?app_id=${{encodeURIComponent(appId)}}` : '';
+  const resp = await fetch(`/web/predictions/daily_revenue${{params}}`);
+  const data = await resp.json();
+
+  const chartDom = document.getElementById('dailyRevenueChart');
+  const statsDiv = document.getElementById('dailyRevenueStats');
+
+  if (!data.rows || data.rows.length === 0) {{
+    chartDom.innerHTML = '<div class="plain-note">暂无数据。运行 scripts/predict_daily_revenue.py 生成预测，运行 offline_backtest.py 生成 per-app 曲线后再执行效果更佳。</div>';
+    statsDiv.innerHTML = '';
+    return;
+  }}
+
+  // Aggregate by date (sum across all apps shown)
+  const dateMap = {{}};
+  data.rows.forEach(r => {{
+    const d = r['日期'];
+    if (!dateMap[d]) dateMap[d] = {{ y_true: 0, y_pred: 0 }};
+    dateMap[d].y_true += parseFloat(r.y_true || 0);
+    dateMap[d].y_pred += parseFloat(r.y_pred || 0);
+  }});
+
+  const dates = Object.keys(dateMap).sort();
+  const yTrue = dates.map(d => dateMap[d].y_true);
+  const yPred = dates.map(d => dateMap[d].y_pred);
+
+  // MAPE computation (days >= 30 filter)
+  let mapeSum = 0, mapeCount = 0;
+  data.rows.forEach(r => {{
+    if (parseInt(r.days_since_start) >= 30 && parseFloat(r.y_true) > 0) {{
+      mapeSum += Math.abs(parseFloat(r.y_true) - parseFloat(r.y_pred)) / parseFloat(r.y_true);
+      mapeCount++;
+    }}
+  }});
+  const mape = mapeCount > 0 ? (mapeSum / mapeCount * 100).toFixed(1) : 'N/A';
+
+  statsDiv.innerHTML = `<b>${{data.total}}</b> 行 | 覆盖 <b>${{new Set(data.rows.map(r=>r['应用ID'])).size}}</b> 个应用 | MAPE (days>=30): <b>${{mape}}%</b>`;
+
+  const chart = echarts.init(chartDom);
+  chart.setOption({{
+    title: {{ text: '每日买量收入：预测 vs 实际', left: 'center' }},
+    tooltip: {{ trigger: 'axis' }},
+    legend: {{ data: ['实际 (y_true)', '预测 (y_pred)'], bottom: 0 }},
+    grid: {{ left: 60, right: 20, top: 50, bottom: 40 }},
+    xAxis: {{ type: 'category', data: dates, axisLabel: {{ rotate: 45, fontSize: 10 }} }},
+    yAxis: {{ type: 'value', name: '收入' }},
+    dataZoom: [{{ type: 'slider', start: 0, end: 100 }}],
+    series: [
+      {{ name: '实际 (y_true)', type: 'line', data: yTrue, smooth: true,
+        lineStyle: {{ width: 2 }}, symbol: 'none' }},
+      {{ name: '预测 (y_pred)', type: 'line', data: yPred, smooth: true,
+        lineStyle: {{ width: 2, type: 'dashed' }}, symbol: 'none' }},
+    ],
+  }});
+
+  window.addEventListener('resize', () => chart.resize());
+}}
+
 const rb = document.getElementById('resetBtn');
 if (rb) rb.addEventListener('click', () => {{
   selectedAppId = '';
@@ -2707,4 +2787,20 @@ def web_prediction_app_chart(target: str, app_id: str):
             "ape": round(ape, 6),
         })
     return JSONResponse(content=result)
+
+
+@router.get("/web/predictions/daily_revenue")
+async def web_daily_revenue_predictions(
+    request: Request,
+    app_id: str = Query(""),
+):
+    """每日买量收入预测验证数据"""
+    csv_path = _repo_root() / "outputs" / "daily_revenue_predictions.csv"
+    if not csv_path.exists():
+        return JSONResponse(content={"rows": [], "message": "预测数据尚未生成，请先运行 scripts/predict_daily_revenue.py"})
+
+    rows = _read_csv_rows(csv_path)
+    if app_id:
+        rows = [r for r in rows if r.get("应用ID") == app_id]
+    return JSONResponse(content={"rows": rows, "total": len(rows)})
 
