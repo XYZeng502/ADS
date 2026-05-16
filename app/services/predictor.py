@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+from app.core.calendar import CalendarService
 from app.schemas import ClientContext
 
 
@@ -14,7 +15,22 @@ class PredictorService:
     """
     _release_multiplier_curve: Dict[int, float] | None = None
     _curve_max_day: int = 30
-    _shopping_days = {(6, 18), (11, 11), (12, 12)}
+    _per_app_curves: Dict[str, Dict[int, float]] | None = None
+    _calendar: CalendarService | None = None
+    _scale_factors: Dict[str, float] | None = None
+
+    @classmethod
+    def _get_calendar(cls) -> CalendarService:
+        if cls._calendar is None:
+            cls._calendar = CalendarService()
+            cls._scale_factors = cls._calendar.get_scale_factors()
+        return cls._calendar
+
+    @classmethod
+    def _get_day_scale(cls, d: date) -> float:
+        cal = cls._get_calendar()
+        day_type = cal.classify_day(d)
+        return cls._scale_factors.get(day_type, 1.0)
 
     @staticmethod
     def _quantile(values: List[float], q: float) -> float:
@@ -115,17 +131,47 @@ class PredictorService:
         return curve.get(day_window, curve.get(day_window - 1, 1.0))
 
     @classmethod
+    def _load_per_app_curves(cls) -> Dict[str, Dict[int, float]]:
+        """
+        加载 per-app 释放曲线文件。
+        Fallback 链：per-app 曲线 -> 竞品模板 -> 默认曲线
+        在 _release_multiplier_for_app 中按 app_id 查找。
+        """
+        if cls._per_app_curves is not None:
+            return cls._per_app_curves
+
+        curve_path = Path("outputs/per_app_release_curves.json")
+        if not curve_path.exists():
+            cls._per_app_curves = {}
+            return cls._per_app_curves
+
+        raw = json.loads(curve_path.read_text(encoding="utf-8"))
+        # JSON keys 是字符串，转回 int
+        cls._per_app_curves = {
+            app_id: {int(d): m for d, m in days.items()}
+            for app_id, days in raw.items()
+        }
+        return cls._per_app_curves
+
+    @classmethod
+    def _release_multiplier_for_app(cls, day_window: int, app_id: str | None) -> float:
+        """按 app_id 查找 per-app 曲线，找不到则 fallback 全局曲线。"""
+        if app_id:
+            per_app = cls._load_per_app_curves()
+            if app_id in per_app:
+                curve = per_app[app_id]
+                max_day = max(curve.keys())
+                if day_window <= 1:
+                    return curve.get(1, 1.0)
+                if day_window >= max_day:
+                    return curve.get(max_day, max(curve.values()))
+                return curve.get(day_window, curve.get(day_window - 1, 1.0))
+        # fallback 到现有全局曲线
+        return cls._release_multiplier(day_window)
+
+    @classmethod
     def _day_type_scale(cls, d: date) -> float:
-        """
-        与时间层一致的轻量节奏因子，用于月末剩余日预算轨迹分配。
-        """
-        if (d.month, d.day) in cls._shopping_days:
-            return 1.15
-        if d.month in (1, 2, 7, 8):
-            return 1.10
-        if d.weekday() >= 5:
-            return 1.08
-        return 1.0
+        return cls._get_day_scale(d)
 
     @classmethod
     def _build_spend_trajectory(
@@ -361,7 +407,9 @@ class PredictorService:
         for idx, spend in enumerate(day_spends):
             # idx=0 是今天；越靠后天数，距月末可释放窗口越短
             release_window = max(horizon_days - idx, 1)
-            multiplier = PredictorService._release_multiplier(release_window)
+            multiplier = PredictorService._release_multiplier_for_app(
+                release_window, context.client_id
+            )
             realized_revenue += spend * d1_roi_anchor * multiplier
 
         month_end_spend = context.month_spend_so_far + sum(day_spends)
