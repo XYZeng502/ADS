@@ -1033,6 +1033,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             roi_pred_calibrated if roi_pred_calibrated > 0 else stable_anchor_d1_roi
         )
 
+        app_curve = per_app_curves.get(app_id, release_curve)
+
         # ① 稳定锚点：求解器(B)日耗 + 仅历史稳定 D1 锚点
         (
             month_end_spend_cohort_stable,
@@ -1049,7 +1051,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             historical_daily=app_daily_history,
             planned_daily_spend=solver_budget_b,
             planned_d1_roi=stable_anchor_d1_roi,
-            curve=release_curve,
+            curve=app_curve,
         )
         # ② 纯预测模块：T+1 spend/roi_d1 校准值作为未来日耗与 D1（无 spend 预测时无法定义「纯预测日耗」，回退求解器日耗）
         (
@@ -1067,9 +1069,8 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             historical_daily=app_daily_history,
             planned_daily_spend=pred_only_daily_spend,
             planned_d1_roi=pred_only_d1_roi,
-            curve=release_curve,
+            curve=app_curve,
         )
-        app_curve = per_app_curves.get(app_id, release_curve)
         (
             month_end_spend_cohort_a,
             month_end_revenue_cohort_a,
@@ -1120,7 +1121,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
             historical_daily=app_daily_history,
             planned_daily_spend=fused_budget,
             planned_d1_roi=month_end_d1_roi,
-            curve=release_curve,
+            curve=app_curve,
         )
 
         _canon = settings.app_last_day_canonical_month_end_roi
