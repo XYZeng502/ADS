@@ -104,6 +104,86 @@ def _load_release_multiplier_curve() -> Dict[int, float]:
     return curve
 
 
+def _build_per_app_curve(
+    app_id: str,
+    total_d1: float,
+    total_d3: float,
+    total_d7: float,
+    total_d30: float,
+    train_days: int,
+    min_train_days: int,
+) -> Dict[int, float] | None:
+    """
+    用 app 历史累积的 D1/D3/D7/D30 总量构建释放倍率曲线。
+    返回 day->multiplier 的 dict，或 None 表示回退到全局曲线。
+    """
+    if train_days < min_train_days:
+        return None
+    if total_d1 <= 0:
+        return None
+
+    raw_nodes = {
+        1: 1.0,
+        3: total_d3 / total_d1,
+        7: total_d7 / total_d1,
+        30: total_d30 / total_d1,
+    }
+
+    # 异常值检查：任一节点比率 > 5.0 则回退
+    for d, ratio in raw_nodes.items():
+        if ratio <= 0 or ratio > 5.0:
+            return None
+
+    # clamp 到 [1.0, 3.0]
+    nodes = {d: max(1.0, min(ratio, 3.0)) for d, ratio in raw_nodes.items()}
+
+    # 节点间线性插值，day 1-30
+    node_days = [1, 3, 7, 30]
+    node_mult = [nodes[d] for d in node_days]
+    curve: Dict[int, float] = {}
+    for d in range(1, 31):
+        if d <= node_days[0]:
+            curve[d] = node_mult[0]
+            continue
+        if d >= node_days[-1]:
+            curve[d] = node_mult[-1]
+            continue
+        for i in range(len(node_days) - 1):
+            d0, d1 = node_days[i], node_days[i + 1]
+            if d0 <= d <= d1:
+                y0, y1 = node_mult[i], node_mult[i + 1]
+                ratio = (d - d0) / (d1 - d0)
+                curve[d] = y0 + (y1 - y0) * ratio
+                break
+    return curve
+
+
+def _build_all_per_app_curves(
+    app_totals: Dict[str, Dict[str, float]],
+    app_train_days: Dict[str, int],
+    min_train_days: int,
+) -> Dict[str, Dict[int, float]]:
+    """
+    遍历所有 app 的累积总量，构建 per-app 曲线。
+    app_totals: {app_id: {"d1": float, "d3": float, "d7": float, "d30": float}}
+    返回: {app_id: {day: multiplier}}，仅包含成功构建的 app
+    """
+    curves: Dict[str, Dict[int, float]] = {}
+    for app_id, totals in app_totals.items():
+        curve = _build_per_app_curve(
+            app_id=app_id,
+            total_d1=totals["d1"],
+            total_d3=totals["d3"],
+            total_d7=totals["d7"],
+            total_d30=totals["d30"],
+            train_days=app_train_days.get(app_id, 0),
+            min_train_days=min_train_days,
+        )
+        if curve is not None:
+            curves[app_id] = curve
+    return curves
+
+
 def _curve_value(curve: Dict[int, float], age_day: int) -> float:
     """
     cumulative multiplier F(age):
