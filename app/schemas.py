@@ -71,7 +71,7 @@ class ProductDiagnosis(BaseModel):
 
 class RiskAlert(BaseModel):
     level: Literal["INFO", "WARN", "CRITICAL"]
-    category: Literal["PRODUCT_D1_DROP", "TRAFFIC_ANOMALY", "ROI_GUARD", "SPEND_DROP", "SPEND_SPIKE", "ROI_DECLINE_TREND", "CAP_PROXIMITY"]
+    category: Literal["PRODUCT_D1_DROP", "TRAFFIC_ANOMALY", "ROI_GUARD", "SPEND_DROP", "SPEND_SPIKE", "ROI_DECLINE_TREND", "CAP_PROXIMITY", "PREDICTION_DRIFT"]
     message: str
     product_id: Optional[str] = None
 

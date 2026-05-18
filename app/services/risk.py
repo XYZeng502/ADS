@@ -13,6 +13,7 @@ class RiskService:
             alerts.extend(self._check_d1_drop(p))
             alerts.extend(self._check_roi_decline(p))
             alerts.extend(self._check_cap_proximity(p, context.yesterday_total_spend))
+        alerts.extend(self.evaluate_drift())
         return alerts
 
     def _check_d1_drop(self, p: ProductState) -> List[RiskAlert]:
@@ -92,6 +93,35 @@ class RiskService:
                 message=f"当日变现{direction}预测 {dev:.1%}，建议切换保守预算。",
             )]
         return []
+
+    # ---- drift ----
+
+    def evaluate_drift(self) -> List[RiskAlert]:
+        try:
+            from app.services.drift import check_prediction_drift
+            report = check_prediction_drift()
+        except Exception:
+            return []
+
+        alerts: List[RiskAlert] = []
+        for m in report.models:
+            if m.status == "critical":
+                alerts.append(RiskAlert(
+                    level="CRITICAL",
+                    category="PREDICTION_DRIFT",
+                    message=(f"{m.model} 模型漂移严重: 近期 MAPE={m.recent_mape:.1f}%, "
+                             f"baseline={m.baseline_mape:.1f}%, drift_ratio={m.drift_ratio:.1f}x，"
+                             f"建议降级到 EWMA baseline 并触发紧急重训。"),
+                ))
+            elif m.status == "warning":
+                alerts.append(RiskAlert(
+                    level="WARN",
+                    category="PREDICTION_DRIFT",
+                    message=(f"{m.model} 模型漂移预警: 近期 MAPE={m.recent_mape:.1f}%, "
+                             f"baseline={m.baseline_mape:.1f}%, drift_ratio={m.drift_ratio:.1f}x，"
+                             f"建议关注并考虑重训。"),
+                ))
+        return alerts
 
     # ---- diagnosis ----
 

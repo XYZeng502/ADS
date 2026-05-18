@@ -1245,6 +1245,7 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
                 "spend_t1_pred_calibrated": round(spend_pred_calibrated, 2),
                 "roi_d1_t1_pred_calibrated": round(roi_pred_calibrated, 4),
                 "top_actions": top_actions,
+                "train_days": app_train_days.get(app_id, 0),
             }
         )
 
@@ -1458,12 +1459,25 @@ def main() -> None:
     )
     parser.add_argument(
         "--input",
-        default="daily_20260421_120112.csv",
+        default="daily_merged.csv",
         help="原始离线数据CSV路径",
     )
     parser.add_argument("--output-dir", default="outputs", help="输出目录")
     parser.add_argument("--kpi", type=float, default=DEFAULT_KPI, help="KPI ROI（默认1.05）")
     args = parser.parse_args()
+
+    # 数据管道：入口健康检查
+    input_path = Path(args.input)
+    if input_path.exists():
+        from app.services.data_pipeline import check_data_health
+        health = check_data_health(input_path)
+        print(f"数据健康: status={health.status}, last_date={health.last_date}, "
+              f"days_behind={health.days_behind}, rows={health.row_count}, apps={health.app_count}")
+        if not health.ok:
+            print(f"  [ABORT] 数据不健康，缺失列: {health.missing_cols}")
+            return
+        if health.status == "stale":
+            print(f"  [WARN] 数据滞后 {health.days_behind} 天")
 
     if args.task == "backtest":
         summary = run_backtest(Path(args.input), Path(args.output_dir), args.kpi)

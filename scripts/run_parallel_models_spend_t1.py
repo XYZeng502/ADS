@@ -406,7 +406,7 @@ def _ewma_spend(train_df: pd.DataFrame, test_df: pd.DataFrame, alpha: float) -> 
     return pd.DataFrame(preds)
 
 
-def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feats: List[str], use_log_target: bool, use_gpu: bool = False) -> pd.DataFrame:
+def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feats: List[str], use_log_target: bool, use_gpu: bool = False, weight_exponent: float = 0.35) -> pd.DataFrame:
     train = train_df.dropna(subset=feats + ["target_t1_spend"]).copy()
     test = test_df.dropna(subset=feats + ["target_t1_spend"]).copy()
     if train.empty or test.empty:
@@ -432,7 +432,7 @@ def _tree_predict(name: str, train_df: pd.DataFrame, test_df: pd.DataFrame, feat
             x_test[c] = x_test[c].astype("category")
         fit_kwargs["cat_features"] = cat_cols
 
-    sample_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
+    sample_weight = np.power(train["消耗金额"].clip(lower=0).values, weight_exponent)
     try:
         model.fit(x_train, y_train, sample_weight=sample_weight, **fit_kwargs)
     except TypeError:
@@ -619,6 +619,7 @@ def _run(
     tree_models: Optional[List[str]] = None,
     skip_baseline_two_stage: bool = False,
     use_gpu: bool = False,
+    weight_exponent: float = 0.35,
 ) -> List[ModelResult]:
     feats = _feature_cols(feature_set)
     models = list(tree_models) if tree_models else ["RandomForest", "GBDT", "ExtraTrees", "LightGBM"]
@@ -683,9 +684,9 @@ def _run(
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {}
             for m in models:
-                futures[ex.submit(_tree_predict, m, train, test, feats_all, False, use_gpu)] = m
+                futures[ex.submit(_tree_predict, m, train, test, feats_all, False, use_gpu, weight_exponent)] = m
                 if use_log_target:
-                    futures[ex.submit(_tree_predict, m, train, test, feats_all, True, use_gpu)] = f"{m}_log"
+                    futures[ex.submit(_tree_predict, m, train, test, feats_all, True, use_gpu, weight_exponent)] = f"{m}_log"
             for fut in as_completed(futures):
                 name = futures[fut]
                 pred_df = fut.result()
@@ -711,6 +712,7 @@ def main() -> None:
     parser.add_argument("--min-train-days", type=int, default=20)
     parser.add_argument("--alpha", type=float, default=0.4)
     parser.add_argument("--use-log-target", action="store_true", help="增加 log1p(spend) 分支")
+    parser.add_argument("--weight-exponent", type=float, default=0.35, help="样本权重指数：spend^exponent (0=等权, 0.35=平衡, 0.5=sqrt, 1=线性)")
     parser.add_argument(
         "--split-col",
         default="",
@@ -851,6 +853,7 @@ def main() -> None:
         tree_models=tree_override,
         skip_baseline_two_stage=skip_bs,
         use_gpu=bool(args.use_gpu),
+        weight_exponent=args.weight_exponent,
     )
     if not results:
         raise ValueError("未得到 spend 预测结果，请检查数据和参数。")

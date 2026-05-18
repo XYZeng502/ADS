@@ -246,6 +246,7 @@ def _tree_predict(
     use_hard_sample_weight: bool = False,
     model_params: Optional[Dict[str, object]] = None,
     use_gpu: bool = False,
+    weight_exponent: float = 0.35,
 ) -> pd.DataFrame:
     train = train_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     test = test_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
@@ -267,7 +268,7 @@ def _tree_predict(
         if cat_cols:
             fit_kw["cat_features"] = cat_cols
 
-    spend_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
+    spend_weight = np.power(train["消耗金额"].clip(lower=0).values, weight_exponent)
     if use_hard_sample_weight:
         train = train.copy()
         app_scale = train.groupby("应用ID", as_index=False)["消耗金额"].median().rename(columns={"消耗金额": "app_median_spend"})
@@ -400,6 +401,7 @@ def _tree_predict_log(
     use_hard_sample_weight: bool = False,
     model_params: Optional[Dict[str, object]] = None,
     use_gpu: bool = False,
+    weight_exponent: float = 0.35,
 ) -> pd.DataFrame:
     train = train_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
     test = test_df.dropna(subset=feature_cols + ["target_t1_roi_d1"]).copy()
@@ -421,7 +423,7 @@ def _tree_predict_log(
         if cat_cols:
             fit_kw["cat_features"] = cat_cols
 
-    spend_weight = np.log1p(train["消耗金额"].clip(lower=0).values)
+    spend_weight = np.power(train["消耗金额"].clip(lower=0).values, weight_exponent)
     if use_hard_sample_weight:
         train = train.copy()
         app_scale = train.groupby("应用ID", as_index=False)["消耗金额"].median().rename(columns={"消耗金额": "app_median_spend"})
@@ -721,6 +723,7 @@ def _run_backtest_parallel(
     retune_frequency_days: int = 7,
     include_date_bucket_models: bool = False,
     use_gpu: bool = False,
+    weight_exponent: float = 0.35,
 ) -> List[ModelResult]:
     all_dates = sorted(df["日期"].dropna().unique())
     candidate_cutoffs = all_dates[:-1]
@@ -845,7 +848,7 @@ def _run_backtest_parallel(
         available_models = [(label, base, p) for label, base, p in model_specs_for_cutoff if _build_model(base, p, use_gpu=use_gpu) is not None]
         with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
             futures = {
-                ex.submit(_tree_predict, base, train, test, feature_cols, False, p, use_gpu): label for label, base, p in available_models
+                ex.submit(_tree_predict, base, train, test, feature_cols, False, p, use_gpu, weight_exponent): label for label, base, p in available_models
             }
             for fut in as_completed(futures):
                 name = futures[fut]
@@ -856,7 +859,7 @@ def _run_backtest_parallel(
         if include_hard_weight_models:
             with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                 futures = {
-                    ex.submit(_tree_predict, base, train, test, feature_cols, True, p, use_gpu): label
+                    ex.submit(_tree_predict, base, train, test, feature_cols, True, p, use_gpu, weight_exponent): label
                     for label, base, p in available_models
                 }
                 for fut in as_completed(futures):
@@ -868,7 +871,7 @@ def _run_backtest_parallel(
         if include_log_target:
             with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                 futures = {
-                    ex.submit(_tree_predict_log, base, train, test, feature_cols, False, p, use_gpu): label
+                    ex.submit(_tree_predict_log, base, train, test, feature_cols, False, p, use_gpu, weight_exponent): label
                     for label, base, p in available_models
                 }
                 for fut in as_completed(futures):
@@ -880,7 +883,7 @@ def _run_backtest_parallel(
             if include_hard_weight_models:
                 with ThreadPoolExecutor(max_workers=max(2, len(available_models))) as ex:
                     futures = {
-                        ex.submit(_tree_predict_log, base, train, test, feature_cols, True, p, use_gpu): label
+                        ex.submit(_tree_predict_log, base, train, test, feature_cols, True, p, use_gpu, weight_exponent): label
                         for label, base, p in available_models
                     }
                     for fut in as_completed(futures):
@@ -1001,6 +1004,7 @@ def main() -> None:
     parser.add_argument("--use-gpu", action="store_true", help="LightGBM/XGBoost 使用 GPU 加速（需 CUDA）")
     parser.add_argument("--min-app-history-days", type=int, default=0, help="应用最少历史天数（如 20 可过滤稀疏应用）")
     parser.add_argument("--eval-recent-days", type=int, default=0, help="仅评估最近 N 天（0=全部），用于统一口径")
+    parser.add_argument("--weight-exponent", type=float, default=0.35, help="样本权重指数：spend^exponent (0=等权, 0.35=平衡, 0.5=sqrt, 1=线性)")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -1028,6 +1032,7 @@ def main() -> None:
         retune_frequency_days=args.retune_frequency_days,
         include_date_bucket_models=args.use_date_bucket_models,
         use_gpu=args.use_gpu,
+        weight_exponent=args.weight_exponent,
     )
     if not results:
         raise ValueError("未得到有效模型结果，请检查数据覆盖与训练窗口。")

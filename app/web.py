@@ -238,6 +238,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     root = _repo_root() / "outputs"
     roi_dir = _pick_existing(
         [
+            root / "model_parallel_roi_d1_exp035",
             root / "model_parallel_roi_d1_v9_unified",
             root / "model_parallel_roi_d1_v8_001",
             root / "model_parallel_roi_d1_v7_001",
@@ -245,6 +246,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     )
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1_exp035",
             root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1_v11_001",
         ]
@@ -322,7 +324,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
 
 def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predict") -> HTMLResponse:
     safe_payload_js = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    safe_initial_view_js = json.dumps(initial_view if initial_view in {"predict", "recommend", "daily-revenue"} else "predict")
+    safe_initial_view_js = json.dumps(initial_view if initial_view in {"predict", "recommend", "daily-revenue", "monitor"} else "predict")
     page = f"""
 <!doctype html>
 <html lang="zh-CN">
@@ -414,13 +416,17 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .layer-body .layer-stat-item .sv {{ font-size: 20px; font-weight: 780; }}
     .layer-body .layer-stat-item .sk {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); }}
-    th {{ color: var(--muted); font-weight: 650; background: #f8fafc; position: sticky; top: 0; }}
+    th, td {{ text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); line-height: 1.5; }}
+    th {{ color: var(--muted); font-weight: 650; background: #f8fafc; position: sticky; top: 0; white-space: nowrap; }}
+    td {{ vertical-align: middle; }}
     th.sortable {{ cursor:pointer; user-select:none; }}
     th.sortable:hover {{ color: var(--blue); background:#eef5ff; }}
     .table-wrap {{ max-height: 360px; overflow: auto; border: 1px solid var(--line); border-radius: 14px; }}
+    .table-wrap table {{ font-size: 13px; }}
+    .table-wrap th {{ top: 0; z-index: 1; }}
     .good {{ color: var(--green); }}
     .bad {{ color: var(--red); }}
+    .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
     .pill {{ display:inline-flex; align-items:center; padding:3px 8px; border-radius:999px; font-size:12px; border:1px solid var(--line); background:#f8fafc; white-space:nowrap; }}
     .pill.good {{ background:#ecfdf3; border-color:#bbf7d0; }}
     .pill.bad {{ background:#fef2f2; border-color:#fecaca; }}
@@ -456,10 +462,8 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
 <div class="shell">
   <div class="hero">
     <div>
-      <div class="title">智能预算决策系统 · 模型评估看板</div>
-      <div class="subtitle">这个页面只展示已有模型输出支撑的内容：预测值 vs 实际值、误差走势、散点校准和明细。月末 ROI 暂不作为主展示，因为当前偏差还不能支撑强业务判断。</div>
+      <div class="title">智能预算决策系统</div>
     </div>
-    <div class="badge">白色简洁版 · 强交互 · 真实结果</div>
   </div>
 
   <div class="topnav">
@@ -467,6 +471,15 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     <button class="navbtn active" id="predictNav" data-view="predict">预测模块</button>
     <button class="navbtn" id="recommendNav" data-view="recommend">推荐模块</button>
     <button class="navbtn" id="dailyRevenueNav" data-view="daily-revenue">每日收入验证</button>
+    <button class="navbtn" id="monitorNav" data-view="monitor">系统监控</button>
+  </div>
+
+  <div id="dataStatusBar" style="display:flex;gap:16px;flex-wrap:wrap;padding:8px 16px;background:var(--bg);border:1px solid var(--line);border-radius:12px;margin-bottom:6px;font-size:12px;align-items:center;">
+    <span class="hint">数据状态：</span><span id="dsLoading">加载中...</span>
+  </div>
+  <div id="retrainStatusBar" style="display:flex;gap:12px;flex-wrap:wrap;padding:6px 16px;background:var(--bg);border:1px solid var(--line);border-radius:12px;margin-bottom:12px;font-size:12px;align-items:center;">
+    <span class="hint">重训状态：</span><span id="rsLoading">加载中...</span>
+    <button id="retrainTriggerBtn" onclick="triggerRetrain()" style="margin-left:auto;padding:4px 14px;font-size:11px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;">触发重训</button>
   </div>
 
   <div class="view" id="view-predict">
@@ -497,7 +510,6 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel">
     <div class="section-title">
       <h2 id="lineTitle">预测值 vs 实际值</h2>
-      <div class="hint">横轴：日期；纵轴：当前目标数值；图例说明每条线含义</div>
     </div>
     <div class="charts">
       <div id="lineChart" class="chart"></div>
@@ -508,7 +520,6 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel">
     <div class="section-title">
       <h2>每日误差走势</h2>
-      <div class="hint">横轴：日期；纵轴：绝对百分比误差 APE（越低越好）</div>
     </div>
     <div id="errorChart" class="chart wide"></div>
   </div>
@@ -524,7 +535,6 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel">
     <div class="section-title">
       <h2>应用总览表</h2>
-      <div class="hint">全量样本按应用聚合；点击行加载该应用明细；表头可排序</div>
     </div>
     <div style="margin-bottom:8px;"><input type="text" id="appTableSearch" placeholder="搜索应用ID…" /></div>
     <div class="table-wrap" style="max-height:320px;">
@@ -561,13 +571,9 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
       <h2>应用推荐模块</h2>
       <div class="hint" id="mpcSourceHint"></div>
     </div>
-    <div class="plain-note" style="margin-bottom:14px;">
-      推荐模块现在直接以“应用月末 ROI 预测表”为主入口：先筛出未达标、放量、控量或有告警的应用，再看建议动作和推荐依据。图表只作为总览辅助，不再让你先看一堆不明确的图。
-    </div>
-    <div class="panel" style="margin-top:14px;">
-      <div class="section-title">
+    <div class=”panel” style=”margin-top:0;”>
+      <div class=”section-title”>
         <h2>应用月末 ROI 预测表</h2>
-        <div class="hint">推荐模块核心表；每一行对应一个应用，点击任意表头可排序</div>
       </div>
       <div class="filter-row">
         <label>应用ID搜索
@@ -634,7 +640,6 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     </div>
     <div class="section-title" style="margin-top:16px;">
       <h2>六层决策面板</h2>
-      <div class="hint">点击各层面板展开查看详情；选中应用后各层切换至该应用视角</div>
     </div>
     <div class="layer-panels" id="layerPanels"></div>
   </div>
@@ -644,14 +649,82 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel">
     <div class="section-title">
       <h2>每日买量收入验证</h2>
-      <div class="hint">预测 vs 实际每日总收入，支持按应用筛选</div>
     </div>
     <div style="margin-bottom:8px;">
       <input type="text" id="drAppSearch" placeholder="搜索应用ID…" style="width:160px;" />
       <button onclick="loadDailyRevenueChart()" type="button">查询</button>
     </div>
-    <div id="dailyRevenueChart" style="width:100%;height:400px;border:1px solid var(--line);border-radius:16px;background:#fff;"></div>
+    <div id="dailyRevenueChart" style="width:100%;height:450px;border:1px solid var(--line);border-radius:16px;background:#fff;"></div>
     <div id="dailyRevenueStats" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel" style="margin-top:16px;">
+    <div class="section-title"><h2>预测数据表</h2></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+      <input type="text" id="drTableSearch" placeholder="搜索应用ID…" style="width:140px;" />
+      <input type="date" id="drTableDateFrom" style="width:130px;" title="起始日期" />
+      <input type="date" id="drTableDateTo" style="width:130px;" title="结束日期" />
+      <select id="drTableDays" style="width:120px;">
+        <option value="0">全部天数</option>
+        <option value="30">days ≥ 30</option>
+        <option value="60">days ≥ 60</option>
+      </select>
+      <button onclick="loadDailyRevenueTable()" type="button">查询</button>
+      <span id="drTableInfo" style="font-size:12px;color:var(--muted);line-height:2;"></span>
+    </div>
+    <div id="dailyRevenueTableWrap" class="table-wrap" style="max-height:420px;">
+      <div class="plain-note">点击「查询」加载数据</div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:16px;">
+    <div class="section-title">
+      <h2>在线预测</h2>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:8px;">
+      <label>目标日期 <input type="date" id="onlineTargetDate" value="2026-05-17" style="width:140px;" /></label>
+      <label>模式
+        <select id="onlineInputMode" onchange="toggleOnlineInputMode()" style="width:110px;">
+          <option value="json">JSON</option>
+          <option value="csv">CSV 批量</option>
+        </select>
+      </label>
+      <button onclick="runOnlinePredict()" type="button" style="background:var(--accent);color:#fff;padding:6px 16px;border-radius:8px;">预测</button>
+    </div>
+    <div id="onlineJsonInput" style="margin-bottom:8px;">
+      <textarea id="onlineInputJson" rows="6" style="width:100%;font-family:monospace;font-size:12px;" placeholder='[{{"应用ID": "30262609", "spend": 5000, "d1_revenue": 750}}]'></textarea>
+    </div>
+    <div id="onlineCsvInput" style="display:none;margin-bottom:8px;">
+      <textarea id="onlineInputCsv" rows="8" style="width:100%;font-family:monospace;font-size:12px;" placeholder="应用ID,spend,d1_revenue&#10;30262609,5000,750&#10;30744533,12000,1800"></textarea>
+    </div>
+    <div id="onlinePredictResult" style="margin-top:8px;"></div>
+  </div>
+</div>
+
+<div class="view hidden" id="view-monitor">
+  <div class="panel">
+    <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
+      <div id="monitorAlertStats" style="padding:10px 16px;background:var(--bg);border:1px solid var(--line);border-radius:10px;flex:1;min-width:200px;">
+        <div style="font-size:13px;color:var(--muted);">告警统计 (7天)</div>
+        <div style="font-size:20px;font-weight:700;margin-top:4px;" id="monitorAlertTotal">--</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px;" id="monitorAlertBreakdown"></div>
+      </div>
+      <div id="monitorHealthCard" style="padding:10px 16px;background:var(--bg);border:1px solid var(--line);border-radius:10px;flex:1;min-width:200px;">
+        <div style="font-size:13px;color:var(--muted);">最新健康快照</div>
+        <div style="font-size:20px;font-weight:700;margin-top:4px;" id="monitorHealthStatus">--</div>
+        <div style="font-size:11px;color:var(--muted);margin-top:2px;" id="monitorHealthDetail"></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:12px;">
+      <div style="flex:2;">
+        <div style="font-size:14px;font-weight:600;margin-bottom:8px;">健康趋势 (30天)</div>
+        <div id="healthTrendChart" style="width:100%;height:280px;"></div>
+      </div>
+      <div style="flex:1;min-width:280px;">
+        <div style="font-size:14px;font-weight:600;margin-bottom:8px;">告警历史</div>
+        <div class="table-wrap" style="max-height:280px;" id="monitorAlertTable"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -759,7 +832,7 @@ function currentRows() {{
   return rowsForTarget(target).filter(r => (!start || r.date >= start) && (!end || r.date <= end));
 }}
 
-let appRoiSort = {{ key: 'app', dir: 'asc' }};
+let appRoiSort = {{ key: 'priorityScore', dir: 'desc' }};
 let appRoiQuickFilter = 'all';
 let detailSort = {{ key: 'date', dir: 'asc' }};
 
@@ -868,17 +941,21 @@ function appMonthRoiRows() {{
       topActions: r.top_actions || '',
       topSuggestionsRaw: r.top_suggestions || '',
       alertsRaw: r.alerts || '',
+      trainDays: num(r.train_days),
       roiGap: monthEndRoi - kpi,
     }};
     const decision = appRoiDecision(row);
     const absBudgetDelta = Math.abs(row.plannedBudget - row.actualSpend);
     const spendWeight = Math.log1p(row.actualSpend);
-    const priorityScore =
+    const trainDays = row.trainDays || 0;
+    const confidenceW = Math.min(1.0, Math.max(0.5, (trainDays - 30) / 30));
+    const priorityScore = (
       Math.max(0, -row.roiGap) * 100 +
       row.alertCount * 8 +
       absBudgetDelta * 0.05 +
       spendWeight * 3 +
-      (row.dominantFactor === 'BALANCED' ? 1 : 2);
+      (row.dominantFactor === 'BALANCED' ? 1 : 2)
+    ) * confidenceW;
     return {{ ...row, ...decision, priorityScore }};
   }});
 }}
@@ -948,6 +1025,7 @@ function renderAppMonthRoiTable() {{
   ].map(c => `<div class="metric"><div class="k">${{c[0]}}</div><div class="v">${{c[1]}}</div><div class="d">${{c[2]}}</div></div>`).join('');
   const headers = [
     ['app', '应用ID'],
+    ['mode', '模式'],
     ['targetDay', '预测日期'],
     ['canonicalLabel', '主口径'],
     ['monthEndRoi', '月末ROI(主)'],
@@ -964,6 +1042,7 @@ function renderAppMonthRoiTable() {{
     ['roiB', '校准锚点ROI'],
     ['roiDelta', '校准差异'],
     ['alertCount', '告警数'],
+    ['trainDays', '训练天数'],
     ['dominantFactor', '偏差主因'],
     ['d1Raw', 'D1 Raw'],
     ['d1Calibrated', 'D1校准'],
@@ -975,7 +1054,7 @@ function renderAppMonthRoiTable() {{
   const bodyEl = document.getElementById('appRoiBody');
   if (!headEl || !bodyEl) return;
   headEl.innerHTML = '<tr>' + headers.map(([key, name]) => {{
-    const mark = appRoiSort.key === key ? (appRoiSort.dir === 'asc' ? ' ↑' : ' ↓') : '';
+    const mark = appRoiSort.key === key ? (appRoiSort.dir === 'asc' ? ' ↑' : ' ↓') : ' ↕';
     return `<th class="sortable" data-sort="${{key}}">${{name}}${{mark}}</th>`;
   }}).join('') + '</tr>';
   const colspan = headers.length;
@@ -992,6 +1071,7 @@ function renderAppMonthRoiTable() {{
     const actionCls = r.action.includes('收紧') || r.action.includes('控量') ? 'bad' : 'good';
     return `<tr>
       <td class="popup-app-id" data-app="${{r.app}}">${{r.app}}</td>
+      <td>${{r.mode}}</td>
       <td>${{r.targetDay}}</td>
       <td>${{r.canonicalLabel}}</td>
       <td class="${{roiCls}}">${{fmt(r.monthEndRoi,4)}}</td>
@@ -1008,7 +1088,8 @@ function renderAppMonthRoiTable() {{
       <td>${{fmt(r.roiB,4)}}</td>
       <td>${{fmt(r.roiDelta,4)}}</td>
       <td class="${{r.alertCount > 0 ? 'bad' : 'good'}}">${{r.alertCount}}</td>
-      <td>${{r.dominantFactor}}</td>
+      <td>${{r.trainDays || '-'}}</td>
+      <td>${{r.dominantFactor === 'CURVE' ? '释放曲线' : r.dominantFactor === 'SPEND' ? '消耗规模' : r.dominantFactor === 'D1_ANCHOR' ? 'D1水平' : r.dominantFactor}}</td>
       <td>${{fmt(r.d1Raw,4)}}</td>
       <td>${{fmt(r.d1Calibrated,4)}}</td>
       <td>${{fmt(r.spendT1Calibrated,2)}}</td>
@@ -1215,7 +1296,7 @@ function renderBusinessSnapshot() {{
   const actionCounts = new Map();
   rows.forEach(r => actionCounts.set(r.action, (actionCounts.get(r.action) || 0) + 1));
   const topAction = [...actionCounts.entries()].sort((a,b)=>b[1]-a[1])[0] || ['-', 0];
-  const riskRows = rows.filter(r => r.alertCount > 0 || r.roiGap < 0);
+  const riskRows = rows.filter(r => (r.alertCount > 0 || r.roiGap < 0) && r.plannedBudget > 0 && r.actualSpend > 0);
   const cards = [
     ['应用数', String(rows.length), `KPI：${{pct(kpi)}}`],
     ['平均预测月末 ROI', fmt(avgRoi,4), `相对 KPI：${{pct(avgRoi - kpi)}}`],
@@ -1233,16 +1314,16 @@ function renderBusinessSnapshot() {{
     series: [{{ type:'pie', radius:['42%','68%'], center:['50%','54%'], data: actionData }}]
   }});
 
-  const topRows = [...rows].sort((a,b)=>Math.abs(b.roiGap)-Math.abs(a.roiGap)).slice(0, 12);
+  const topRows = [...rows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 12);
   charts.product.setOption({{
     color: ['#2563eb', '#16a34a'],
     tooltip: {{ trigger:'axis' }},
     legend: {{ top: 8 }},
     grid: {{ left: 72, right: 24, top: 56, bottom: 74 }},
-    xAxis: {{ type:'category', name:'应用ID', nameLocation:'middle', nameGap:50, axisLabel:{{rotate:25}}, data:topRows.map(r=>r.app) }},
+    xAxis: {{ type:'category', axisLabel:{{rotate:25}}, data:topRows.map(r=>r.app) }},
     yAxis: [
-      {{ type:'value', name:'今日计划预算' }},
-      {{ type:'value', name:'预测月末ROI' }}
+      {{ type:'value' }},
+      {{ type:'value' }}
     ],
     series: [
       {{ name:'今日计划预算', type:'bar', data:topRows.map(r=>r.plannedBudget) }},
@@ -1256,14 +1337,14 @@ function renderBusinessSnapshot() {{
     color: ['#2563eb'],
     tooltip: {{ trigger:'axis' }},
     grid: {{ left: 72, right: 24, top: 46, bottom: 54 }},
-    xAxis: {{ type:'category', name:'偏差主因', nameLocation:'middle', nameGap:34, data:[...factorCounts.keys()] }},
-    yAxis: {{ type:'value', name:'应用数' }},
+    xAxis: {{ type:'category', data:[...factorCounts.keys()] }},
+    yAxis: {{ type:'value' }},
     series: [{{ name:'应用数', type:'bar', data:[...factorCounts.values()] }}]
   }});
 
-  const topRecommend = [...rows].sort((a,b)=>Math.abs(b.roiGap)-Math.abs(a.roiGap)).slice(0, 5)
+  const topRecommend = [...rows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 5)
     .map(r => `<li><b>${{r.app}}</b>：${{r.action}}；${{r.basis}}</li>`).join('');
-  const riskList = riskRows.slice(0, 5).map(r => `<li>${{r.app}}：ROI=${{fmt(r.monthEndRoi,4)}}，告警${{r.alertCount}}次，建议${{r.action}}</li>`).join('');
+  const riskList = [...riskRows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 5).map(r => `<li>${{r.app}}：ROI=${{fmt(r.monthEndRoi,4)}}，告警${{r.alertCount}}次，建议${{r.action}}</li>`).join('');
 
   const kpiOk = avgRoi >= kpi;
   const kpiStatusCls = kpiOk ? 's-ok' : 's-warn';
@@ -1309,7 +1390,6 @@ function renderBusinessSnapshot() {{
           <div class="layer-stat-item"><div class="sv" style="color:${{belowKpiCount > 0 ? 'var(--red)' : 'var(--green)'}}">${{belowKpiCount}}</div><div class="sk">未达标应用数</div></div>
           <div class="layer-stat-item"><div class="sv">${{pct(avgRoi - kpi)}}</div><div class="sk">相对KPI差距</div></div>
         </div>
-        <div class="hint" style="margin-bottom:8px;">偏差主因分布（按应用数）</div>
         <table><thead><tr><th>主因</th><th>应用数</th><th>占比</th><th>含义</th></tr></thead><tbody>
           ${{factorEntries.sort((a,b)=>b[1]-a[1]).map(([k,v]) => {{
             const meaning = {{SPEND:'消耗主导',D1_ANCHOR:'D1锚点主导',CURVE:'长尾曲线主导',BALANCED:'多因子均衡'}}[k] || k;
@@ -1323,14 +1403,12 @@ function renderBusinessSnapshot() {{
       status: 'INFO',
       summary: '日历驱动：周末/节假日/调休日识别 + scale因子调节预算节奏',
       body: `
-        <div class="plain-note" style="margin-bottom:12px;">时间层根据次日类型（工作日/周末/节假日/寒暑假）自动调整预算 scale 因子，在流量高峰期适度放量。</div>
         <table><thead><tr><th>日期类型</th><th>scale 因子</th><th>策略</th></tr></thead><tbody>
           <tr><td>工作日</td><td>1.00</td><td>基准节奏，均匀消耗</td></tr>
           <tr><td>周末</td><td>1.08</td><td>流量高约8%，适度多投</td></tr>
           <tr><td>节假日</td><td>1.12</td><td>流量高且持续多天，提前蓄量</td></tr>
           <tr><td>寒暑假</td><td>1.10</td><td>持续时间长，长期预算规划窗口</td></tr>
         </tbody></table>
-        <div class="hint" style="margin-top:8px;">scale 因子当前为经验预设值，待历史数据回测校准。</div>
       `
     }},
     {{
@@ -1344,7 +1422,6 @@ function renderBusinessSnapshot() {{
           <div class="layer-stat-item"><div class="sv">${{topAction[1]}}</div><div class="sk">覆盖应用数（${{fmt(topAction[1]/rows.length*100,1)}}%）</div></div>
           <div class="layer-stat-item"><div class="sv">${{actionCounts.size}}</div><div class="sk">动作种类数</div></div>
         </div>
-        <div class="hint" style="margin-bottom:8px;">动作分布详情</div>
         <table><thead><tr><th>动作</th><th>应用数</th><th>占比</th></tr></thead><tbody>
           ${{[...actionCounts.entries()].sort((a,b)=>b[1]-a[1]).map(([k,v]) => `<tr><td>${{k}}</td><td>${{v}}</td><td>${{fmt(v/rows.length*100,1)}}%</td></tr>`).join('')}}
         </tbody></table>
@@ -1363,7 +1440,7 @@ function renderBusinessSnapshot() {{
           <div class="layer-stat-item"><div class="sv">${{rows.filter(r => (r.mode||'').toUpperCase() === 'SCALE').length}}</div><div class="sk">放量模式应用数</div></div>
           <div class="layer-stat-item"><div class="sv">${{rows.filter(r => (r.mode||'').toUpperCase() === 'GUARD').length}}</div><div class="sk">保守模式应用数</div></div>
         </div>
-        <div class="plain-note">U型节奏：月初冲量 → 月中平稳 → 月末在盈余充足时释放跨月蓄力。当前月末释放触发阈值 = KPI + 5pp = ${{fmt(kpi + 0.05, 4)}}。</div>
+        <div class="plain-note">U型节奏：月初冲量 → 月中平稳 → 月末在盈余充足时释放跨月蓄力。</div>
       `
     }},
     {{
@@ -1374,7 +1451,7 @@ function renderBusinessSnapshot() {{
         : '全部应用达标且无告警，暂无风险',
       body: riskRows.length ? `
         <table><thead><tr><th>应用ID</th><th>月末ROI</th><th>ROI差距</th><th>告警数</th><th>建议动作</th></tr></thead><tbody>
-          ${{riskRows.slice(0, 15).map(r => `<tr>
+          ${{[...riskRows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 15).map(r => `<tr>
             <td><b>${{r.app}}</b></td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{pct(r.roiGap)}}</td>
@@ -1383,7 +1460,6 @@ function renderBusinessSnapshot() {{
           </tr>`).join('')}}
         </tbody></table>
         ${{riskRows.length > 15 ? `<div class="hint" style="margin-top:8px;">仅展示前 15 个，共 ${{riskRows.length}} 个风险应用</div>` : ''}}
-        <div class="hint" style="margin-top:8px;">风险检测：D1连续下滑 | ROI趋势下行 | 消耗骤降/骤升 | Cap逼近 | 流量偏离 ±20% | 月末ROI警戒</div>
       ` : '<div class="note-body" style="color:#15803d;padding: 8px 0;">✅ 当前全部应用达标且无告警</div>'
     }},
     {{
@@ -1391,10 +1467,9 @@ function renderBusinessSnapshot() {{
       status: 'OK',
       summary: `按ROI差距排序，前5优先：${{topRecommend ? '已列出' : '暂无'}}；产品×时间联合求解`,
       body: `
-        <div class="plain-note" style="margin-bottom:12px;">当前求解路径：先产品比例分配 → 再按节假日微调（方案B）。未来可升级为产品×时间联合求解（方案C，需Gurobi/PuLP）。</div>
-        <div class="hint" style="margin-bottom:8px;">优先处理应用（按ROI差距绝对值排序，前10）</div>
+        <div class="plain-note" style="margin-bottom:12px;">按产品比例分配后依节假日节奏微调，优先处理ROI差距最大的应用。</div>
         <table><thead><tr><th>优先级</th><th>应用ID</th><th>月末ROI</th><th>ROI差距</th><th>建议动作</th></tr></thead><tbody>
-          ${{[...rows].sort((a,b)=>Math.abs(b.roiGap)-Math.abs(a.roiGap)).slice(0, 10).map((r, i) => `<tr>
+          ${{[...rows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 10).map((r, i) => `<tr>
             <td>${{i + 1}}</td>
             <td><b>${{r.app}}</b></td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
@@ -1473,8 +1548,8 @@ function renderChartSeries(data, unit, target) {{
     legend: {{ top: 8 }},
     title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
     grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
-    xAxis: {{ type: 'category', name: '日期', nameLocation: 'middle', nameGap: 34, data: dates }},
-    yAxis: {{ type: 'value', name: unit, nameGap: 48 }},
+    xAxis: {{ type: 'category', data: dates }},
+    yAxis: {{ type: 'value' }},
     dataZoom: [{{type:'inside'}}, {{type:'slider', height: 18, bottom: 12}}],
     series
   }});
@@ -1482,16 +1557,16 @@ function renderChartSeries(data, unit, target) {{
     color: ['#2563eb'],
     tooltip: {{ formatter: p => `实际：${{fmt(p.value[0], target==='roi'?4:2)}}<br/>预测：${{fmt(p.value[1], target==='roi'?4:2)}}` }},
     grid: {{ left: 62, right: 24, top: 36, bottom: 54 }},
-    xAxis: {{ type:'value', name:`实际${{unit}}`, nameLocation:'middle', nameGap:34 }},
-    yAxis: {{ type:'value', name:`预测${{unit}}`, nameGap:44 }},
+    xAxis: {{ type:'value' }},
+    yAxis: {{ type:'value' }},
     series: [{{ name:'每日预测校准', type:'scatter', symbolSize: 9, data: data.map(x => [x.actual, x.pred]) }}]
   }});
   charts.error.setOption({{
     color: ['#dc2626'],
     tooltip: {{ trigger:'axis', valueFormatter: v => fmt(v, 2) + '%' }},
     grid: {{ left: 64, right: 28, top: 36, bottom: 55 }},
-    xAxis: {{ type:'category', name:'日期', nameLocation:'middle', nameGap:34, data: dates }},
-    yAxis: {{ type:'value', name:'APE (%)', nameGap:46 }},
+    xAxis: {{ type:'category', data: dates }},
+    yAxis: {{ type:'value' }},
     dataZoom: [{{type:'inside'}}, {{type:'slider', height: 18, bottom: 12}}],
     series: [{{ name:'每日汇总绝对百分比误差', type:'bar', data: data.map(x => x.ape * 100) }}]
   }});
@@ -1555,8 +1630,8 @@ function showAppPopup(appId, rowData, evt) {{
   // init or re-use charts
   if (!_popupCharts.roi) _popupCharts.roi = echarts.init(document.getElementById('popupRoiChart'));
   if (!_popupCharts.spend) _popupCharts.spend = echarts.init(document.getElementById('popupSpendChart'));
-  _popupCharts.roi.setOption({{ title: {{ text: 'T+1 ROI_D1', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 16, top: 32, bottom: 22 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10}} }}, yAxis: {{ type:'value', name:'ROI', nameGap:28, axisLabel:{{fontSize:10}} }}, series: [] }});
-  _popupCharts.spend.setOption({{ title: {{ text: 'T+1 Spend', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 16, top: 32, bottom: 22 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10}} }}, yAxis: {{ type:'value', name:'消耗', nameGap:32, axisLabel:{{fontSize:10}} }}, series: [] }});
+  _popupCharts.roi.setOption({{ title: {{ text: 'T+1 ROI_D1', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 20, top: 32, bottom: 34 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:10}} }}, series: [] }});
+  _popupCharts.spend.setOption({{ title: {{ text: 'T+1 Spend', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 20, top: 32, bottom: 34 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:10}} }}, series: [] }});
 
   _popupCharts.roi.showLoading();
   _popupCharts.spend.showLoading();
@@ -1582,7 +1657,7 @@ function _renderPopupChart(chart, data, unit, isSpend) {{
       {{ name: predName, type: 'line', smooth: true, symbolSize: 3, data: data.map(x => x.pred) }},
     ],
     color: ['#16a34a', '#2563eb'],
-    legend: {{ bottom: 2, textStyle: {{fontSize:10}} }},
+    legend: {{ bottom: 6, textStyle: {{fontSize:10}} }},
   }});
 }}
 
@@ -1751,7 +1826,7 @@ if (appRoiResetBtn) appRoiResetBtn.addEventListener('click', () => {{
   const rk = document.getElementById('appRoiRisk'); if (rk) rk.value = '';
   appRoiQuickFilter = 'all';
   document.querySelectorAll('#appRoiQuickFilters .chip').forEach(x => x.classList.toggle('active', x.dataset.filter === 'all'));
-  appRoiSort = {{ key: 'app', dir: 'asc' }};
+  appRoiSort = {{ key: 'priorityScore', dir: 'desc' }};
   renderAppMonthRoiTable();
 }});
 const viewRecommend = document.getElementById('view-recommend');
@@ -1777,8 +1852,9 @@ function setActiveView(view) {{
   document.getElementById('view-predict').classList.toggle('hidden', view !== 'predict');
   document.getElementById('view-recommend').classList.toggle('hidden', view !== 'recommend');
   document.getElementById('view-daily-revenue').classList.toggle('hidden', view !== 'daily-revenue');
+  document.getElementById('view-monitor').classList.toggle('hidden', view !== 'monitor');
   hideAppPopup(true);
-  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') loadDailyRevenueChart(); }}, 0);
+  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') loadDailyRevenueChart(); if (view === 'monitor') loadMonitorView(); }}, 0);
 }}
 document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
 
@@ -1792,7 +1868,7 @@ async function loadDailyRevenueChart() {{
   const statsDiv = document.getElementById('dailyRevenueStats');
 
   if (!data.rows || data.rows.length === 0) {{
-    chartDom.innerHTML = '<div class="plain-note">暂无数据。运行 scripts/predict_daily_revenue.py 生成预测，运行 offline_backtest.py 生成 per-app 曲线后再执行效果更佳。</div>';
+    chartDom.innerHTML = '<div class="plain-note">暂无预测数据，请先执行每日预测回测。</div>';
     statsDiv.innerHTML = '';
     return;
   }}
@@ -1810,36 +1886,372 @@ async function loadDailyRevenueChart() {{
   const yTrue = dates.map(d => dateMap[d].y_true);
   const yPred = dates.map(d => dateMap[d].y_pred);
 
-  // MAPE computation (days >= 30 filter)
-  let mapeSum = 0, mapeCount = 0;
+  // 双口径 MAPE (days >= 30 filter)
+  let combinedSum = 0, combinedCount = 0, carryoverSum = 0, carryoverCount = 0;
   data.rows.forEach(r => {{
     if (parseInt(r.days_since_start) >= 30 && parseFloat(r.y_true) > 0) {{
-      mapeSum += Math.abs(parseFloat(r.y_true) - parseFloat(r.y_pred)) / parseFloat(r.y_true);
-      mapeCount++;
+      combinedSum += Math.abs(parseFloat(r.y_true) - parseFloat(r.y_pred)) / parseFloat(r.y_true);
+      combinedCount++;
+    }}
+    if (parseInt(r.days_since_start) >= 30 && parseFloat(r.y_true_carryover) > 0) {{
+      carryoverSum += Math.abs(parseFloat(r.y_true_carryover) - parseFloat(r.y_pred_carryover)) / parseFloat(r.y_true_carryover);
+      carryoverCount++;
     }}
   }});
-  const mape = mapeCount > 0 ? (mapeSum / mapeCount * 100).toFixed(1) : 'N/A';
+  const combinedMape = combinedCount > 0 ? (combinedSum / combinedCount * 100).toFixed(1) : 'N/A';
+  const carryoverMape = carryoverCount > 0 ? (carryoverSum / carryoverCount * 100).toFixed(1) : 'N/A';
 
-  statsDiv.innerHTML = `<b>${{data.total}}</b> 行 | 覆盖 <b>${{new Set(data.rows.map(r=>r['应用ID'])).size}}</b> 个应用 | MAPE (days>=30): <b>${{mape}}%</b>`;
+  // D1 占比
+  let d1Total = 0, buyTotal = 0;
+  data.rows.forEach(r => {{ d1Total += parseFloat(r.y_true_d1||0); buyTotal += parseFloat(r.y_true||0); }});
+  const d1Ratio = buyTotal > 0 ? (d1Total / buyTotal * 100).toFixed(1) : '0';
 
+  statsDiv.innerHTML = `<b>${{data.total}}</b> 行 | <b>${{new Set(data.rows.map(r=>r['应用ID'])).size}}</b> 个应用`
+    + ` | D1占比 <b>${{d1Ratio}}%</b>`
+    + ` | 组合MAPE(D1已知) <b>${{combinedMape}}%</b>`
+    + ` | CarryoverMAPE(曲线) <b>${{carryoverMape}}%</b>`;
+
+  echarts.dispose(chartDom);
   const chart = echarts.init(chartDom);
   chart.setOption({{
-    title: {{ text: '每日买量收入：预测 vs 实际', left: 'center' }},
+    color: ['#16a34a', '#2563eb'],
+    title: {{ text: '每日买量收入：预测 vs 实际', left: 16, top: 6, textStyle: {{ fontSize: 14 }} }},
     tooltip: {{ trigger: 'axis' }},
-    legend: {{ data: ['实际 (y_true)', '预测 (y_pred)'], bottom: 0 }},
-    grid: {{ left: 60, right: 20, top: 50, bottom: 40 }},
-    xAxis: {{ type: 'category', data: dates, axisLabel: {{ rotate: 45, fontSize: 10 }} }},
-    yAxis: {{ type: 'value', name: '收入' }},
-    dataZoom: [{{ type: 'slider', start: 0, end: 100 }}],
+    legend: {{ data: ['实际', '预测'], top: 6 }},
+    grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
+    xAxis: {{ type: 'category', data: dates }},
+    yAxis: {{ type: 'value' }},
+    dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 18, bottom: 12 }}],
     series: [
-      {{ name: '实际 (y_true)', type: 'line', data: yTrue, smooth: true,
+      {{ name: '实际', type: 'line', data: yTrue, smooth: true,
         lineStyle: {{ width: 2 }}, symbol: 'none' }},
-      {{ name: '预测 (y_pred)', type: 'line', data: yPred, smooth: true,
+      {{ name: '预测', type: 'line', data: yPred, smooth: true,
         lineStyle: {{ width: 2, type: 'dashed' }}, symbol: 'none' }},
     ],
   }});
 
   window.addEventListener('resize', () => chart.resize());
+}}
+
+async function loadDailyRevenueTable() {{
+  const appId = document.getElementById('drTableSearch').value.trim();
+  const from = document.getElementById('drTableDateFrom').value;
+  const to = document.getElementById('drTableDateTo').value;
+  const minDays = parseInt(document.getElementById('drTableDays').value) || 0;
+  const infoDiv = document.getElementById('drTableInfo');
+  const wrap = document.getElementById('dailyRevenueTableWrap');
+
+  const params = appId ? `?app_id=${{encodeURIComponent(appId)}}` : '';
+  infoDiv.textContent = '加载中...';
+  const resp = await fetch(`/web/predictions/daily_revenue${{params}}`);
+  const data = await resp.json();
+
+  if (!data.rows || data.rows.length === 0) {{
+    wrap.innerHTML = '<div class="plain-note">暂无数据</div>';
+    infoDiv.textContent = '';
+    return;
+  }}
+
+  let rows = data.rows;
+  if (from) rows = rows.filter(r => r['日期'] >= from);
+  if (to) rows = rows.filter(r => r['日期'] <= to);
+  if (minDays > 0) rows = rows.filter(r => parseInt(r.days_since_start) >= minDays);
+
+  if (rows.length === 0) {{
+    wrap.innerHTML = '<div class="plain-note">筛选后无数据</div>';
+    infoDiv.textContent = '';
+    return;
+  }}
+
+  const totalYTrue = rows.reduce((s,r) => s + parseFloat(r.y_true||0), 0);
+  const totalYPred = rows.reduce((s,r) => s + parseFloat(r.y_pred||0), 0);
+  const totalD1 = rows.reduce((s,r) => s + parseFloat(r.y_true_d1||0), 0);
+  const totalCOTrue = rows.reduce((s,r) => s + parseFloat(r.y_true_carryover||0), 0);
+  const totalCOPred = rows.reduce((s,r) => s + parseFloat(r.y_pred_carryover||0), 0);
+  const mapeCombined = rows.filter(r => parseFloat(r.y_true) > 0).reduce((s,r) => s + Math.abs(parseFloat(r.y_true)-parseFloat(r.y_pred))/parseFloat(r.y_true), 0)
+    / Math.max(1, rows.filter(r => parseFloat(r.y_true) > 0).length) * 100;
+  const mapeCO = rows.filter(r => parseFloat(r.y_true_carryover) > 0).reduce((s,r) => s + Math.abs(parseFloat(r.y_true_carryover)-parseFloat(r.y_pred_carryover))/parseFloat(r.y_true_carryover), 0)
+    / Math.max(1, rows.filter(r => parseFloat(r.y_true_carryover) > 0).length) * 100;
+  const d1Ratio = totalYTrue > 0 ? (totalD1/totalYTrue*100).toFixed(1) : '0';
+  infoDiv.innerHTML = `${{rows.length}} 行 | D1占比 ${{d1Ratio}}% | 组合MAPE=${{mapeCombined.toFixed(1)}}% | CarryoverMAPE=${{mapeCO.toFixed(1)}}%`;
+
+  let html = '<table><thead><tr>';
+  html += '<th>日期</th><th>应用ID</th><th class="num">实际收入</th><th class="num">预测收入</th><th class="num">误差%</th><th class="num">D1收入</th><th class="num">尾量实际</th><th class="num">尾量预测</th><th class="num">尾量误差%</th><th>累计天</th>';
+  html += '</tr></thead><tbody>';
+
+  const display = rows.slice(0, 2000);
+  display.forEach(r => {{
+    const yt = parseFloat(r.y_true||0), yp = parseFloat(r.y_pred||0);
+    const err = yt > 0 ? ((Math.abs(yt-yp)/yt)*100).toFixed(1) : '-';
+    const errCls = err!=='-' && parseFloat(err)>50 ? 'bad' : '';
+    const d1 = parseFloat(r.y_true_d1||0);
+    const coTrue = parseFloat(r.y_true_carryover||0);
+    const coPred = parseFloat(r.y_pred_carryover||0);
+    const coErr = coTrue > 0 ? ((Math.abs(coTrue-coPred)/coTrue)*100).toFixed(1) : '-';
+    const coErrCls = coErr!=='-' && parseFloat(coErr)>100 ? 'bad' : '';
+    const appId = r['应用ID'];
+    html += '<tr><td>' + r['日期'] + '</td><td><a href="#" onclick="selectAppForDrTable(&#39;' + appId + '&#39;)">' + appId + '</a></td><td class="num">' + yt.toLocaleString() + '</td><td class="num">' + yp.toLocaleString() + '</td><td class="num ' + errCls + '">' + err + '</td><td class="num">' + d1.toLocaleString() + '</td><td class="num">' + coTrue.toLocaleString() + '</td><td class="num">' + coPred.toLocaleString() + '</td><td class="num ' + coErrCls + '">' + coErr + '</td><td class="num">' + r.days_since_start + '</td></tr>';
+  }});
+  html += '</tbody></table>';
+  if (rows.length > 2000) html += '<div class="hint" style="margin-top:4px;">显示前 2000 行，共 ' + rows.length + ' 行</div>';
+  wrap.innerHTML = html;
+}}
+
+function selectAppForDrTable(appId) {{
+  document.getElementById('drTableSearch').value = appId;
+  document.getElementById('drAppSearch').value = appId;
+  loadDailyRevenueTable();
+}}
+
+async function loadDataStatus() {{
+  try {{
+    const resp = await fetch('/health');
+    const h = await resp.json();
+    const bar = document.getElementById('dataStatusBar');
+    if (!bar) return;
+    const d = h.data || {{}};
+    const m = h.models || {{}};
+    const dsDays = d.days_behind;
+    let daysStyle = dsDays <= 1 ? 'var(--green)' : dsDays <= 3 ? '#e6a817' : 'var(--red)';
+    let daysLabel = dsDays === null ? '未知' : dsDays === 0 ? '今日' : dsDays + '天前';
+    const modelOk = Object.values(m).filter(Boolean).length;
+    const modelTotal = Object.values(m).length;
+    bar.innerHTML = `<span class="hint">数据:</span>`
+      + `<b style="color:${{daysStyle}};">${{d.last_date || 'N/A'}}</b>`
+      + `<span style="color:var(--muted);">(${{daysLabel}})</span>`
+      + `<span>|</span>`
+      + `<span>${{(d.row_count/1e4).toFixed(0)}}万行</span>`
+      + `<span>|</span>`
+      + `<span>${{d.app_count}} apps</span>`
+      + `<span>|</span>`
+      + `<span style="color:var(--muted);">空值: 消耗${{((d.critical_null_rate||{{}})['消耗金额']*100||0).toFixed(1)}}% D1${{((d.critical_null_rate||{{}})['首日广告收入']*100||0).toFixed(1)}}%</span>`
+      + `<span>|</span>`
+      + `<span>模型: <b>${{modelOk}}/${{modelTotal}}</b></span>`
+      + (dsDays > 3 ? '<span style="color:var(--red);margin-left:4px;">⚠ 数据滞后，建议更新 daily_merged.csv</span>' : '');
+    const drift = h.drift || {{}};
+    const cal = h.calendar_health || {{}};
+    if (drift.overall) {{
+      const dColors = {{'ok':'var(--green)','warning':'#e6a817','critical':'var(--red)','error':'var(--muted)'}};
+      const dLabels = {{'ok':'正常','warning':'预警','critical':'异常','error':'--'}};
+      bar.innerHTML += '<span>|</span><span>漂移: <b style="color:' + (dColors[drift.overall]||'var(--muted)') + ';">' + (dLabels[drift.overall]||drift.overall) + '</b></span>';
+    }}
+    if (cal.status) {{
+      const cColors = {{'ok':'var(--green)','warning':'#e6a817','error':'var(--red)','unknown':'var(--muted)'}};
+      const cLabels = {{'ok':'正常','warning':'预警','error':'异常','unknown':'--'}};
+      bar.innerHTML += '<span>|</span><span>日历: <b style="color:' + (cColors[cal.status]||'var(--muted)') + ';">' + (cLabels[cal.status]||cal.status) + '</b>' + (cal.status==='warning'?' (未来30d缺)':'') + '</span>';
+    }}
+  }} catch(e) {{
+    console.error('loadDataStatus:', e);
+    const el = document.getElementById('dsLoading');
+    if (el) el.textContent = '获取失败';
+  }}
+}}
+
+async function loadRetrainStatus() {{
+  try {{
+    const resp = await fetch('/health');
+    const h = await resp.json();
+    const bar = document.getElementById('retrainStatusBar');
+    if (!bar || !h.training) return;
+    const t = h.training;
+    const btn = document.getElementById('retrainTriggerBtn');
+    const statusColors = {{'success': 'var(--green)', 'partial': '#e6a817', 'failed': 'var(--red)', 'running': 'var(--accent)', 'never': 'var(--muted)'}};
+    const color = statusColors[t.overall] || 'var(--muted)';
+    const labels = {{'success': '全部通过', 'partial': '部分失败', 'failed': '失败', 'running': '运行中', 'never': '无记录'}};
+    const stepLabels = {{'health_check': '数据', 'spend_t1': 'Spend', 'roi_d1': 'ROI', 'app_curves': '曲线', 'daily_revenue': '收入'}};
+    let stepsHtml = (t.steps || []).map(s => {{
+      const sColor = s.status === 'ok' ? 'var(--green)' : s.status === 'failed' ? 'var(--red)' : s.status === 'running' ? 'var(--accent)' : 'var(--muted)';
+      return '<span style="color:' + sColor + ';">' + (stepLabels[s.step] || s.step) + '</span>';
+    }}).join(' <span style="color:var(--muted);">·</span> ');
+    const lastRun = t.last_run ? new Date(t.last_run).toLocaleString('zh-CN') : '--';
+    bar.innerHTML = '<span class="hint">重训:</span>'
+      + '<b style="color:' + color + ';">' + (labels[t.overall] || t.overall) + '</b>'
+      + '<span style="color:var(--muted);">(' + lastRun + ')</span>'
+      + (stepsHtml ? '<span>|</span>' + stepsHtml : '');
+    if (btn) {{
+      btn.disabled = t.overall === 'running';
+      btn.style.opacity = t.overall === 'running' ? '0.5' : '1';
+    }}
+  }} catch(e) {{
+    const el = document.getElementById('rsLoading');
+    if (el) el.textContent = '获取失败';
+  }}
+}}
+
+async function triggerRetrain() {{
+  const btn = document.getElementById('retrainTriggerBtn');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = '启动中...';
+  try {{
+    const resp = await fetch('/web/retrain/trigger', {{method: 'POST'}});
+    const data = await resp.json();
+    btn.textContent = data.status === 'started' ? '已触发' : '失败';
+    if (data.status === 'started') {{
+      setTimeout(loadRetrainStatus, 3000);
+      setTimeout(loadRetrainStatus, 10000);
+      setTimeout(loadRetrainStatus, 30000);
+    }}
+  }} catch(e) {{
+    btn.textContent = '触发失败';
+    btn.disabled = false;
+  }} finally {{
+    setTimeout(() => {{ btn.disabled = false; btn.textContent = '触发重训'; }}, 5000);
+  }}
+}}
+
+let healthTrendChart = null;
+
+async function loadMonitorView() {{
+  loadMonitorAlerts();
+  loadHealthTrend();
+}}
+
+async function loadMonitorAlerts() {{
+  try {{
+    const resp = await fetch('/v1/monitor/alerts?days=7');
+    const data = await resp.json();
+    document.getElementById('monitorAlertTotal').textContent = data.total || 0;
+    const byLvl = data.by_level || {{}};
+    const byCat = data.by_category || {{}};
+    document.getElementById('monitorAlertBreakdown').innerHTML =
+      'CRITICAL:' + (byLvl.CRITICAL || 0) + ' WARN:' + (byLvl.WARN || 0) +
+      ' | 漂移:' + (byCat.PREDICTION_DRIFT || 0) + ' D1:' + (byCat.PRODUCT_D1_DROP || 0) + ' Spend:' + (byCat.SPEND_DROP || 0);
+
+    // 告警历史表格
+    const recent = data.recent || [];
+    const tabDiv = document.getElementById('monitorAlertTable');
+    if (recent.length === 0) {{
+      tabDiv.innerHTML = '<div style="text-align:center;color:var(--muted);padding:40px 0;font-size:13px;">近7天无告警<br/><span style="font-size:11px;">系统运行正常</span></div>';
+    }} else {{
+      let thtml = '<table><thead><tr><th>时间</th><th>级别</th><th>类别</th><th>详情</th></tr></thead><tbody>';
+      recent.forEach(a => {{
+        const levelClr = a.level === 'CRITICAL' ? 'var(--red)' : '#f59e0b';
+        const catLabel = {{PREDICTION_DRIFT:'预测漂移',PRODUCT_D1_DROP:'D1下滑',TRAFFIC_ANOMALY:'流量异常',ROI_GUARD:'ROI警戒',SPEND_DROP:'消耗骤降',SPEND_SPIKE:'消耗骤升',ROI_DECLINE_TREND:'ROI趋势下行',CAP_PROXIMITY:'Cap逼近'}}[a.category] || a.category;
+        thtml += '<tr><td>' + (a.date||'') + '</td><td style="color:' + levelClr + ';font-weight:600;">' + a.level + '</td><td>' + catLabel + '</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + (a.message||'') + '">' + (a.message||'') + '</td></tr>';
+      }});
+      thtml += '</tbody></table>';
+      tabDiv.innerHTML = thtml;
+    }}
+  }} catch(e) {{}}
+  try {{
+    const r = await fetch('/health');
+    const h = await r.json();
+    const drift = h.drift || {{}};
+    const cal = h.calendar_health || {{}};
+    const training = h.training || {{}};
+    document.getElementById('monitorHealthStatus').textContent =
+      '漂移:' + (drift.overall||'--') + ' 数据:' + ((h.data||{{}}).status||'--');
+    document.getElementById('monitorHealthDetail').textContent =
+      '训练:' + (training.overall||'--') + ' 日历:' + (cal.status||'--');
+  }} catch(e) {{}}
+}}
+
+async function loadHealthTrend() {{
+  try {{
+    const resp = await fetch('/v1/monitor/health-trend?days=30');
+    const data = await resp.json();
+    const snaps = data.snapshots || [];
+    if (snaps.length === 0) {{
+      const el = document.getElementById('healthTrendChart');
+      if (el) el.innerHTML = '<div style="text-align:center;color:var(--muted);padding-top:100px;">暂无健康快照数据<br/>等待首次重训后自动记录</div>';
+      return;
+    }}
+    const dates = snaps.map(s => s.timestamp ? s.timestamp.slice(0,10) : '');
+    const behind = snaps.map(s => s.days_behind || 0);
+    const driftSpend = snaps.map(s => s.drift_spend_mape || 0);
+    const driftRoi = snaps.map(s => s.drift_roi_mape || 0);
+
+    if (!healthTrendChart) {{
+      const el = document.getElementById('healthTrendChart');
+      if (!el) return;
+      healthTrendChart = echarts.init(el);
+    }}
+    healthTrendChart.setOption({{
+      tooltip: {{ trigger: 'axis' }},
+      legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], bottom: 4 }},
+      grid: {{ left: 55, right: 24, top: 10, bottom: 48 }},
+      xAxis: {{ type: 'category', data: dates, axisLabel: {{ rotate: 30, fontSize: 10 }} }},
+      yAxis: [
+        {{ type: 'value', name: '天数', min: 0 }},
+        {{ type: 'value', name: 'MAPE%', min: 0 }},
+      ],
+      series: [
+        {{ name: '数据滞后(天)', type: 'bar', data: behind, itemStyle: {{ color: '#94a3b8' }} }},
+        {{ name: 'Spend MAPE%', type: 'line', yAxisIndex: 1, data: driftSpend, lineStyle: {{ color: '#f59e0b' }}, itemStyle: {{ color: '#f59e0b' }} }},
+        {{ name: 'ROI MAPE%', type: 'line', yAxisIndex: 1, data: driftRoi, lineStyle: {{ color: '#10b981' }}, itemStyle: {{ color: '#10b981' }} }},
+      ],
+    }});
+  }} catch(e) {{}}
+}}
+
+function toggleOnlineInputMode() {{
+  const mode = document.getElementById('onlineInputMode').value;
+  document.getElementById('onlineJsonInput').style.display = mode === 'json' ? '' : 'none';
+  document.getElementById('onlineCsvInput').style.display = mode === 'csv' ? '' : 'none';
+}}
+
+async function runOnlinePredict() {{
+  const targetDate = document.getElementById('onlineTargetDate').value;
+  const mode = document.getElementById('onlineInputMode').value;
+  const resultDiv = document.getElementById('onlinePredictResult');
+
+  let apps = [];
+  try {{
+    if (mode === 'json') {{
+      apps = JSON.parse(document.getElementById('onlineInputJson').value);
+    }} else {{
+      const lines = document.getElementById('onlineInputCsv').value.trim().split('\\n');
+      const header = lines[0].replace(/\\r/g, '');
+      const cols = header.split(',');
+      const idxApp = cols.findIndex(c => c.trim() === '应用ID');
+      const idxSpend = cols.findIndex(c => c.trim().toLowerCase() === 'spend');
+      const idxD1 = cols.findIndex(c => c.trim().toLowerCase() === 'd1_revenue');
+      for (let i = 1; i < lines.length; i++) {{
+        const vals = lines[i].replace(/\\r/g, '').split(',');
+        if (vals.length >= 3) {{
+          apps.push({{
+            '应用ID': vals[idxApp].trim(),
+            spend: parseFloat(vals[idxSpend]),
+            d1_revenue: parseFloat(vals[idxD1]),
+          }});
+        }}
+      }}
+    }}
+  }} catch (e) {{
+    resultDiv.innerHTML = '<div class="risk-alert critical">输入格式错误: ' + e.message + '</div>';
+    return;
+  }}
+
+  if (!targetDate || apps.length === 0) {{
+    resultDiv.innerHTML = '<div class="risk-alert warn">请输入目标日期和至少一个应用</div>';
+    return;
+  }}
+
+  resultDiv.innerHTML = '<span style="color:var(--accent);">计算中...</span>';
+  try {{
+    const resp = await fetch('/web/revenue/daily-predict', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ target_date: targetDate, apps: apps }}),
+    }});
+    const data = await resp.json();
+    if (data.error) {{
+      resultDiv.innerHTML = '<div class="risk-alert critical">' + data.error + '</div>';
+      return;
+    }}
+
+    const top10 = data.rows.sort((a,b) => b.y_pred - a.y_pred).slice(0, 10);
+    let html = '<b>预测完成:</b> ' + data.predicted_apps + ' apps | 总收入预测: <b>' + data.total_predicted_revenue.toLocaleString() + '</b>';
+    html += '<table style="margin-top:8px;"><tr><th>应用ID</th><th class="num">预测收入</th><th class="num">消耗</th><th class="num">D1_ROI</th><th class="num">累计天</th><th class="num">Cohort数</th></tr>';
+    top10.forEach(r => {{
+      html += '<tr><td>' + r['应用ID'] + '</td><td class="num">' + r.y_pred.toLocaleString() + '</td><td class="num">' + r.spend.toLocaleString() + '</td><td class="num">' + r.d1_roi + '</td><td class="num">' + r.days_since_start + '</td><td class="num">' + r.cohort_count + '</td></tr>';
+    }});
+    html += '</table><div class="hint">显示 top 10 by y_pred | ' + (data.rows.length > 10 ? '共 ' + data.rows.length + ' apps' : '') + '</div>';
+    resultDiv.innerHTML = html;
+  }} catch (e) {{
+    resultDiv.innerHTML = '<div class="risk-alert critical">请求失败: ' + e.message + '</div>';
+  }}
 }}
 
 const rb = document.getElementById('resetBtn');
@@ -1858,6 +2270,8 @@ if (rb) rb.addEventListener('click', () => {{
 window.addEventListener('resize', () => {{ Object.values(charts).forEach(c => c.resize()); if (_popupCharts.roi) _popupCharts.roi.resize(); if (_popupCharts.spend) _popupCharts.spend.resize(); }});
 render();
 setActiveView(initialView);
+loadDataStatus();
+loadRetrainStatus();
 </script>
 </body>
 </html>
@@ -2573,6 +2987,7 @@ def _resolve_prediction_path(target: str) -> Path | None:
     if target == "roi":
         roi_dir = _pick_existing(
             [
+                root / "model_parallel_roi_d1_exp035",
                 root / "model_parallel_roi_d1_v9_unified",
                 root / "model_parallel_roi_d1_v8_001",
                 root / "model_parallel_roi_d1_v7_001",
@@ -2583,6 +2998,7 @@ def _resolve_prediction_path(target: str) -> Path | None:
         return resolve_roi_predictions_csv(roi_dir)
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1_exp035",
             root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1_v11_001",
         ]
@@ -2803,4 +3219,66 @@ async def web_daily_revenue_predictions(
     if app_id:
         rows = [r for r in rows if r.get("应用ID") == app_id]
     return JSONResponse(content={"rows": rows, "total": len(rows)})
+
+
+@router.post("/web/revenue/daily-predict")
+async def web_revenue_daily_predict(request: Request):
+    """在线预测：给定目标日期 + per-app spend/D1，返回当日收入预测"""
+    from scripts.predict_daily_revenue import (
+        load_app_daily,
+        load_curves,
+        build_cohorts_until,
+        predict_single_day,
+    )
+
+    body = await request.json()
+    target_date_str = body.get("target_date", "")
+    apps_input = body.get("apps", [])
+
+    if not target_date_str or not apps_input:
+        return JSONResponse(
+            content={"error": "缺少 target_date 或 apps"},
+            status_code=400,
+        )
+
+    target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+
+    csv_path = _repo_root() / "daily_merged.csv"
+    data = load_app_daily(csv_path)
+
+    curves_path = _repo_root() / "outputs" / "per_app_release_curves.json"
+    curves = load_curves(curves_path)
+
+    cohorts_map = build_cohorts_until(data, target_date)
+    rows = predict_single_day(target_date, cohorts_map, apps_input, curves)
+
+    total_predicted = sum(r["y_pred"] for r in rows)
+    return JSONResponse(content={
+        "target_date": target_date_str,
+        "predicted_apps": len(rows),
+        "total_predicted_revenue": round(total_predicted, 2),
+        "rows": rows,
+    })
+
+
+@router.post("/web/retrain/trigger")
+async def web_trigger_retrain():
+    """手动触发每日重训（异步执行，不阻塞响应）"""
+    from scripts.daily_retrain import main as retrain_main
+
+    def _worker():
+        try:
+            retrain_main()
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    return JSONResponse({"status": "started"})
+
+
+@router.get("/web/monitor", response_class=HTMLResponse)
+def web_monitor(request: Request):
+    """监控面板：告警历史 + 健康趋势"""
+    return _render_model_dashboard({}, initial_view="monitor")
 
