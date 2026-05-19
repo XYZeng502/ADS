@@ -123,7 +123,7 @@ def _read_csv(path: Path, limit: int) -> List[Dict[str, str]]:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(row)
-            if len(rows) >= limit:
+            if limit > 0 and len(rows) >= limit:
                 break
     return rows
 
@@ -3215,7 +3215,7 @@ async def web_daily_revenue_predictions(
     if not csv_path.exists():
         return JSONResponse(content={"rows": [], "message": "预测数据尚未生成，请先运行 scripts/predict_daily_revenue.py"})
 
-    rows = _read_csv_rows(csv_path)
+    rows = _read_csv_rows(csv_path, limit=0)
     if app_id:
         rows = [r for r in rows if r.get("应用ID") == app_id]
     return JSONResponse(content={"rows": rows, "total": len(rows)})
