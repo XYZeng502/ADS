@@ -28,7 +28,7 @@ from app.unified_daily import build_unified_daily
 from app.prediction_artifacts import validate_merged_daily_csv
 
 EXPERIMENT_NAME = "exp_01_quantile"
-QUANTILE_ALPHAS = [0.1, 0.5, 0.9]
+QUANTILE_ALPHAS = [0.05, 0.5, 0.95]
 
 
 def _make_quantile_variants(alphas: List[float]) -> List[Dict]:
@@ -53,17 +53,25 @@ def _assign_spend_bucket(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _find_quantile_keys(columns: list) -> tuple:
-    p10_key = None
-    p50_key = None
-    p90_key = None
+    """Find P10/P50/P90 (or P05/P50/P95) keys from model column names.
+
+    Works with any QUANTILE_ALPHAS by finding the min, median, and max alpha suffixes.
+    """
+    alpha_suffixes = []
     for col in columns:
-        if "_q10" in col and "_log" not in col:
-            p10_key = col
-        elif "_q50" in col and "_log" not in col:
-            p50_key = col
-        elif "_q90" in col and "_log" not in col:
-            p90_key = col
-    return p10_key, p50_key, p90_key
+        if "_q" in col and "_log" not in col:
+            # Extract the numeric suffix after _q (e.g., "5", "10", "50", "95")
+            for part in col.split("_"):
+                if part.startswith("q") and part[1:].isdigit():
+                    alpha_suffixes.append((int(part[1:]), col))
+                    break
+    if not alpha_suffixes:
+        return None, None, None
+    alpha_suffixes.sort()
+    lo_key = alpha_suffixes[0][1]   # smallest alpha (e.g., q5 or q10)
+    md_key = alpha_suffixes[len(alpha_suffixes)//2][1]  # median alpha (q50)
+    hi_key = alpha_suffixes[-1][1]  # largest alpha (e.g., q90 or q95)
+    return lo_key, md_key, hi_key
 
 
 def _compute_quantile_metrics(results: list) -> Dict:
@@ -71,34 +79,34 @@ def _compute_quantile_metrics(results: list) -> Dict:
     for r in results:
         pred_dfs[r.model_name] = r.prediction_df.set_index(["日期", "应用ID"])
 
-    p10_key, p50_key, p90_key = _find_quantile_keys(list(pred_dfs.keys()))
+    lo_key, md_key, hi_key = _find_quantile_keys(list(pred_dfs.keys()))
 
-    if not all([p10_key, p50_key, p90_key]):
+    if not all([lo_key, md_key, hi_key]):
         return {"error": "Missing quantile predictions", "available_keys": list(pred_dfs.keys())}
 
-    p10 = pred_dfs[p10_key]["y_pred"]
-    p50 = pred_dfs[p50_key]["y_pred"]
-    p90 = pred_dfs[p90_key]["y_pred"]
-    y_true = pred_dfs[p10_key]["y_true"]
+    p_lo = pred_dfs[lo_key]["y_pred"]
+    p_md = pred_dfs[md_key]["y_pred"]
+    p_hi = pred_dfs[hi_key]["y_pred"]
+    y_true = pred_dfs[lo_key]["y_true"]
 
-    coverage = compute_coverage(y_true.values, p10.values, p90.values)
-    interval_width_median = float(np.median(compute_interval_width(p10.values, p90.values, p50.values)))
+    coverage = compute_coverage(y_true.values, p_lo.values, p_hi.values)
+    interval_width_median = float(np.median(compute_interval_width(p_lo.values, p_hi.values, p_md.values)))
 
     pinball_scores = {}
-    for a, key in [(0.1, p10_key), (0.5, p50_key), (0.9, p90_key)]:
+    for a, key in [(0.05, lo_key), (0.5, md_key), (0.95, hi_key)]:
         pinball_scores[f"alpha_{a}"] = evaluate_pinball(
             y_true.values, pred_dfs[key]["y_pred"].values, a
         )
 
-    p50_metrics = evaluate(y_true.values, p50.values)
+    md_metrics = evaluate(y_true.values, p_md.values)
 
     return {
-        "coverage_p10_p90": round(coverage, 4),
+        "coverage": round(coverage, 4),
         "ideal_coverage": 0.80,
         "coverage_error_pp": round((coverage - 0.80) * 100, 2),
         "interval_width_median": round(interval_width_median, 4),
         "pinball_loss": {k: round(v, 6) for k, v in pinball_scores.items()},
-        "p50_mape_pct": round(p50_metrics["mape_pct"], 2),
+        "median_mape_pct": round(md_metrics["mape_pct"], 2),
     }
 
 
@@ -117,9 +125,9 @@ def _bucket_metrics(results: list) -> Dict:
 
     merged = _assign_spend_bucket(merged)
 
-    p10_key, p50_key, p90_key = _find_quantile_keys(["pred_{}".format(r.model_name) for r in results])
+    lo_key, md_key, hi_key = _find_quantile_keys(["pred_{}".format(r.model_name) for r in results])
 
-    if not all([p10_key, p50_key, p90_key]):
+    if not all([lo_key, md_key, hi_key]):
         return {}
 
     bucket_stats = {}
@@ -128,14 +136,14 @@ def _bucket_metrics(results: list) -> Dict:
         if b.empty:
             continue
         y = b["y_true"].values
-        lo = b[p10_key].values
-        md = b[p50_key].values
-        hi = b[p90_key].values
+        lo = b[lo_key].values
+        md = b[md_key].values
+        hi = b[hi_key].values
         bucket_stats[bucket] = {
             "n": int(len(b)),
             "coverage": round(compute_coverage(y, lo, hi), 4),
             "interval_width_median": round(float(np.median(compute_interval_width(lo, hi, md))), 4),
-            "p50_mape_pct": round(evaluate(y, md)["mape_pct"], 2),
+            "mape_pct": round(evaluate(y, md)["mape_pct"], 2),
         }
 
     return bucket_stats
@@ -223,8 +231,9 @@ def main():
     report_path = out_dir / "experiment_report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nReport saved to {report_path}")
-    print(f"  Coverage (P10-P90): {quantile_metrics.get('coverage_p10_p90', 'N/A')}")
+    print(f"  Coverage: {quantile_metrics.get('coverage', 'N/A')}")
     print(f"  Interval width (median): {quantile_metrics.get('interval_width_median', 'N/A')}")
+    print(f"  Median MAPE: {quantile_metrics.get('median_mape_pct', 'N/A')}%")
     if bucket_stats:
         print(f"  Q4_high coverage: {bucket_stats.get('Q4_high', {}).get('coverage', 'N/A')}")
     print(f"  Verdict: {verdict}")
