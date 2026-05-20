@@ -1908,10 +1908,12 @@ function render() {{
   renderTable(rows);
 }}
 
-['targetSel','startDate','endDate'].forEach(id => {{
+['startDate','endDate'].forEach(id => {{
   const el = document.getElementById(id);
   if (el) el.addEventListener('change', () => {{ selectedAppId = ''; _chartAppId = ''; document.getElementById('appSelectHint').style.display = 'none'; detailState = {{ appId: '', page: 0, limit: 200, total: 0 }}; render(); }});
 }});
+const targetSelEl = document.getElementById('targetSel');
+if (targetSelEl) targetSelEl.addEventListener('change', () => {{ _chartAppId = ''; detailState = selectedAppId ? {{ appId: selectedAppId, page: 0, limit: 200, total: 0 }} : {{ appId: '', page: 0, limit: 200, total: 0 }}; render(); }});
 const appTableSearchEl = document.getElementById('appTableSearch');
 if (appTableSearchEl) appTableSearchEl.addEventListener('input', renderAppSummary);
 const detailAppSearchEl = document.getElementById('detailAppSearch');
