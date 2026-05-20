@@ -762,7 +762,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
       <span style="font-size:13px;">重训状态：</span>
       <b id="monitorRetrainOverall" style="font-size:14px;">--</b>
       <span style="color:var(--muted);font-size:12px;" id="monitorRetrainTime"></span>
-      <button onclick="triggerRetrain()" style="margin-left:auto;padding:6px 20px;font-size:13px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer;">触发重训</button>
+      <button id="retrainTriggerBtn" onclick="triggerRetrain()" style="margin-left:auto;padding:6px 20px;font-size:13px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer;">触发重训</button>
     </div>
     <div class="grid4" style="margin-bottom:8px;">
       <div class="metric"><div class="k">数据日期</div><div class="v" id="monitorDataDate">--</div><div class="d" id="monitorDataBehind"></div></div>
