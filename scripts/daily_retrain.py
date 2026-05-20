@@ -25,6 +25,9 @@ STEPS = [
             "--output-dir", "outputs/model_parallel_spend_t1",
             "--min-train-days", "20",
             "--use-gpu",
+            "--tree-models", "XGBoost",
+            "--use-log-target",
+            "--enable-cqr",
         ],
     },
     {
