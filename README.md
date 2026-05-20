@@ -255,8 +255,8 @@ sudo systemctl enable --now ad-ml
 
 ## 文档索引
 
-- `CLAUDE.md` — 开发者上下文（系统架构、最新模型版本、关键文件索引）
-- `docs/system_architecture.md` — 系统架构
-- `docs/USAGE.md` — 使用指南
-- `docs/modules/` — 模块详细文档
-- `docs/superpowers/specs/` — 设计文档
+- **`docs/项目交付概述.md`** — 交付总览：项目背景、能力总览、架构、部署、配置（推荐首先阅读）
+- `README.md` — 本文档：快速启动、核心模块、API 接口表、项目结构、故障排查
+- `docs/system_architecture.md` — 系统架构详解：数据流、模型架构、CQR 区间、决策六层
+- `docs/USAGE.md` — 使用手册：Web 看板操作、数据管理、训练命令、API 示例、配置参数全表、常见问题
+- `docs/modules/` — 各模块详细文档
