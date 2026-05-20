@@ -187,6 +187,17 @@ def main() -> None:
     parser.add_argument("--use-log-target", action="store_true", help="增加 log1p(spend) 分支")
     parser.add_argument("--weight-exponent", type=float, default=0.35, help="样本权重指数：spend^exponent (0=等权, 0.35=平衡, 0.5=sqrt, 1=线性)")
     parser.add_argument(
+        "--enable-cqr",
+        action="store_true",
+        help="Enable CQR per-bucket calibration for prediction intervals (requires mapie).",
+    )
+    parser.add_argument(
+        "--q4-confidence",
+        type=float,
+        default=0.85,
+        help="Target coverage for Q4 high-spend bucket (default 0.85).",
+    )
+    parser.add_argument(
         "--split-col",
         default="",
         help="（已废弃-统一底表不区分分流）",
@@ -305,6 +316,14 @@ def main() -> None:
     if not tree_override:
         tree_override = ["XGBoost", "CatBoost"]
 
+    extra_variants = None
+    if args.enable_cqr:
+        extra_variants = [
+            {"suffix": "q5",  "overrides": {"objective": "reg:quantileerror", "quantile_alpha": 0.05}},
+            {"suffix": "q50", "overrides": {"objective": "reg:quantileerror", "quantile_alpha": 0.5}},
+            {"suffix": "q95", "overrides": {"objective": "reg:quantileerror", "quantile_alpha": 0.95}},
+        ]
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     df, clean_meta = build_unified_daily(
@@ -325,6 +344,7 @@ def main() -> None:
         tree_models=tree_override,
         use_gpu=bool(args.use_gpu),
         weight_exponent=args.weight_exponent,
+        extra_model_variants=extra_variants,
     )
     if not results:
         raise ValueError("未得到 spend 预测结果，请检查数据和参数。")
@@ -335,6 +355,44 @@ def main() -> None:
         r.prediction_df.to_csv(out_dir / f"predictions_{safe_model_filename(r.model_name)}.csv", index=False, encoding="utf-8-sig")
     metric_df = pd.DataFrame(metric_rows).sort_values("mape")
     metric_df.to_csv(out_dir / "metrics_summary.csv", index=False, encoding="utf-8-sig")
+
+    # CQR post-hoc calibration
+    cqr_report = None
+    if args.enable_cqr:
+        from app.experiments.core import build_cqr_prediction, compute_coverage, evaluate
+        preds_by_name = {r.model_name: r.prediction_df for r in results}
+        q5_key = "XGBoost_q5"
+        q50_key = "XGBoost_q50"
+        q95_key = "XGBoost_q95"
+        if q5_key in preds_by_name and q50_key in preds_by_name and q95_key in preds_by_name:
+            print("Running CQR per-bucket calibration...", flush=True)
+            cqr_df = build_cqr_prediction(
+                pred_q05=preds_by_name[q5_key],
+                pred_q50=preds_by_name[q50_key],
+                pred_q95=preds_by_name[q95_key],
+                weight_exponent=args.weight_exponent,
+                q4_confidence=args.q4_confidence,
+            )
+            cqr_path = out_dir / "predictions_XGBoost_CQR.csv"
+            cqr_df.to_csv(cqr_path, index=False, encoding="utf-8-sig")
+
+            y_true = cqr_df["y_true"].values
+            y_lower = cqr_df["y_lower"].values
+            y_upper = cqr_df["y_upper"].values
+            y_pred = cqr_df["y_pred"].values
+            cqr_metrics = evaluate(y_true, y_pred)
+            cqr_coverage = float(compute_coverage(y_true, y_lower, y_upper))
+
+            cqr_report = {
+                "coverage": round(cqr_coverage, 4),
+                "coverage_pct": round(cqr_coverage * 100, 2),
+                "mape_pct": round(cqr_metrics["mape_pct"], 2),
+                "q4_confidence": args.q4_confidence,
+                "samples": int(len(cqr_df)),
+            }
+            print(f"CQR: coverage={cqr_coverage:.4f} ({cqr_coverage*100:.1f}%) MAPE={cqr_metrics['mape_pct']:.2f}% samples={len(cqr_df)}", flush=True)
+        else:
+            print("CQR: quantile variants not found in results. Available:", list(preds_by_name.keys()), flush=True)
 
     reconcile_report = None
     if args.reconcile_with_app_baseline:
@@ -384,6 +442,8 @@ def main() -> None:
         "best_model_by_mape": str(metric_df.iloc[0]["model"]),
         "best_mape": float(metric_df.iloc[0]["mape"]),
         "best_mape_pct": float(metric_df.iloc[0]["mape_pct"]),
+        "cqr_enabled": bool(args.enable_cqr),
+        "cqr": cqr_report,
         "reconcile_enabled": bool(args.reconcile_with_app_baseline),
         "reconcile_model": args.reconcile_model,
         "reconcile_min_entities": int(args.reconcile_min_entities),
