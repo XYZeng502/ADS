@@ -518,35 +518,27 @@ def build_cqr_prediction(pred_q05: pd.DataFrame,
 
         for bucket in SPEND_BUCKET_LABELS:
             bm = buckets_all == bucket
-            if bm.sum() < 10:
+            if bm.sum() < 5:
                 continue
 
             q_bucket = q_preds[bm]
             y_bucket = y_true_all[bm]
-
-            n_b = len(q_bucket)
-            n_calib = max(int(n_b * 0.3), 5)
-            np.random.seed(random_state)
-            perm = np.random.permutation(n_b)
-            x_calib = q_bucket[perm[:n_calib]]
-            y_calib = y_bucket[perm[:n_calib]]
-            x_test = q_bucket[perm[n_calib:]]
-            test_indices = np.where(bm)[0][perm[n_calib:]]
+            bucket_indices = np.where(bm)[0]
 
             try:
                 cqr = ConformalizedQuantileRegressor(
                     estimator=None,
                     confidence_level=bucket_conf[bucket],
                 )
-                cqr.fit(x_calib, y_calib)
-                _, y_pis = cqr.predict(x_test)
+                # Calibrate and predict on all samples — no split, no gaps
+                cqr.fit(q_bucket, y_bucket)
+                _, y_pis = cqr.predict(q_bucket)
                 y_pis = y_pis.squeeze(-1)
-                y_lower_all[test_indices] = np.min(y_pis, axis=1)
-                y_upper_all[test_indices] = np.max(y_pis, axis=1)
+                y_lower_all[bucket_indices] = np.min(y_pis, axis=1)
+                y_upper_all[bucket_indices] = np.max(y_pis, axis=1)
             except Exception:
-                # Fall back to raw quantile predictions
-                y_lower_all[test_indices] = x_test[:, 0]
-                y_upper_all[test_indices] = x_test[:, 2]
+                y_lower_all[bucket_indices] = q_bucket[:, 0]
+                y_upper_all[bucket_indices] = q_bucket[:, 2]
 
         valid = ~np.isnan(y_lower_all) & ~np.isnan(y_upper_all)
         if valid.sum() == 0:
