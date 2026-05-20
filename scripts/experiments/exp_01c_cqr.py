@@ -44,20 +44,25 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
     if train.empty or test.empty or len(train) < 60:
         return None
 
+    # Assign static spend buckets for per-bucket calibration
+    train["_bucket"] = _assign_static_bucket_label(train)
+    test["_bucket"] = _assign_static_bucket_label(test)
+
     x = train[feats].values
     y = train["target_t1_spend"].clip(lower=0.0).values
     x_test = test[feats].values
     y_test = test["target_t1_spend"].values
     sw = np.power(train["消耗金额"].clip(lower=0).values, weight_exponent)
 
-    # Split: proper train (60%) / calibration (20%) / test is separate
+    # Split: proper train (70%) / calibration (30%)
     n = len(x)
     n_proper = int(n * 0.7)
     x_proper, x_calib = x[:n_proper], x[n_proper:]
     y_proper, y_calib = y[:n_proper], y[n_proper:]
     sw_proper = sw[:n_proper]
+    calib_buckets = train["_bucket"].values[n_proper:]
 
-    # Train 3 quantile XGBoost models on proper training set
+    # Train 3 quantile XGBoost models on ALL proper training data
     estimators = []
     for alpha in [0.05, 0.5, 0.95]:
         m = build_model("XGBoost", use_gpu=use_gpu,
@@ -70,23 +75,59 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
             m.fit(x_proper, y_proper)
         estimators.append(m)
 
-    # CQR calibration — prefit=True: estimators already fitted, use conformalize()
-    cqr = ConformalizedQuantileRegressor(
-        estimator=estimators,
-        confidence_level=TARGET_COVERAGE,
-        prefit=True,
-    )
-    cqr.conformalize(x_calib, y_calib)
-    _, y_pis = cqr.predict_interval(x_test)
-    y_pis = y_pis.squeeze(-1)  # (n, 2, 1) -> (n, 2)
+    def _calibrate_and_predict(x_cal, y_cal, x_test_subset):
+        """Calibrate CQR on bucket-specific calibration data and predict."""
+        if len(x_cal) < 20:
+            return None  # too few samples for calibration
+        cqr = ConformalizedQuantileRegressor(
+            estimator=estimators,
+            confidence_level=TARGET_COVERAGE,
+            prefit=True,
+        )
+        cqr.conformalize(x_cal, y_cal)
+        _, y_pis = cqr.predict_interval(x_test_subset)
+        y_pis = y_pis.squeeze(-1)
+        return y_pis
 
-    # Use median model (alpha=0.5) for point predictions, not CQR's combined output
-    y_pred_raw = estimators[1].predict(x_test)  # alpha=0.5
-    y_pred = apply_holiday_transition_calibration(test, y_pred_raw)
+    # Per-bucket calibration + prediction
+    n_test = len(x_test)
+    y_pis_all = np.zeros((n_test, 2))
+    y_pred_raw_all = np.zeros(n_test)
 
-    # Ensure intervals are non-crossing: sort lower/upper per row
-    y_lower = np.min(y_pis, axis=1)
-    y_upper = np.max(y_pis, axis=1)
+    # Use median model for point predictions (same for all buckets)
+    y_pred_raw_all = estimators[1].predict(x_test)
+
+    test_buckets = test["_bucket"].values
+    buckets_used = set()
+
+    for bucket in sorted(set(test_buckets)):
+        calib_mask = calib_buckets == bucket
+        test_mask = test_buckets == bucket
+
+        if not calib_mask.any() or calib_mask.sum() < 20:
+            continue  # skip buckets with too few calibration samples
+
+        x_cal_bucket = x_calib[calib_mask]
+        y_cal_bucket = y_calib[calib_mask]
+        x_test_bucket = x_test[test_mask]
+
+        y_pis_bucket = _calibrate_and_predict(x_cal_bucket, y_cal_bucket, x_test_bucket)
+        if y_pis_bucket is not None:
+            y_pis_all[test_mask] = y_pis_bucket
+            buckets_used.add(bucket)
+
+    # Fallback: global CQR for buckets without enough calibration samples
+    missing_mask = ~np.array([b in buckets_used for b in test_buckets])
+    if missing_mask.any():
+        y_pis_global = _calibrate_and_predict(x_calib, y_calib, x_test[missing_mask])
+        if y_pis_global is not None:
+            y_pis_all[missing_mask] = y_pis_global
+
+    y_pred = apply_holiday_transition_calibration(test, y_pred_raw_all)
+
+    # Ensure intervals are non-crossing
+    y_lower = np.min(y_pis_all, axis=1)
+    y_upper = np.max(y_pis_all, axis=1)
 
     return pd.DataFrame({
         "日期": test["日期"].values,
@@ -95,7 +136,15 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
         "y_pred": np.clip(y_pred, 0.0, None),
         "y_lower": np.clip(y_lower, 0.0, None),
         "y_upper": np.clip(y_upper, 0.0, None),
-        "model": "XGBoost_CQR",
+        "model": "XGBoost_CQR_bucket",
+    })
+
+
+def _assign_static_bucket_label(df):
+    """Assign static spend bucket labels Q1-Q4 based on app mean spend."""
+    train_holdout = df["target_t1_spend"] if "target_t1_spend" in df.columns else df["消耗金额"]
+    app_avg = df.groupby("应用ID")[train_holdout.name].transform("mean")
+    return pd.qcut(app_avg, q=4, labels=["Q1_low", "Q2", "Q3", "Q4_high"])
     })
 
 
