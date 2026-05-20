@@ -1441,8 +1441,12 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
     _save_per_app_curves(per_app_curves)
 
     # 三档预算推荐（基于CQR预测区间）
-    cqr_path = Path("outputs/model_parallel_spend_t1/predictions_XGBoost_CQR.csv")
-    if cqr_path.exists():
+    cqr_path = _pick_existing([
+        Path("outputs/model_parallel_spend_t1_v12_unified/predictions_XGBoost_CQR.csv"),
+        Path("outputs/model_parallel_spend_t1/predictions_XGBoost_CQR.csv"),
+        Path("outputs/model_parallel_spend_t1_exp035/predictions_XGBoost_CQR.csv"),
+    ])
+    if cqr_path and cqr_path.exists():
         cqr_rows: Dict[str, dict] = {}
         with cqr_path.open("r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)

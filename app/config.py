@@ -1,3 +1,4 @@
+import os
 from typing import Literal
 
 from pydantic import BaseModel
@@ -7,6 +8,8 @@ class Settings(BaseModel):
     app_name: str = "Smart Budget Decision System"
     version: str = "0.1.0"
     default_kpi: float = 1.05
+    retrain_timeout_seconds: int = 7200  # 单步重训最长 2 小时
+    api_key: str = ""  # API 鉴权密钥，为空则不启用鉴权
     release_surplus_threshold: float = 0.05
     risk_d1_drop_days: int = 3
     risk_d1_drop_ratio: float = 0.9
@@ -62,4 +65,22 @@ class Settings(BaseModel):
     app_last_day_min_train_days: int = 30
 
 
-settings = Settings()
+def _load_settings() -> Settings:
+    """Load settings from defaults overridden by APP_* environment variables."""
+    kwargs = {}
+    env_prefix = "APP_"
+    for field_name in Settings.model_fields:
+        env_key = f"{env_prefix}{field_name.upper()}"
+        env_val = os.environ.get(env_key)
+        if env_val is not None:
+            field_type = Settings.model_fields[field_name].annotation
+            if field_type is float:
+                kwargs[field_name] = float(env_val)
+            elif field_type is int:
+                kwargs[field_name] = int(env_val)
+            else:
+                kwargs[field_name] = env_val
+    return Settings(**kwargs)
+
+
+settings = _load_settings()

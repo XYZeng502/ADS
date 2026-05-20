@@ -22,7 +22,7 @@ class RiskService:
         actual = p.recent_d1_actual[-settings.risk_d1_drop_days:]
         pred = p.recent_d1_predicted[-settings.risk_d1_drop_days:]
         drops = sum(1 for a, b in zip(actual, pred) if b > 0 and a < b * settings.risk_d1_drop_ratio)
-        if drops == settings.risk_d1_drop_days:
+        if drops >= settings.risk_d1_drop_days:
             return [RiskAlert(
                 level="WARN", category="PRODUCT_D1_DROP", product_id=p.product_id,
                 message=f"{p.product_name} 连续{settings.risk_d1_drop_days}天D1低于预测90%，建议自动降权。",
@@ -35,7 +35,7 @@ class RiskService:
         if len(hist) < settings.risk_roi_decline_days:
             return []
         window = hist[-settings.risk_roi_decline_days:]
-        declining = all(window[i] > window[i + 1] for i in range(len(window) - 1))
+        declining = all(window[i] >= window[i + 1] for i in range(len(window) - 1)) and any(window[i] > window[i + 1] for i in range(len(window) - 1))
         if declining and window[0] > 0:
             drop_pct = (window[0] - window[-1]) / window[0] if window[0] > 0 else 0
             return [RiskAlert(

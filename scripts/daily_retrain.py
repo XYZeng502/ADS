@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.config import settings
 from app.services.data_pipeline import check_data_health
 from app.services.retrain_status import (
     RetrainStatus,
@@ -22,7 +23,7 @@ STEPS = [
         "cmd": [
             sys.executable, "scripts/run_parallel_models_spend_t1.py",
             "--input", "daily_merged.csv",
-            "--output-dir", "outputs/model_parallel_spend_t1",
+            "--output-dir", "outputs/model_parallel_spend_t1_v12_unified",
             "--min-train-days", "20",
             "--use-gpu",
             "--tree-models", "XGBoost",
@@ -36,7 +37,7 @@ STEPS = [
         "cmd": [
             sys.executable, "scripts/run_parallel_models_roi_d1.py",
             "--input", "daily_merged.csv",
-            "--output-dir", "outputs/model_parallel_roi_d1",
+            "--output-dir", "outputs/model_parallel_roi_d1_v9_unified",
             "--min-train-days", "20",
             "--use-gpu",
         ],
@@ -57,7 +58,6 @@ STEPS = [
     },
 ]
 
-_TIMEOUT_PER_STEP = 7200  # 单步最长 2 小时
 
 
 def _extract_details(step_id: str, stdout: str) -> dict:
@@ -102,7 +102,7 @@ def run_step(step: dict) -> StepStatus:
             step["cmd"],
             capture_output=True,
             text=True,
-            timeout=_TIMEOUT_PER_STEP,
+            timeout=settings.retrain_timeout_seconds,
             cwd=Path(__file__).resolve().parent.parent,
         )
         elapsed = time.time() - t0
@@ -126,9 +126,9 @@ def run_step(step: dict) -> StepStatus:
 
     except subprocess.TimeoutExpired:
         st.status = "failed"
-        st.error = f"timeout ({_TIMEOUT_PER_STEP}s)"
-        st.duration_s = _TIMEOUT_PER_STEP
-        print(f"[TIMEOUT] {step['label']} 超时 {_TIMEOUT_PER_STEP}s")
+        st.error = f"timeout ({settings.retrain_timeout_seconds}s)"
+        st.duration_s = settings.retrain_timeout_seconds
+        print(f"[TIMEOUT] {step['label']} 超时 {settings.retrain_timeout_seconds}s")
 
     st.finished_at = datetime.now(timezone.utc).isoformat()
     return st
@@ -173,16 +173,28 @@ def main():
     status.overall = "success" if all_ok else ("failed" if not any_failure else "partial")
     save_retrain_status(status)
 
-    # 3. 告警持久化 + 健康快照
+    # 3. 告警持久化（含重训失败通知） + 健康快照
     print("\n[附] 采集告警与健康快照...")
     try:
+        from app.schemas import RiskAlert
         from app.services.alert_log import AlertLog
         from app.services.risk import RiskService
+
+        retrain_alerts = []
+        for s in status.steps:
+            if s.status == "failed":
+                retrain_alerts.append(RiskAlert(
+                    level="CRITICAL", category="RETRAIN_FAILURE",
+                    message=f"重训步骤「{s.step}」失败: {s.error or '未知错误'}（耗时{s.duration_s:.0f}s）",
+                ))
+        if retrain_alerts:
+            AlertLog.append(retrain_alerts)
+            print(f"  重训失败告警: {len(retrain_alerts)} 条")
 
         risk_svc = RiskService()
         drift_alerts = risk_svc.evaluate_drift()
         AlertLog.append(drift_alerts)
-        print(f"  告警已持久化: {len(drift_alerts)} 条")
+        print(f"  漂移告警: {len(drift_alerts)} 条")
     except Exception as e:
         print(f"  [WARN] 告警采集失败: {e}")
 

@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from app.config import settings
 from app.core.calendar import CalendarService
 from app.prediction_artifacts import resolve_roi_predictions_csv, resolve_spend_predictions_csv
 from scripts.offline_backtest import run_app_level_last_day_prediction, run_backtest
@@ -21,6 +23,17 @@ from scripts.offline_backtest import run_app_level_last_day_prediction, run_back
 router = APIRouter(tags=["web"])
 _BACKTEST_JOBS: Dict[str, Dict[str, Any]] = {}
 _BACKTEST_JOBS_LOCK = threading.Lock()
+
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def _require_api_key(credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme)) -> None:
+    """若配置了 api_key 则校验 Bearer token，否则放行。"""
+    if not settings.api_key:
+        return
+    if credentials is None or credentials.credentials != settings.api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def _repo_root() -> Path:
@@ -397,6 +410,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
       --green: #16a34a;
       --orange: #f59e0b;
       --red: #dc2626;
+      --accent: #2563eb;
       --shadow: 0 10px 30px rgba(16, 24, 40, .08);
     }}
     * {{ box-sizing: border-box; }}
@@ -544,6 +558,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
         <input type="date" id="endDate" />
       </label>
       <button id="resetBtn">重置筛选</button>
+      <a id="exportCsvLink" href="/web/export/predictions/spend" download style="display:inline-flex;align-items:center;height:40px;padding:0 14px;border-radius:10px;background:#fff;color:var(--blue);border:1px solid #bfdbfe;text-decoration:none;font-weight:650;font-size:14px;">导出CSV</a>
     </div>
     <div id="appSelectHint" style="margin-top:10px; display:none; padding:8px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px; font-size:13px;">
       <span id="appSelectText"></span>
@@ -615,10 +630,13 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel recommend-hero" id="businessPanel">
     <div class="section-title">
       <h2>应用推荐模块</h2>
-      <div class="hint" id="mpcSourceHint"></div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <a href="/web/export/recommendations" download class="chip" style="text-decoration:none;font-size:12px;">导出CSV</a>
+        <span class="hint" id="mpcSourceHint"></span>
+      </div>
     </div>
-    <div class=”panel” style=”margin-top:0;”>
-      <div class=”section-title”>
+    <div class="panel" style="margin-top:0;">
+      <div class="section-title">
         <h2>应用月末 ROI 预测表</h2>
       </div>
       <div class="filter-row">
@@ -1836,12 +1854,12 @@ function renderSummary(rows) {{
   document.getElementById('sourceHint').textContent = `数据来源：${{hint || '暂无'}}`;
   if (target === 'roi') {{
     const best = (payload.roi.metrics || [])[0] || {{}};
-    document.getElementById('modelSummary').innerHTML = `当前 ROI_D1 最优结果来自 <b>${{best.model || '模型输出'}}</b>：MAE=${{fmt(num(best.mae),4)}}，RMSE=${{fmt(num(best.rmse),4)}}，MAPE=${{pct(num(best.mape))}}。本页图表展示“下一天 ROI_D1 预测值”和“下一天实际 ROI_D1”，用于判断模型是否贴近真实投放结果。`;
+    document.getElementById('modelSummary').innerHTML = `当前 ROI_D1 最优结果来自 <b>${{best.model || '模型输出'}}</b>：MAE=${{fmt(num(best.mae),4)}}，RMSE=${{fmt(num(best.rmse),4)}}，MAPE=${{pct(num(best.mape))}}。本页图表展示"下一天 ROI_D1 预测值"和"下一天实际 ROI_D1"，用于判断模型是否贴近真实投放结果。`;
   }} else {{
     const r = payload.spend.report || {{}};
     const holidayRows = rows.filter(x => x.calendarLabel.includes('清明') || x.calendarLabel.includes('假期') || x.calendarLabel.includes('节后'));
     const avgImprove = holidayRows.length ? holidayRows.reduce((s,x)=>s+(Number.isFinite(x.improvement)?x.improvement:0),0)/holidayRows.length : NaN;
-    document.getElementById('modelSummary').innerHTML = `Spend 当前使用 <b>目标日历特征 + 假期切换校准</b>：最优模型=${{r.best_model_by_mape || '模型输出'}}，MAPE=${{fmt(num(r.best_mape_pct),2)}}%。表格已增加“旧预测/旧APE/新APE/改善幅度/T+1日历标签”，清明与节后样本平均改善=${{pct(avgImprove)}}。${{payload.spend.cqr_coverage != null ? ` CQR预测区间覆盖率=${{pct(payload.spend.cqr_coverage)}}。` : ''}}`;
+    document.getElementById('modelSummary').innerHTML = `Spend 当前使用 <b>目标日历特征 + 假期切换校准</b>：最优模型=${{r.best_model_by_mape || '模型输出'}}，MAPE=${{fmt(num(r.best_mape_pct),2)}}%。表格已增加"旧预测/旧APE/新APE/改善幅度/T+1日历标签"，清明与节后样本平均改善=${{pct(avgImprove)}}。${{payload.spend.cqr_coverage != null ? ` CQR预测区间覆盖率=${{pct(payload.spend.cqr_coverage)}}。` : ''}}`;
   }}
 }}
 
@@ -1921,7 +1939,7 @@ function render() {{
   if (el) el.addEventListener('change', () => {{ selectedAppId = ''; _chartAppId = ''; document.getElementById('appSelectHint').style.display = 'none'; detailState = {{ appId: '', page: 0, limit: 200, total: 0 }}; render(); }});
 }});
 const targetSelEl = document.getElementById('targetSel');
-if (targetSelEl) targetSelEl.addEventListener('change', () => {{ _chartAppId = ''; detailState = selectedAppId ? {{ appId: selectedAppId, page: 0, limit: 200, total: 0 }} : {{ appId: '', page: 0, limit: 200, total: 0 }}; render(); }});
+if (targetSelEl) targetSelEl.addEventListener('change', () => {{ _chartAppId = ''; detailState = selectedAppId ? {{ appId: selectedAppId, page: 0, limit: 200, total: 0 }} : {{ appId: '', page: 0, limit: 200, total: 0 }}; const link = document.getElementById('exportCsvLink'); if (link) link.href = '/web/export/predictions/' + targetSelEl.value; render(); }});
 const appTableSearchEl = document.getElementById('appTableSearch');
 if (appTableSearchEl) appTableSearchEl.addEventListener('input', renderAppSummary);
 const detailAppSearchEl = document.getElementById('detailAppSearch');
@@ -2530,589 +2548,6 @@ def web_prediction_dashboard():
 def web_recommendation_dashboard():
     return _render_model_dashboard(_load_model_dashboard_payload(), initial_view="recommend")
 
-    out_dir = Path(output_dir)
-    payload = _load_payload(out_dir, task, app_id, advertiser_id, date, limit)
-    job_status = _snapshot_job(job_id.strip()) if job_id.strip() else {}
-    safe_payload_js = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    safe_message = html.escape(message)
-    safe_job_status_js = json.dumps(job_status, ensure_ascii=False).replace("</", "<\\/")
-    safe_job_id_js = json.dumps(job_id.strip(), ensure_ascii=False)
-
-    page = f"""
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>智能预算决策系统 - 阶段成果看板</title>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-  <style>
-    :root {{
-      --bg: #0b1020;
-      --panel: #121a2f;
-      --muted: #8fa2c7;
-      --text: #e8eefc;
-      --accent: #4f8cff;
-      --ok: #1fbf75;
-      --warn: #f5b73b;
-      --danger: #f87171;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif; background: var(--bg); color: var(--text); }}
-    .wrap {{ max-width: 1600px; margin: 0 auto; padding: 16px 18px 28px; }}
-    .head {{ display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }}
-    .title {{ font-size: 24px; font-weight: 700; }}
-    .sub {{ color: var(--muted); font-size: 13px; margin-top: 4px; }}
-    .msg {{ background: rgba(79, 140, 255, 0.18); border: 1px solid rgba(79, 140, 255, 0.5); padding: 8px 10px; border-radius: 8px; }}
-    .panel {{ background: var(--panel); border: 1px solid rgba(143, 162, 199, 0.15); border-radius: 12px; padding: 12px; margin-top: 12px; }}
-    .form-grid {{ display: grid; grid-template-columns: repeat(6, minmax(140px, 1fr)); gap: 8px; }}
-    label {{ font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 5px; }}
-    input, select {{ background: #0d1428; color: var(--text); border: 1px solid #22345f; border-radius: 8px; padding: 8px; }}
-    .btns {{ display: flex; gap: 8px; align-items: end; }}
-    button, .btn {{
-      background: linear-gradient(135deg, #4f8cff, #6f63ff);
-      border: none;
-      color: #fff;
-      border-radius: 8px;
-      padding: 9px 12px;
-      cursor: pointer;
-      font-weight: 600;
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-    }}
-    .cards {{ display: grid; grid-template-columns: repeat(6, minmax(160px, 1fr)); gap: 10px; margin-top: 10px; }}
-    .card {{ background: #0d1428; border: 1px solid #22345f; border-radius: 10px; padding: 10px; }}
-    .card .k {{ color: var(--muted); font-size: 12px; }}
-    .card .v {{ font-size: 20px; font-weight: 700; margin-top: 6px; }}
-    .layout {{ display: grid; grid-template-columns: 1.2fr 1fr; gap: 12px; margin-top: 12px; }}
-    .chart {{ height: 280px; background: #0d1428; border: 1px solid #22345f; border-radius: 10px; }}
-    .table-wrap {{ margin-top: 12px; overflow: auto; max-height: 520px; border: 1px solid #22345f; border-radius: 10px; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-    th, td {{ padding: 7px 8px; border-bottom: 1px solid #22345f; white-space: nowrap; text-align: left; }}
-    th {{ position: sticky; top: 0; background: #121d39; z-index: 2; }}
-    tr:hover td {{ background: rgba(79, 140, 255, 0.08); }}
-    .tabs {{ display: flex; gap: 8px; margin-top: 12px; }}
-    .tab {{ padding: 6px 10px; border-radius: 8px; border: 1px solid #2a3d6b; color: var(--muted); cursor: pointer; }}
-    .tab.active {{ color: #fff; border-color: var(--accent); background: rgba(79, 140, 255, 0.15); }}
-    .stage-grid {{ display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }}
-    .badge {{ display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; }}
-    .b-ok {{ background: rgba(31,191,117,.2); color: #54dd9a; }}
-    .b-warn {{ background: rgba(245,183,59,.2); color: #ffd27f; }}
-    .b-danger {{ background: rgba(248,113,113,.18); color: #ff9a9a; }}
-    .job-status {{
-      margin-top: 10px;
-      background: #0d1428;
-      border: 1px solid #22345f;
-      border-radius: 10px;
-      padding: 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }}
-    .job-row {{ display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }}
-    .progress {{ width: 100%; height: 10px; border-radius: 999px; background: #1a2648; overflow: hidden; }}
-    .progress > i {{ display: block; height: 100%; width: 0%; background: linear-gradient(90deg, #4f8cff, #1fbf75); transition: width .2s ease; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="head">
-      <div>
-        <div class="title">智能预算决策系统 · 阶段成果强交互看板</div>
-        <div class="sub">聚焦：月末ROI达标前提下最大化消耗规模（文档 v2.3）</div>
-      </div>
-      {"<div class='msg'>" + safe_message + "</div>" if safe_message else ""}
-    </div>
-
-    <div class="panel">
-      <form id="runForm" action="/web/run" method="get">
-        <div class="form-grid">
-          <label>CSV路径<input name="input_csv" value="{html.escape(input_csv)}" /></label>
-          <label>输出目录<input name="output_dir" value="{html.escape(output_dir)}" /></label>
-          <label>KPI<input name="kpi" value="{kpi}" /></label>
-          <label>任务
-            <select name="task" id="taskSel">
-              <option value="app_last_day" {"selected" if task == "app_last_day" else ""}>应用层最后一天预测</option>
-              <option value="backtest" {"selected" if task == "backtest" else ""}>全量回放</option>
-            </select>
-          </label>
-          <label>应用ID筛选<input id="fApp" value="{html.escape(app_id)}" /></label>
-          <label>广告主ID筛选<input id="fAdv" value="{html.escape(advertiser_id)}" /></label>
-          <label>日期筛选<input id="fDate" type="date" value="{html.escape(date)}" /></label>
-          <label>展示条数上限<input id="fLimit" type="number" min="20" max="1000" value="{max(20, min(limit, 1000))}" /></label>
-          <div class="btns">
-            <button id="runBtn" type="submit">运行离线回放</button>
-            <a class="btn" id="refreshBtn" href="#">刷新筛选</a>
-          </div>
-        </div>
-      </form>
-      <div id="jobStatus" class="job-status" style="display:none;">
-        <div class="job-row">
-          <span id="jobText">任务状态</span>
-          <span id="jobMeta"></span>
-        </div>
-        <div class="progress"><i id="jobBar"></i></div>
-      </div>
-    </div>
-
-    <div class="tabs">
-      <div class="tab active" data-pane="predict">预测模块</div>
-      <div class="tab" data-pane="solver">求解模块</div>
-      <div class="tab" data-pane="risk">风控模块</div>
-      <div class="tab" data-pane="rule">规则模块</div>
-      <div class="tab" data-pane="stage">阶段成果对比</div>
-      <div class="tab" data-pane="detail">明细数据</div>
-    </div>
-
-    <div class="pane panel" id="pane-predict">
-      <div class="sub">预测模块：月末ROI与锚点校准表现</div>
-      <div class="cards" id="summaryCards"></div>
-      <div class="layout">
-        <div id="modeChart" class="chart"></div>
-        <div id="roiChart" class="chart"></div>
-      </div>
-    </div>
-
-    <div class="pane panel" id="pane-solver" style="display:none;">
-      <div class="sub">求解模块：建议预算与实际消耗对照</div>
-      <div id="solverChart" class="chart" style="height:320px;"></div>
-    </div>
-
-    <div class="pane panel" id="pane-risk" style="display:none;">
-      <div class="sub">风控模块：告警强度与分布</div>
-      <div id="riskChart" class="chart" style="height:320px;"></div>
-    </div>
-
-    <div class="pane panel" id="pane-rule" style="display:none;">
-      <div class="sub">规则模块：ROI偏差主因统计</div>
-      <div id="attrChart" class="chart" style="height:300px;"></div>
-    </div>
-
-    <div class="pane panel" id="pane-stage" style="display:none;">
-      <div class="stage-grid" id="stageGrid"></div>
-      <div id="stageCompareChart" class="chart" style="margin-top:12px;"></div>
-    </div>
-
-    <div class="pane panel" id="pane-detail" style="display:none;">
-      <div class="table-wrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div>
-    </div>
-  </div>
-
-  <script>
-    let payload = {safe_payload_js};
-    const initialJobStatus = {safe_job_status_js};
-    let currentJobId = {safe_job_id_js};
-    let pollTimer = null;
-    let task = payload.task;
-    let rowsRaw = payload.rows || [];
-    let attributionRowsRaw = payload.attribution_rows || [];
-    let summary = payload.summary || {{}};
-    let modeDist = payload.mode_distribution || {{}};
-
-    const toNum = (v) => Number(v || 0);
-    const fmt = (v, d=2) => isFinite(Number(v)) ? Number(v).toFixed(d) : '-';
-    const fmtPct = (v) => isFinite(Number(v)) ? (Number(v) * 100).toFixed(2) + '%' : '-';
-
-    function renderJobStatus(status) {{
-      const box = document.getElementById('jobStatus');
-      const text = document.getElementById('jobText');
-      const meta = document.getElementById('jobMeta');
-      const bar = document.getElementById('jobBar');
-      if (!status || (!status.job_id && !status.message)) {{
-        box.style.display = 'none';
-        return;
-      }}
-      box.style.display = 'flex';
-      const state = status.status || 'queued';
-      const stateMap = {{
-        queued: '已入队',
-        running: '执行中',
-        completed: '已完成',
-        failed: '失败',
-        expired: '状态失效'
-      }};
-      text.textContent = `任务状态：${{stateMap[state] || state}} - ${{status.message || ''}}`;
-      const elapsed = Number(status.elapsed_sec || 0);
-      const err = status.error ? ` | error: ${{status.error}}` : '';
-      meta.textContent = `job_id=${{status.job_id}} | 用时=${{elapsed.toFixed(2)}}s${{err}}`;
-      bar.style.width = `${{Math.max(0, Math.min(100, Number(status.progress_pct || 0)))}}%`;
-      if (state === 'failed') {{
-        box.style.borderColor = 'rgba(248,113,113,.6)';
-      }} else if (state === 'completed') {{
-        box.style.borderColor = 'rgba(31,191,117,.6)';
-      }} else {{
-        box.style.borderColor = '#22345f';
-      }}
-    }}
-
-    async function pollJobStatus() {{
-      if (!currentJobId) return;
-      try {{
-        const r = await fetch(`/web/run/status?job_id=${{encodeURIComponent(currentJobId)}}`);
-        if (!r.ok) return;
-        const status = await r.json();
-        renderJobStatus(status);
-        if (status.status === 'completed' || status.status === 'failed' || status.status === 'expired') {{
-          if (pollTimer) clearInterval(pollTimer);
-          if (status.status === 'completed') {{
-            await applyServerFilter();
-          }}
-        }}
-      }} catch (_e) {{
-      }}
-    }}
-
-    function syncPayload(newPayload) {{
-      payload = newPayload || {{}};
-      task = payload.task || document.getElementById('taskSel').value || 'app_last_day';
-      rowsRaw = payload.rows || [];
-      attributionRowsRaw = payload.attribution_rows || [];
-      summary = payload.summary || {{}};
-      modeDist = payload.mode_distribution || {{}};
-    }}
-
-    async function applyServerFilter() {{
-      const outputDir = document.querySelector('input[name=\"output_dir\"]').value.trim();
-      const f = getFilters();
-      const selTask = document.getElementById('taskSel').value;
-      const params = new URLSearchParams();
-      params.set('output_dir', outputDir || 'outputs');
-      params.set('task', selTask);
-      params.set('app_id', f.app);
-      params.set('advertiser_id', f.adv);
-      params.set('date', f.date);
-      params.set('limit', String(f.limit));
-      const r = await fetch(`/web/data?${{params.toString()}}`);
-      if (!r.ok) return;
-      const data = await r.json();
-      syncPayload(data);
-      refreshAll();
-    }}
-
-    function getFilters() {{
-      return {{
-        app: document.getElementById('fApp').value.trim(),
-        adv: document.getElementById('fAdv').value.trim(),
-        date: document.getElementById('fDate').value.trim(),
-        limit: Number(document.getElementById('fLimit').value || 300),
-      }};
-    }}
-
-    function filterRows(rows) {{
-      const f = getFilters();
-      let out = rows.slice();
-      if (f.app) out = out.filter(r => (r.app_id || '') === f.app);
-      if (f.adv && task !== 'app_last_day') out = out.filter(r => (r.advertiser_id || '') === f.adv);
-      if (f.date) out = out.filter(r => (r.date || r.target_day || '') === f.date);
-      return out.slice(0, Math.max(20, Math.min(1000, f.limit)));
-    }}
-
-    function renderCards(rows) {{
-      const cards = document.getElementById('summaryCards');
-      const modeGuard = rows.filter(r => (r.mode || '') === 'GUARD').length;
-      const modeScale = rows.filter(r => (r.mode || '') === 'SCALE').length;
-      const avgPredROI = rows.length
-        ? rows.reduce((s, r) => s + toNum(r.month_end_roi_prediction || r.predicted_month_end_roi), 0) / rows.length
-        : toNum(summary.avg_predicted_month_end_roi || 0);
-      const avgActualROI = rows.length
-        ? rows.reduce((s, r) => s + toNum(r.actual_roi || 0), 0) / rows.length
-        : toNum(summary.avg_actual_roi || 0);
-      const avgPlanSpend = rows.length
-        ? rows.reduce((s, r) => s + toNum(r.planned_spend || r.planned_total_budget), 0) / rows.length
-        : 0;
-      const avgAnchorRaw = rows.length
-        ? rows.reduce((s, r) => s + toNum(r.d1_anchor_raw_mean), 0) / rows.length
-        : toNum(summary.avg_d1_anchor_raw_mean || 0);
-      const avgAnchorCal = rows.length
-        ? rows.reduce((s, r) => s + toNum(r.d1_anchor_calibrated_mean), 0) / rows.length
-        : toNum(summary.avg_d1_anchor_calibrated_mean || 0);
-      const avgRoiA = rows.length
-        ? rows.reduce((s, r) => s + toNum(r.month_end_roi_prediction_a), 0) / rows.length
-        : toNum((summary.ab_compare || {{}}).A_raw_anchor_avg_month_end_roi || 0);
-      const avgRoiB = rows.length
-        ? rows.reduce((s, r) => s + toNum(r.month_end_roi_prediction_b || r.month_end_roi_prediction), 0) / rows.length
-        : toNum((summary.ab_compare || {{}}).B_calibrated_anchor_avg_month_end_roi || summary.avg_predicted_month_end_roi || 0);
-
-      const data = [
-        ['样本行数', rows.length],
-        ['平均预测月末ROI', fmt(avgPredROI, 4)],
-        ['A组ROI(原始锚点)', fmt(avgRoiA, 4)],
-        ['B组ROI(校准锚点)', fmt(avgRoiB, 4)],
-        ['B-A ROI差值', fmt(avgRoiB - avgRoiA, 4)],
-        ['平均实际ROI', fmt(avgActualROI, 4)],
-        ['平均建议日预算', fmt(avgPlanSpend, 2)],
-        ['D1锚点(原始均值)', fmt(avgAnchorRaw, 4)],
-        ['D1锚点(校准均值)', fmt(avgAnchorCal, 4)],
-        ['锚点校准差值', fmt(avgAnchorRaw - avgAnchorCal, 4)],
-        ['模式分布', `GUARD ${{modeGuard}} / SCALE ${{modeScale}}`],
-        ['告警总数', rows.reduce((s, r) => s + toNum(r.alert_count), 0)],
-      ];
-      cards.innerHTML = data.map(([k, v]) => `<div class="card"><div class="k">${{k}}</div><div class="v">${{v}}</div></div>`).join('');
-    }}
-
-    function renderModeChart(rows) {{
-      const chart = echarts.init(document.getElementById('modeChart'));
-      const guard = rows.filter(r => (r.mode || '') === 'GUARD').length;
-      const scale = rows.filter(r => (r.mode || '') === 'SCALE').length;
-      chart.setOption({{
-        title: {{ text: '模式分布', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
-        tooltip: {{ trigger: 'item' }},
-        series: [{{
-          type: 'pie',
-          radius: ['45%', '72%'],
-          data: [{{ name: 'GUARD', value: guard }}, {{ name: 'SCALE', value: scale }}],
-          label: {{ color: '#e8eefc' }}
-        }}],
-        backgroundColor: 'transparent'
-      }});
-    }}
-
-    function renderROIChart(rows) {{
-      const chart = echarts.init(document.getElementById('roiChart'));
-      const x = rows.map((r, i) => r.date || r.target_day || String(i + 1));
-      const pred = rows.map(r => toNum(r.month_end_roi_prediction || r.predicted_month_end_roi));
-      const predA = rows.map(r => toNum(r.month_end_roi_prediction_a));
-      const predB = rows.map(r => toNum(r.month_end_roi_prediction_b || r.month_end_roi_prediction || r.predicted_month_end_roi));
-      const actual = rows.map(r => toNum(r.actual_roi || 0));
-      chart.setOption({{
-        title: {{ text: 'ROI对比（筛选样本）', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
-        tooltip: {{ trigger: 'axis' }},
-        legend: {{ bottom: 8, textStyle: {{ color: '#c9d7f5' }} }},
-        xAxis: {{ type: 'category', data: x, axisLabel: {{ color: '#a9bddf' }} }},
-        yAxis: {{ type: 'value', axisLabel: {{ color: '#a9bddf' }} }},
-        series: [
-          {{ name: '预测月末ROI', type: 'line', smooth: true, data: pred }},
-          {{ name: 'A组ROI(原始锚点)', type: 'line', smooth: true, data: predA }},
-          {{ name: 'B组ROI(校准锚点)', type: 'line', smooth: true, data: predB }},
-          {{ name: '实际ROI', type: 'line', smooth: true, data: actual }},
-        ]
-      }});
-    }}
-
-    function renderAttributionChart(rows) {{
-      const chart = echarts.init(document.getElementById('attrChart'));
-      const count = {{ SPEND: 0, D1_ANCHOR: 0, CURVE: 0, BALANCED: 0 }};
-      rows.forEach(r => {{
-        const k = String(r.roi_dominant_factor || '').toUpperCase();
-        if (count[k] != null) count[k] += 1;
-      }});
-      const data = Object.entries(count).map(([k, v]) => ({{ name: k, value: v }}));
-      chart.setOption({{
-        title: {{ text: 'ROI偏差主因分布', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
-        tooltip: {{ trigger: 'item' }},
-        xAxis: {{ type: 'category', data: data.map(d => d.name), axisLabel: {{ color: '#a9bddf' }} }},
-        yAxis: {{ type: 'value', axisLabel: {{ color: '#a9bddf' }} }},
-        series: [{{ type: 'bar', data: data.map(d => d.value), itemStyle: {{ color: '#4f8cff' }} }}]
-      }});
-    }}
-
-    function renderSolverChart(rows) {{
-      const chart = echarts.init(document.getElementById('solverChart'));
-      const x = rows.map((r, i) => r.app_id || r.advertiser_id || String(i + 1));
-      const planned = rows.map(r => toNum(r.planned_total_budget || r.planned_spend));
-      const actual = rows.map(r => toNum(r.actual_spend_last_day || r.actual_spend));
-      chart.setOption({{
-        title: {{ text: '建议预算 vs 实际消耗', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
-        tooltip: {{ trigger: 'axis' }},
-        legend: {{ bottom: 8, textStyle: {{ color: '#c9d7f5' }} }},
-        xAxis: {{ type: 'category', data: x, axisLabel: {{ color: '#a9bddf', interval: 0, rotate: 30 }} }},
-        yAxis: {{ type: 'value', axisLabel: {{ color: '#a9bddf' }} }},
-        series: [
-          {{ name: '建议预算', type: 'bar', data: planned }},
-          {{ name: '实际消耗', type: 'bar', data: actual }},
-        ],
-      }});
-    }}
-
-    function renderRiskChart(rows) {{
-      const chart = echarts.init(document.getElementById('riskChart'));
-      const x = rows.map((r, i) => r.app_id || r.advertiser_id || String(i + 1));
-      const alerts = rows.map(r => toNum(r.alert_count));
-      chart.setOption({{
-        title: {{ text: '告警数量分布', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
-        tooltip: {{ trigger: 'axis' }},
-        xAxis: {{ type: 'category', data: x, axisLabel: {{ color: '#a9bddf', interval: 0, rotate: 30 }} }},
-        yAxis: {{ type: 'value', axisLabel: {{ color: '#a9bddf' }} }},
-        series: [{{ type: 'line', smooth: true, data: alerts, itemStyle: {{ color: '#f5b73b' }} }}],
-      }});
-    }}
-
-    function renderStagePanel() {{
-      const stage = payload.stage_compare || {{}};
-      const nodes = [
-        ['启发式基线', stage.heuristic || {{}}, 'b-warn'],
-        ['联合求解初版', stage.joint_v1 || {{}}, 'b-danger'],
-        ['联合求解调优版', stage.joint_tuned || {{}}, 'b-ok'],
-      ];
-      const grid = document.getElementById('stageGrid');
-      grid.innerHTML = nodes.map(([name, s, badge]) => {{
-        if (!s || Object.keys(s).length === 0) return `<div class="card"><div class="k">${{name}}</div><div class="v">暂无数据</div></div>`;
-        return `
-          <div class="card">
-            <div class="k">${{name}} <span class="badge ${{badge}}">阶段</span></div>
-            <div class="sub">avg_pred_roi: ${{fmt(s.avg_predicted_month_end_roi || 0, 4)}}</div>
-            <div class="sub">avg_plan-actual_spend: ${{fmt(s.avg_planned_minus_actual_spend || 0, 2)}}</div>
-            <div class="sub">roi_warning_count: ${{s.roi_warning_count ?? '-'}}</div>
-          </div>
-        `;
-      }}).join('');
-
-      const chart = echarts.init(document.getElementById('stageCompareChart'));
-      const labels = ['启发式', '联合v1', '联合调优'];
-      const roi = [
-        toNum(stage.heuristic?.avg_predicted_month_end_roi),
-        toNum(stage.joint_v1?.avg_predicted_month_end_roi),
-        toNum(stage.joint_tuned?.avg_predicted_month_end_roi),
-      ];
-      const spendGap = [
-        toNum(stage.heuristic?.avg_planned_minus_actual_spend),
-        toNum(stage.joint_v1?.avg_planned_minus_actual_spend),
-        toNum(stage.joint_tuned?.avg_planned_minus_actual_spend),
-      ];
-      chart.setOption({{
-        title: {{ text: '阶段成果对比（25天子集）', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
-        tooltip: {{ trigger: 'axis' }},
-        legend: {{ bottom: 8, textStyle: {{ color: '#c9d7f5' }} }},
-        xAxis: {{ type: 'category', data: labels, axisLabel: {{ color: '#a9bddf' }} }},
-        yAxis: [
-          {{ type: 'value', name: '预测月末ROI', axisLabel: {{ color: '#a9bddf' }} }},
-          {{ type: 'value', name: 'planned-actual', axisLabel: {{ color: '#a9bddf' }} }},
-        ],
-        series: [
-          {{ name: 'avg_pred_month_roi', type: 'line', data: roi, smooth: true }},
-          {{ name: 'avg_planned_minus_actual_spend', type: 'bar', yAxisIndex: 1, data: spendGap }},
-        ],
-      }});
-    }}
-
-    function renderTable(rows) {{
-      const appHeaders = [
-        'target_day','app_id','mode','canonical_month_end_roi_source','actual_spend_last_day','actual_revenue_last_day',
-        'planned_total_budget','planned_daily_spend_stable_anchor','planned_daily_spend_pred_only','planned_daily_spend_fused',
-        'month_end_roi_prediction','month_end_roi_stable_anchor','month_end_roi_pred_only','month_end_roi_fused',
-        'month_end_spend_prediction','alert_count','roi_dominant_factor',
-        'month_end_roi_prediction_a','month_end_roi_prediction_b','ab_roi_delta_b_minus_a',
-        'd1_anchor_raw_mean','d1_anchor_calibrated_mean','top_actions'
-      ];
-      const backtestHeaders = [
-        'date','advertiser_id','mode','products','actual_spend','actual_revenue','actual_roi','planned_spend','predicted_month_end_roi','alert_count'
-      ];
-      const headers = task === 'app_last_day' ? appHeaders : backtestHeaders;
-      document.getElementById('thead').innerHTML = '<tr>' + headers.map(h => `<th>${{h}}</th>`).join('') + '</tr>';
-      document.getElementById('tbody').innerHTML = rows.map(r => '<tr>' + headers.map(h => `<td>${{r[h] ?? ''}}</td>`).join('') + '</tr>').join('');
-    }}
-
-    function refreshAll() {{
-      const rows = filterRows(rowsRaw);
-      const attrs = filterRows(attributionRowsRaw);
-      renderCards(rows);
-      renderModeChart(rows);
-      renderROIChart(rows);
-      renderSolverChart(rows);
-      renderRiskChart(rows);
-      renderAttributionChart(attrs);
-      renderTable(rows);
-      renderStagePanel();
-    }}
-
-    document.getElementById('refreshBtn').addEventListener('click', (e) => {{
-      e.preventDefault();
-      applyServerFilter();
-    }});
-    document.getElementById('taskSel').addEventListener('change', () => {{
-      applyServerFilter();
-    }});
-
-    const runBtn = document.getElementById('runBtn');
-    const runForm = document.getElementById('runForm');
-    runForm.addEventListener('submit', async (e) => {{
-      e.preventDefault();
-      runBtn.disabled = true;
-      runBtn.textContent = '任务提交中...';
-      try {{
-        const fd = new FormData(runForm);
-        const params = new URLSearchParams();
-        for (const [k, v] of fd.entries()) {{
-          params.set(k, String(v));
-        }}
-        const r = await fetch(`/web/run/start?${{params.toString()}}`);
-        const data = await r.json();
-        if (!r.ok || !data.ok) {{
-          renderJobStatus({{
-            job_id: '',
-            status: 'failed',
-            message: data.error || '任务提交失败',
-            elapsed_sec: 0,
-            progress_pct: 100,
-            error: data.error || '',
-          }});
-          runBtn.disabled = false;
-          runBtn.textContent = '运行离线回放';
-          return;
-        }}
-        currentJobId = data.job_id;
-        renderJobStatus({{
-          job_id: data.job_id,
-          status: 'queued',
-          message: data.message || '任务已提交',
-          elapsed_sec: 0,
-          progress_pct: 5,
-          error: '',
-        }});
-        if (pollTimer) clearInterval(pollTimer);
-        pollTimer = setInterval(pollJobStatus, 2000);
-        await pollJobStatus();
-      }} catch (err) {{
-        renderJobStatus({{
-          job_id: '',
-          status: 'failed',
-          message: '请求失败，请检查服务是否可用',
-          elapsed_sec: 0,
-          progress_pct: 100,
-          error: String(err || ''),
-        }});
-      }} finally {{
-        runBtn.disabled = false;
-        runBtn.textContent = '运行离线回放';
-      }}
-    }});
-
-    document.querySelectorAll('.tab').forEach(el => {{
-      el.addEventListener('click', () => {{
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        el.classList.add('active');
-        const pane = el.getAttribute('data-pane');
-        document.querySelectorAll('.pane').forEach(p => p.style.display = 'none');
-        document.getElementById(`pane-${{pane}}`).style.display = 'block';
-      }});
-    }});
-
-    const dateInput = document.getElementById('fDate');
-    if (dateInput) {{
-      const openPicker = () => {{
-        if (typeof dateInput.showPicker === 'function') {{
-          dateInput.showPicker();
-        }}
-      }};
-      dateInput.addEventListener('click', openPicker);
-      dateInput.addEventListener('focus', openPicker);
-    }}
-
-    refreshAll();
-    renderJobStatus(initialJobStatus);
-    if (initialJobStatus && initialJobStatus.job_id) {{
-      currentJobId = initialJobStatus.job_id;
-    }}
-    if (currentJobId) {{
-      pollTimer = setInterval(pollJobStatus, 2000);
-      pollJobStatus();
-    }}
-  </script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=page)
 
 
 @router.get("/web/data")
@@ -3134,6 +2569,7 @@ def web_run(
     output_dir: str = "outputs",
     kpi: float = 1.05,
     task: str = "app_last_day",
+    _require_api_key: None = Depends(_require_api_key),
 ):
     csv_path = Path(input_csv)
     if not csv_path.exists():
@@ -3168,6 +2604,7 @@ def web_run_start(
     output_dir: str = "outputs",
     kpi: float = 1.05,
     task: str = "app_last_day",
+    _require_api_key: None = Depends(_require_api_key),
 ):
     csv_path = Path(input_csv)
     if not csv_path.exists():
@@ -3449,7 +2886,7 @@ def web_daily_revenue_predictions(
 
 
 @router.post("/web/revenue/daily-predict")
-async def web_revenue_daily_predict(request: Request):
+async def web_revenue_daily_predict(request: Request, _require_api_key: None = Depends(_require_api_key)):
     """在线预测：给定目标日期 + per-app spend/D1，返回当日收入预测"""
     from scripts.predict_daily_revenue import (
         load_app_daily,
@@ -3489,7 +2926,7 @@ async def web_revenue_daily_predict(request: Request):
 
 
 @router.post("/web/retrain/trigger")
-def web_trigger_retrain():
+def web_trigger_retrain(_require_api_key: None = Depends(_require_api_key)):
     """手动触发每日重训（异步执行，不阻塞响应）"""
     from scripts.daily_retrain import main as retrain_main
 
@@ -3504,6 +2941,47 @@ def web_trigger_retrain():
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
     return JSONResponse({"status": "started"})
+
+
+# ── CSV 导出 ──────────────────────────────────────────────────
+
+from fastapi.responses import FileResponse
+
+
+@router.get("/web/export/recommendations")
+def export_recommendations():
+    """导出应用推荐表为 CSV"""
+    path = _repo_root() / "outputs" / "app_level_last_day_suggestions.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="推荐数据不存在，请先生成。")
+    return FileResponse(path, media_type="text/csv", filename="recommendations.csv")
+
+
+@router.get("/web/export/predictions/{target}")
+def export_predictions(target: str):
+    """导出预测明细 CSV（target=spend|roi）"""
+    if target not in ("spend", "roi"):
+        raise HTTPException(status_code=400, detail="target 须为 spend 或 roi")
+    root = _repo_root() / "outputs"
+    if target == "roi":
+        roi_dir = _pick_existing([
+            root / "model_parallel_roi_d1_v9_unified",
+            root / "model_parallel_roi_d1_exp035",
+            root / "model_parallel_roi_d1_v8_001",
+            root / "model_parallel_roi_d1_v7_001",
+        ])
+        path = resolve_roi_predictions_csv(roi_dir) if roi_dir else None
+    else:
+        spend_dir = _pick_existing([
+            root / "model_parallel_spend_t1_v12_unified",
+            root / "model_parallel_spend_t1",
+            root / "model_parallel_spend_t1_exp035",
+            root / "model_parallel_spend_t1_v11_001",
+        ])
+        path = resolve_spend_predictions_csv(spend_dir) if spend_dir else None
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail=f"无 {target} 预测文件，请先训练模型。")
+    return FileResponse(path, media_type="text/csv", filename=f"predictions_{target}.csv")
 
 
 @router.get("/web/monitor", response_class=HTMLResponse)
