@@ -3185,8 +3185,8 @@ def _resolve_prediction_path(target: str) -> Path | None:
     if target == "roi":
         roi_dir = _pick_existing(
             [
-                root / "model_parallel_roi_d1_exp035",
                 root / "model_parallel_roi_d1_v9_unified",
+                root / "model_parallel_roi_d1_exp035",
                 root / "model_parallel_roi_d1_v8_001",
                 root / "model_parallel_roi_d1_v7_001",
             ]
