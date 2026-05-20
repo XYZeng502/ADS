@@ -3505,6 +3505,8 @@ async def web_trigger_retrain():
     def _worker():
         try:
             retrain_main()
+            from app.services.health_history import HealthHistory
+            HealthHistory.snapshot()
         except Exception:
             pass
 
