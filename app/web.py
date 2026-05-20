@@ -1184,7 +1184,6 @@ function renderAppMonthRoiTable() {{
       setActiveView('predict');
       document.getElementById('appSelectHint').style.display = '';
       document.getElementById('appSelectText').textContent = '已选中应用 ' + appId + ' — 图表和明细均仅显示该应用数据';
-      render();
     }});
   }});
 }}
@@ -1725,7 +1724,6 @@ function showAppPopup(appId, rowData, evt) {{
     setActiveView('predict');
     document.getElementById('appSelectHint').style.display = '';
     document.getElementById('appSelectText').textContent = '已选中应用 ' + appId + ' — 图表和明细均仅显示该应用数据';
-    render();
   }});
   // 解析 Python 风格字符串 → 提取基本信息
   const parsePythonList = (s) => {{
@@ -1764,8 +1762,8 @@ function showAppPopup(appId, rowData, evt) {{
   // init or re-use charts
   if (!_popupCharts.roi) _popupCharts.roi = echarts.init(document.getElementById('popupRoiChart'));
   if (!_popupCharts.spend) _popupCharts.spend = echarts.init(document.getElementById('popupSpendChart'));
-  _popupCharts.roi.setOption({{ title: {{ text: 'T+1 ROI_D1', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 20, top: 32, bottom: 34 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:10}} }}, series: [] }});
-  _popupCharts.spend.setOption({{ title: {{ text: 'T+1 Spend', left: 8, top: 4, textStyle: {{fontSize:12}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 52, right: 20, top: 32, bottom: 34 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:10, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:10}} }}, series: [] }});
+  _popupCharts.roi.setOption({{ title: {{ text: 'T+1 ROI_D1', left: 8, top: 2, textStyle: {{fontSize:11}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 56, right: 16, top: 28, bottom: 44 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:9, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:9}} }}, series: [] }});
+  _popupCharts.spend.setOption({{ title: {{ text: 'T+1 Spend', left: 8, top: 2, textStyle: {{fontSize:11}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 56, right: 16, top: 28, bottom: 44 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:9, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:9}} }}, series: [] }});
 
   _popupCharts.roi.showLoading();
   _popupCharts.spend.showLoading();
