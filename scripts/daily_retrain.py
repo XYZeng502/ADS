@@ -189,14 +189,7 @@ def main():
     try:
         from app.services.health_history import HealthHistory
         snap = HealthHistory.snapshot()
-        print(f"  健康快照已保存: drift_spend={snap.drift_spend_mape:.2%} drift_roi={snap.drift_roi_mape:.2%}")
-    except Exception as e:
-        print(f"  [WARN] 健康快照失败: {e}")
-
-    try:
-        from app.services.health_history import HealthHistory
-        snap = HealthHistory.snapshot()
-        print(f"  健康快照已记录: drift={snap.drift_overall}, data={snap.data_status}")
+        print(f"  健康快照已保存: drift={snap.drift_overall} spend_mape={snap.drift_spend_mape:.2%} roi_mape={snap.drift_roi_mape:.2%} data={snap.data_status}")
     except Exception as e:
         print(f"  [WARN] 健康快照失败: {e}")
 
