@@ -246,9 +246,9 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     )
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1",
             root / "model_parallel_spend_t1_exp035",
-            root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1_v11_001",
         ]
     )
@@ -1358,8 +1358,8 @@ function renderBusinessSnapshot() {{
   charts.budget.setOption({{
     color: ['#2563eb', '#16a34a', '#f59e0b', '#7c3aed'],
     tooltip: {{ trigger:'item', formatter: p => `${{p.name}}<br/>应用数：${{p.value}} (${{fmt(p.percent,1)}}%)` }},
-    legend: {{ top: 8, right: 16 }},
-    title: {{ text:'推荐动作分布', subtext:'按应用数汇总', left:16, top:12, textStyle:{{fontSize:16}} }},
+    legend: {{ bottom: 8 }},
+    title: {{ text:'推荐动作分布', subtext:'按应用数汇总', left:16, top:8, textStyle:{{fontSize:16}} }},
     series: [{{ type:'pie', radius:['42%','68%'], center:['50%','54%'], data: actionData }}]
   }});
 
@@ -1367,8 +1367,8 @@ function renderBusinessSnapshot() {{
   charts.product.setOption({{
     color: ['#2563eb', '#16a34a'],
     tooltip: {{ trigger:'axis' }},
-    legend: {{ top: 8, right: 16 }},
-    grid: {{ left: 72, right: 24, top: 56, bottom: 74 }},
+    legend: {{ bottom: 8 }},
+    grid: {{ left: 72, right: 24, top: 46, bottom: 64 }},
     xAxis: {{ type:'category', axisLabel:{{rotate:25}}, data:topRows.map(r=>r.app) }},
     yAxis: [
       {{ type:'value' }},
@@ -1385,7 +1385,8 @@ function renderBusinessSnapshot() {{
   charts.layer.setOption({{
     color: ['#2563eb'],
     tooltip: {{ trigger:'axis' }},
-    grid: {{ left: 72, right: 24, top: 46, bottom: 54 }},
+    legend: {{ bottom: 8 }},
+    grid: {{ left: 72, right: 24, top: 36, bottom: 54 }},
     xAxis: {{ type:'category', data:[...factorCounts.keys()] }},
     yAxis: {{ type:'value' }},
     series: [{{ name:'应用数', type:'bar', data:[...factorCounts.values()] }}]
@@ -1617,8 +1618,8 @@ function renderChartSeries(data, unit, target) {{
     }});
     series.push(predSeries);
   }}
+  charts.line.clear();
   charts.line.setOption({{
-    notMerge: true,
     color: ['#16a34a', '#2563eb', '#f59e0b', '#8ab4f8'],
     tooltip: {{
       trigger: 'axis',
@@ -1648,8 +1649,8 @@ function renderChartSeries(data, unit, target) {{
     dataZoom: [{{type:'inside'}}, {{type:'slider', height: 18, bottom: 12}}],
     series
   }});
+  charts.scatter.clear();
   charts.scatter.setOption({{
-    notMerge: true,
     color: ['#2563eb'],
     tooltip: {{ formatter: p => `实际：${{fmt(p.value[0], target==='roi'?4:2)}}<br/>预测：${{fmt(p.value[1], target==='roi'?4:2)}}` }},
     grid: {{ left: 62, right: 24, top: 36, bottom: 54 }},
@@ -1657,8 +1658,8 @@ function renderChartSeries(data, unit, target) {{
     yAxis: {{ type:'value' }},
     series: [{{ name:'每日预测校准', type:'scatter', symbolSize: 9, data: data.map(x => [x.actual, x.pred]) }}]
   }});
+  charts.error.clear();
   charts.error.setOption({{
-    notMerge: true,
     color: ['#dc2626'],
     tooltip: {{ trigger:'axis', valueFormatter: v => fmt(v, 2) + '%' }},
     grid: {{ left: 64, right: 28, top: 36, bottom: 55 }},
@@ -3195,9 +3196,9 @@ def _resolve_prediction_path(target: str) -> Path | None:
         return resolve_roi_predictions_csv(roi_dir)
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1",
             root / "model_parallel_spend_t1_exp035",
-            root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1_v11_001",
         ]
     )
