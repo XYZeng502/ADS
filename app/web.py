@@ -3433,7 +3433,7 @@ def web_prediction_app_chart(target: str, app_id: str):
 
 
 @router.get("/web/predictions/daily_revenue")
-async def web_daily_revenue_predictions(
+def web_daily_revenue_predictions(
     request: Request,
     app_id: str = Query(""),
 ):
@@ -3489,7 +3489,7 @@ async def web_revenue_daily_predict(request: Request):
 
 
 @router.post("/web/retrain/trigger")
-async def web_trigger_retrain():
+def web_trigger_retrain():
     """手动触发每日重训（异步执行，不阻塞响应）"""
     from scripts.daily_retrain import main as retrain_main
 
@@ -3516,62 +3516,46 @@ def web_monitor(request: Request):
 def monitor_alerts(days: int = 7):
     """监控告警：从现有数据源收集告警信息"""
     from datetime import date, timedelta
-    from app.services.risk import RiskService
     from app.services.retrain_status import load_retrain_status
-    from app.prediction_artifacts import resolve_spend_predictions_csv, resolve_roi_predictions_csv
 
     recent = []
     by_level = {"CRITICAL": 0, "WARN": 0}
     by_category: dict[str, int] = {}
 
     try:
-        # 读取最新预测数据
-        root = _repo_root() / "outputs"
-        spend_dir = _pick_existing([
-            root / "model_parallel_spend_t1_v12_unified",
-            root / "model_parallel_spend_t1",
-        ])
-        roi_dir = _pick_existing([
-            root / "model_parallel_roi_d1_v9_unified",
-            root / "model_parallel_roi_d1_exp035",
-        ])
+        spend_csv = _resolve_prediction_path("spend")
+        if spend_csv and spend_csv.exists():
+            import pandas as pd
+            df = pd.read_csv(spend_csv, encoding="utf-8-sig")
+            df = df[df["日期"].astype(str).between(
+                str(date.today() - timedelta(days=days)),
+                str(date.today())
+            )]
+            latest = df.sort_values("日期").groupby("应用ID").tail(3)
+            for app_id, grp in latest.groupby("应用ID"):
+                vals = grp["y_true"].values
+                if len(vals) >= 2 and vals[-2] > 30:
+                    ratio = vals[-1] / (vals[-2] + 1e-8)
+                    if ratio < 0.5:
+                        recent.append({
+                            "date": str(grp["日期"].iloc[-1])[:10],
+                            "level": "CRITICAL", "category": "SPEND_DROP",
+                            "app_id": str(app_id),
+                            "message": f"消耗从 {vals[-2]:.0f} 骤降至 {vals[-1]:.0f} ({ratio:.0%})",
+                        })
+                    elif ratio > 2.5:
+                        recent.append({
+                            "date": str(grp["日期"].iloc[-1])[:10],
+                            "level": "WARN", "category": "SPEND_SPIKE",
+                            "app_id": str(app_id),
+                            "message": f"消耗从 {vals[-2]:.0f} 骤升至 {vals[-1]:.0f} ({ratio:.0%})",
+                        })
 
-        if spend_dir:
-            spend_csv = resolve_spend_predictions_csv(spend_dir)
-            if spend_csv and spend_csv.exists():
-                import pandas as pd
-                df = pd.read_csv(spend_csv, encoding="utf-8-sig")
-                df = df[df["日期"].astype(str).between(
-                    str(date.today() - timedelta(days=days)),
-                    str(date.today())
-                )]
-                # 检测消耗骤降/骤升
-                latest = df.sort_values("日期").groupby("应用ID").tail(3)
-                for app_id, grp in latest.groupby("应用ID"):
-                    vals = grp["y_true"].values
-                    if len(vals) >= 2 and vals[-2] > 30:
-                        ratio = vals[-1] / (vals[-2] + 1e-8)
-                        if ratio < 0.5:
-                            recent.append({
-                                "date": str(grp["日期"].iloc[-1])[:10],
-                                "level": "CRITICAL", "category": "SPEND_DROP",
-                                "app_id": str(app_id),
-                                "message": f"消耗从 {vals[-2]:.0f} 骤降至 {vals[-1]:.0f} ({ratio:.0%})",
-                            })
-                        elif ratio > 2.5:
-                            recent.append({
-                                "date": str(grp["日期"].iloc[-1])[:10],
-                                "level": "WARN", "category": "SPEND_SPIKE",
-                                "app_id": str(app_id),
-                                "message": f"消耗从 {vals[-2]:.0f} 骤升至 {vals[-1]:.0f} ({ratio:.0%})",
-                            })
-
-        # 训练状态
         status = load_retrain_status()
         if status.last_run_finished:
             recent.append({
                 "date": status.last_run_finished[:10],
-                "level": "WARN" if status.last_run_success is False else "CRITICAL" if status.last_run_success is False else "WARN",
+                "level": "CRITICAL" if status.last_run_success is False else "WARN",
                 "category": "TRAINING",
                 "app_id": "",
                 "message": f"最近重训: {status.last_run_finished[:16]}, 成功={status.last_run_success}",
