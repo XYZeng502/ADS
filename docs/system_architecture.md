@@ -98,13 +98,19 @@ XGBoost (P95) ─┘    (Q1/Q2/Q3/Q4 各独立校准)
 
 ## 接口总览
 
-| 路径 | 说明 |
-|------|------|
-| `/health` | 系统健康（数据、模型、训练、漂移） |
-| `/web` | Web 看板主页 |
-| `/web/predict` | 预测模块（T+1 Spend/ROI 对比） |
-| `/web/recommend` | 推荐模块（月末预算建议） |
-| `/web/retrain/trigger` | 触发每日重训练 |
-| `/web/data/{target}` | 预测统计查询 |
-| `/v1/monitor/alerts` | 告警列表 |
-| `/v1/monitor/health-trend` | 健康趋势快照 |
+| 路径 | 鉴权 | 说明 |
+|------|------|------|
+| `/health` | - | 系统健康（数据、模型、训练、漂移） |
+| `/web` | - | Web 看板主页 |
+| `/web/predict` | - | 预测模块（T+1 Spend/ROI 对比） |
+| `/web/recommend` | - | 推荐模块（月末预算建议） |
+| `/web/data/{target}` | - | 预测统计查询 |
+| `/web/export/predictions/{target}` | - | 导出预测明细 CSV |
+| `/web/export/recommendations` | - | 导出推荐结果 CSV |
+| `/web/retrain/trigger` | 需要 | 触发每日重训练 |
+| `/web/run/start` | 需要 | 触发离线回放任务 |
+| `/web/revenue/daily-predict` | 需要 | 在线收入预测 |
+| `/v1/monitor/alerts` | - | 告警列表 |
+| `/v1/monitor/health-trend` | - | 健康趋势快照 |
+
+写操作接口若配置了 `APP_API_KEY` 环境变量，需携带 `Authorization: Bearer <key>` 请求头。

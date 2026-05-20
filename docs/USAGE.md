@@ -213,12 +213,12 @@ print(f'列完整: {h.columns_ok} | 缺失列: {h.missing_cols}')
 ```bash
 PYTHONPATH=. python scripts/run_parallel_models_spend_t1.py \
   --input daily_merged.csv \
-  --output-dir outputs/model_parallel_spend_t1 \
+  --output-dir outputs/model_parallel_spend_t1_v12_unified \
   --min-train-days 20 \
   --use-gpu
 ```
 
-输出到 `outputs/model_parallel_spend_t1/`：
+输出到 `outputs/model_parallel_spend_t1_v12_unified/`：
 - `predictions_XGBoost.csv` — 最优模型预测结果
 - `metrics_summary.csv` — 各模型指标汇总
 - `report.json` — 训练报告
@@ -228,7 +228,7 @@ PYTHONPATH=. python scripts/run_parallel_models_spend_t1.py \
 ```bash
 PYTHONPATH=. python scripts/run_parallel_models_roi_d1.py \
   --input daily_merged.csv \
-  --output-dir outputs/model_parallel_roi_d1 \
+  --output-dir outputs/model_parallel_roi_d1_v9_unified \
   --min-train-days 20 \
   --use-gpu
 ```
@@ -269,7 +269,7 @@ PYTHONPATH=. python scripts/offline_backtest.py \
 
 ```bash
 # 添加到 crontab（每天早上 6:00）
-0 6 * * * cd /home/lsh/ad_ml && PYTHONPATH=. python scripts/daily_retrain.py >> logs/retrain.log 2>&1
+0 3 * * * cd /path/to/ad_ml && PYTHONPATH=. python scripts/daily_retrain.py >> logs/retrain.log 2>&1
 ```
 
 ### 手动触发
@@ -325,10 +325,10 @@ curl -X POST http://localhost:8000/web/revenue/daily-predict \
 
 ### 休息日校准
 
-系统自动识别休息日（周末/节假日/寒暑假）并应用 scale 因子提升预测精度：
+系统自动识别休息日（周末/节假日/寒暑假）并应用 scale 因子提升预测精度（基于 2026-05-19 Carryover 实证校准）：
 - 工作日：×1.00
-- 周末：×1.08
-- 节假日：×1.12
+- 周末：×1.90
+- 节假日：×1.60
 - 寒暑假：×1.10
 
 ---
@@ -378,7 +378,24 @@ curl -X POST http://localhost:8000/v1/optimize/daily-plan \
 
 ## 9. 配置参数
 
-所有配置集中在 `app/config.py` 的 `Settings` 类中。
+所有配置集中在 `app/config.py` 的 `Settings` 类中，支持 `APP_` 前缀环境变量覆盖默认值。
+
+```bash
+# 环境变量覆盖示例
+export APP_DEFAULT_KPI=1.08
+export APP_API_KEY="your-secret-key"
+export APP_RETRAIN_TIMEOUT_SECONDS=10800
+```
+
+若配置了 `API_KEY`，写操作接口需带 `Authorization: Bearer <key>` 请求头。
+
+### 通用配置
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `default_kpi` | 1.05 | 默认目标 ROI |
+| `api_key` | (空) | API 鉴权密钥，为空不启用 |
+| `retrain_timeout_seconds` | 7200 | 单步重训超时（秒） |
 
 ### KPI 与预算
 

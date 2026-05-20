@@ -72,11 +72,3 @@ bash scripts/run_web_8000.sh
 
 Web fallback: ROI v9→v8→v7, Spend v12→v11。
 
-## 未提交改动
-
-1. `app/config.py` — 新增风控参数（spend anomaly/ROI decline/cap proximity）+ scale 因子微调
-2. `app/core/calendar.py` — scale 因子基于实证校准：weekend 1.08→1.10, holiday 1.12→1.15
-3. `app/schemas.py` — ProductDiagnosis 加 trend/cap_utilization；RiskAlert 加 4 个新 category
-4. `app/services/risk.py` — 风控重构：拆分子方法 + 新增 spend_anomaly/roi_decline/cap_proximity/趋势判断/风险评分
-5. `app/web.py` — 六层决策面板（KPI/时间/配置/节奏/风控/决策排序）+ 优先级排序优化
-6. `scripts/offline_backtest.py` — 回测中接入 spend anomaly 检测
