@@ -62,10 +62,6 @@ BASE_FEATURE_COLS = [
     "scene_n_unique", "scene_top1_pct", "scene_hhi",
     "creative_n_unique", "creative_top1_pct", "creative_hhi",
     "billing_n_unique", "billing_top1_pct", "billing_hhi",
-    # cohort 特征
-    "cohort_hhi", "cohort_top1_pct", "cohort_top3_pct",
-    "cohort_n_active", "cohort_log_n_active", "cohort_new_spend_ratio",
-    "cohort_spend_wt_age", "cohort_mature_spend_ratio", "cohort_young_spend_ratio",
     "spend_x_is_rest_day", "spend_lag1_x_target_rest",
     "spend_lag1_x_target_holiday", "spend_ratio_x_target_rest",
     "app_label",
