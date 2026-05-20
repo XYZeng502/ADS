@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -72,6 +73,14 @@ def _days_since_prev_holiday(d: date) -> int:
     return CALENDAR.days_since_prev_holiday(d)
 
 
+def _cohort_fill_default(col_name: str) -> float:
+    if col_name in ("cohort_hhi", "cohort_top1_pct", "cohort_top3_pct"):
+        return 1.0
+    if "ratio" in col_name or "momentum" in col_name:
+        return 0.0
+    return 0.0
+
+
 def _build_composition_features(raw: pd.DataFrame) -> pd.DataFrame:
     comp_dims = {
         "traffic": "推广流量名称",
@@ -112,6 +121,150 @@ def _build_composition_features(raw: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _build_cohort_features(raw: pd.DataFrame) -> pd.DataFrame:
+    """构建 (应用ID, 日期) 级 cohort 特征。
+
+    从 product_uid（广告主ID:计划ID）粒度聚合，计算：
+    - 消耗集中度：HHI、top1 占比、活跃 cohort 数
+    - Cohort 年龄分布：消耗加权平均年龄、成熟/新生 cohort 消耗占比
+    - Cohort 质量：新生 vs 成熟 cohort 的 D1 ROI 对比（动量）
+    """
+    # Step A: 构建 product-date 表
+    raw = raw.copy()
+    raw["product_uid"] = raw["广告主ID"].astype(str) + ":" + raw["计划ID"].astype(str)
+
+    prod_cols = ["消耗金额", "首日广告收入", "激活人数(快应用新增用户数)"]
+    prod_date = (
+        raw.groupby(["应用ID", "日期", "product_uid"], as_index=False)[prod_cols]
+        .sum()
+        .sort_values(["应用ID", "product_uid", "日期"])
+    )
+
+    # Step B: cohort 起始日期与年龄
+    cohort_start = (
+        prod_date[prod_date["消耗金额"] > 1e-8]
+        .groupby(["应用ID", "product_uid"])["日期"]
+        .min()
+        .reset_index()
+        .rename(columns={"日期": "cohort_start_date"})
+    )
+    prod_date = prod_date.merge(cohort_start, on=["应用ID", "product_uid"], how="left")
+    prod_date["cohort_age_days"] = (
+        (prod_date["日期"] - prod_date["cohort_start_date"]).dt.days
+    )
+    prod_date["cohort_age_days"] = prod_date["cohort_age_days"].fillna(-1).astype(int)
+
+    # Step C: 每 cohort 指标
+    prod_date["cohort_roi_d1"] = np.where(
+        prod_date["消耗金额"] > 1e-8,
+        prod_date["首日广告收入"] / prod_date["消耗金额"],
+        np.nan,
+    )
+
+    # Step D: 筛选活跃 cohort，聚合到 (应用ID, 日期)
+    active = prod_date[prod_date["消耗金额"] > 1e-8].copy()
+
+    total_spend = (
+        active.groupby(["应用ID", "日期"])["消耗金额"]
+        .sum()
+        .rename("_total_spend")
+    )
+    active = active.join(total_spend, on=["应用ID", "日期"])
+    active["_spend_share"] = np.where(
+        active["_total_spend"] > 1e-8,
+        active["消耗金额"] / active["_total_spend"],
+        0.0,
+    )
+
+    # 预计算加权列（避免 agg 内用 apply）
+    active["_spend_times_age"] = active["消耗金额"] * active["cohort_age_days"].clip(lower=0)
+
+    # age bucket tags
+    active["_is_young"] = (
+        (active["cohort_age_days"] >= 0) & (active["cohort_age_days"] < 3)
+    ).astype(float)
+    active["_is_mature"] = (active["cohort_age_days"] >= 7).astype(float)
+
+    active["_young_spend"] = active["_is_young"] * active["消耗金额"]
+    active["_mature_spend"] = active["_is_mature"] * active["消耗金额"]
+
+    # ROI 加权列
+    roi_filled = active["cohort_roi_d1"].fillna(0.0)
+    active["_young_roi_wt"] = active["_is_young"] * roi_filled * active["消耗金额"]
+    active["_mature_roi_wt"] = active["_is_mature"] * roi_filled * active["消耗金额"]
+    active["_young_spend_wt"] = active["_is_young"] * active["消耗金额"]
+    active["_mature_spend_wt"] = active["_is_mature"] * active["消耗金额"]
+
+    # 集中度：top3 share 需要先排序
+    top3 = (
+        active.groupby(["应用ID", "日期"])
+        .apply(lambda g: g.nlargest(3, "消耗金额")["_spend_share"].sum(), include_groups=False)
+        .rename("_top3_share")
+    )
+
+    agg = active.groupby(["应用ID", "日期"]).agg(
+        _total_spend=("消耗金额", "sum"),
+        cohort_hhi=("_spend_share", lambda s: float((s**2).sum())),
+        cohort_top1_pct=("_spend_share", "max"),
+        cohort_n_active=("消耗金额", "count"),
+        cohort_spend_wt_age=("_spend_times_age", "sum"),
+        cohort_young_spend_ratio=("_young_spend", "sum"),
+        cohort_mature_spend_ratio=("_mature_spend", "sum"),
+        cohort_young_roi_d1=("_young_roi_wt", "sum"),
+        cohort_mature_roi_d1=("_mature_roi_wt", "sum"),
+        cohort_young_spend=("_young_spend_wt", "sum"),
+        cohort_mature_spend=("_mature_spend_wt", "sum"),
+    )
+
+    # 归一化加权年龄
+    agg["cohort_spend_wt_age"] = np.where(
+        agg["cohort_n_active"] > 0,
+        agg["cohort_spend_wt_age"] / agg["_total_spend"],
+        0.0,
+    )
+
+    # 归一化年龄分段占比
+    agg["cohort_young_spend_ratio"] = np.where(
+        agg["_total_spend"] > 1e-8,
+        agg["cohort_young_spend_ratio"] / agg["_total_spend"],
+        0.0,
+    )
+    agg["cohort_mature_spend_ratio"] = np.where(
+        agg["_total_spend"] > 1e-8,
+        agg["cohort_mature_spend_ratio"] / agg["_total_spend"],
+        0.0,
+    )
+
+    # 归一化加权 ROI
+    agg["cohort_young_roi_d1"] = np.where(
+        agg["cohort_young_spend"] > 1e-8,
+        agg["cohort_young_roi_d1"] / agg["cohort_young_spend"],
+        np.nan,
+    )
+    agg["cohort_mature_roi_d1"] = np.where(
+        agg["cohort_mature_spend"] > 1e-8,
+        agg["cohort_mature_roi_d1"] / agg["cohort_mature_spend"],
+        np.nan,
+    )
+    agg["cohort_roi_momentum"] = agg["cohort_young_roi_d1"] - agg["cohort_mature_roi_d1"]
+
+    # top3 合并
+    agg = agg.join(top3, on=["应用ID", "日期"])
+    agg["cohort_top3_pct"] = agg["_top3_share"].fillna(agg["cohort_top1_pct"])
+
+    # 派生特征
+    agg["cohort_log_n_active"] = np.log1p(agg["cohort_n_active"])
+    agg["cohort_new_spend_ratio"] = agg["cohort_young_spend_ratio"]
+
+    # 删除中间列，只保留特征
+    drop_cols = [
+        "_total_spend", "_top3_share", "cohort_young_spend", "cohort_mature_spend",
+    ]
+    result = agg.drop(columns=[c for c in drop_cols if c in agg.columns]).reset_index()
+
+    return result
+
+
 def build_unified_daily(
     input_csv: str,
     min_spend_train: float = 2.0,
@@ -143,6 +296,7 @@ def build_unified_daily(
 
     # 阶段2：聚合到 应用-日期
     comp_df = _build_composition_features(raw)
+    cohort_df = _build_cohort_features(raw)
     agg_cols = ["消耗金额", "首日广告收入", "曝光量", "点击量", "下载量", "激活人数(快应用新增用户数)"]
     df = (
         raw.groupby(["应用ID", "日期"], as_index=False)[agg_cols]
@@ -153,6 +307,12 @@ def build_unified_daily(
     for c in comp_df.columns:
         if c not in ("应用ID", "日期") and c in df.columns:
             df[c] = df[c].fillna(0)
+
+    # 合并 cohort 特征
+    df = df.merge(cohort_df, on=["应用ID", "日期"], how="left")
+    for c in cohort_df.columns:
+        if c not in ("应用ID", "日期") and c in df.columns:
+            df[c] = df[c].fillna(_cohort_fill_default(c))
 
     # 阶段3：过滤
     # 3a：app 级 — 全周期消耗为 0
@@ -310,6 +470,7 @@ def build_unified_daily(
 
     # ---- 清理 ----
     fill_cols = [c for c in df.columns if "lag_" in c or "roll_" in c or "ratio_" in c
+                 or c.startswith("cohort_")
                  or c in ("month_progress", "mtd_roi_d1", "roi_d1_std_7", "roi_d1_iqr_7",
                           "roi_d1_range_7", "act_per_spend", "rev_per_act_d1")]
     for c in fill_cols:
