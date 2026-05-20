@@ -77,17 +77,24 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
         prefit=True,
     )
     cqr.conformalize(x_calib, y_calib)
-    y_pred, y_pis = cqr.predict_interval(x_test)
+    _, y_pis = cqr.predict_interval(x_test)
     y_pis = y_pis.squeeze(-1)  # (n, 2, 1) -> (n, 2)
-    y_pred = apply_holiday_transition_calibration(test, y_pred)
+
+    # Use median model (alpha=0.5) for point predictions, not CQR's combined output
+    y_pred_raw = estimators[1].predict(x_test)  # alpha=0.5
+    y_pred = apply_holiday_transition_calibration(test, y_pred_raw)
+
+    # Ensure intervals are non-crossing: sort lower/upper per row
+    y_lower = np.min(y_pis, axis=1)
+    y_upper = np.max(y_pis, axis=1)
 
     return pd.DataFrame({
         "日期": test["日期"].values,
         "应用ID": test["应用ID"].values,
         "y_true": y_test,
         "y_pred": np.clip(y_pred, 0.0, None),
-        "y_lower": np.clip(y_pis[:, 0], 0.0, None),
-        "y_upper": np.clip(y_pis[:, 1], 0.0, None),
+        "y_lower": np.clip(y_lower, 0.0, None),
+        "y_upper": np.clip(y_upper, 0.0, None),
         "model": "XGBoost_CQR",
     })
 
