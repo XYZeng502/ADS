@@ -1681,7 +1681,7 @@ function renderChartSeries(data, unit, target) {{
     legend: {{ top: 4, left: 260, data: series.filter(s => s.name !== '区间下界').map(s => s.name) }},
     title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
     grid: {{ left: 72, right: 28, top: 48, bottom: 60 }},
-    xAxis: {{ type: 'category', data: dates }},
+    xAxis: {{ type: 'category', data: dates, axisLabel: {{ formatter: v => String(v).slice(2) }} }},
     yAxis: {{ type: 'value', axisLabel: {{ formatter: v => v >= 10000 ? (v/10000).toFixed(1)+'万' : v }} }},
     dataZoom: [{{type:'inside'}}, {{type:'slider', height: 18, bottom: 12}}],
     series
@@ -1762,8 +1762,8 @@ function showAppPopup(appId, rowData, evt) {{
   // init or re-use charts
   if (!_popupCharts.roi) _popupCharts.roi = echarts.init(document.getElementById('popupRoiChart'));
   if (!_popupCharts.spend) _popupCharts.spend = echarts.init(document.getElementById('popupSpendChart'));
-  _popupCharts.roi.setOption({{ title: {{ text: 'T+1 ROI_D1', left: 8, top: 2, textStyle: {{fontSize:11}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 56, right: 16, top: 28, bottom: 44 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:9, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:9}} }}, series: [] }});
-  _popupCharts.spend.setOption({{ title: {{ text: 'T+1 Spend', left: 8, top: 2, textStyle: {{fontSize:11}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 56, right: 16, top: 28, bottom: 44 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:9, rotate:20}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:9}} }}, series: [] }});
+  _popupCharts.roi.setOption({{ title: {{ text: 'T+1 ROI_D1', left: 8, top: 2, textStyle: {{fontSize:11}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 56, right: 16, top: 28, bottom: 44 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:9, rotate:20, formatter: v => String(v).slice(2)}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:9}} }}, series: [] }});
+  _popupCharts.spend.setOption({{ title: {{ text: 'T+1 Spend', left: 8, top: 2, textStyle: {{fontSize:11}} }}, tooltip: {{ trigger:'axis' }}, grid: {{ left: 56, right: 16, top: 28, bottom: 44 }}, xAxis: {{ type:'category', data: [], axisLabel:{{fontSize:9, rotate:20, formatter: v => String(v).slice(2)}} }}, yAxis: {{ type:'value', axisLabel:{{fontSize:9}} }}, series: [] }});
 
   _popupCharts.roi.showLoading();
   _popupCharts.spend.showLoading();
@@ -1783,7 +1783,7 @@ function _renderPopupChart(chart, data, unit, isSpend) {{
   const actualName = isSpend ? '实际Spend' : '实际ROI';
   const predName = isSpend ? '预测Spend' : '预测ROI';
   chart.setOption({{
-    xAxis: {{ data: dates }},
+    xAxis: {{ data: dates, axisLabel: {{ formatter: v => String(v).slice(2) }} }},
     series: [
       {{ name: actualName, type: 'line', smooth: true, symbolSize: 3, data: data.map(x => x.actual) }},
       {{ name: predName, type: 'line', smooth: true, symbolSize: 3, data: data.map(x => x.pred) }},
@@ -2061,7 +2061,7 @@ async function loadDailyRevenueChart() {{
     tooltip: {{ trigger: 'axis' }},
     legend: {{ data: ['实际总收入', '预测总收入'], top: 4, left: 200 }},
     grid: {{ left: 80, right: 28, top: 48, bottom: 56 }},
-    xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
+    xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10, formatter: v => String(v).slice(2) }} }},
     yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10, formatter: v => v >= 10000 ? (v/10000).toFixed(1)+'万' : v }} }},
     dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
     series: [
@@ -2081,7 +2081,7 @@ async function loadDailyRevenueChart() {{
     tooltip: {{ trigger: 'axis' }},
     legend: {{ data: ['实际Carryover', '预测Carryover'], top: 4, left: 200 }},
     grid: {{ left: 80, right: 28, top: 48, bottom: 56 }},
-    xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
+    xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10, formatter: v => String(v).slice(2) }} }},
     yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10, formatter: v => v >= 10000 ? (v/10000).toFixed(1)+'万' : v }} }},
     dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
     series: [
@@ -2405,7 +2405,7 @@ async function loadHealthTrend() {{
       tooltip: {{ trigger: 'axis' }},
       legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], top: 4, left: 200 }},
       grid: {{ left: 72, right: 28, top: 48, bottom: 60 }},
-      xAxis: {{ type: 'category', data: dates }},
+      xAxis: {{ type: 'category', data: dates, axisLabel: {{ formatter: v => String(v).slice(2) }} }},
       yAxis: [
         {{ type: 'value', min: 0 }},
         {{ type: 'value', min: 0 }},
