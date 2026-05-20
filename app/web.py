@@ -539,7 +539,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel">
     <div class="controls">
       <label>评估目标
-        <select id="targetSel">
+        <select id="targetSel" onchange="render()">
           <option value="roi">T+1 ROI_D1 预测</option>
           <option value="spend">T+1 Spend 预测</option>
         </select>
@@ -1679,7 +1679,7 @@ function renderChartSeries(data, unit, target) {{
         return html;
       }}
     }},
-    legend: {{ top: 4, left: 260 }},
+    legend: {{ top: 4, left: 260, data: series.filter(s => s.name !== '区间下界').map(s => s.name) }},
     title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
     grid: {{ left: 72, right: 28, top: 48, bottom: 60 }},
     xAxis: {{ type: 'category', data: dates }},
