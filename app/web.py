@@ -261,6 +261,28 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     spend_pred_path = resolve_spend_predictions_csv(spend_dir) if spend_dir else None
 
     spend_predictions = _read_csv_rows(spend_pred_path, 50000, from_end=True)
+
+    # CQR interval predictions
+    cqr_path = spend_dir / "predictions_XGBoost_CQR.csv" if spend_dir else None
+    cqr_predictions = None
+    cqr_coverage = None
+    if cqr_path and cqr_path.exists():
+        cqr_raw = _read_csv_rows(cqr_path, 50000, from_end=True)
+        cqr_by_date: dict[str, dict] = {}
+        for row in cqr_raw:
+            day = str(row.get("日期", ""))[:10]
+            if not day:
+                continue
+            if day not in cqr_by_date:
+                cqr_by_date[day] = {"y_pred": 0.0, "y_lower": 0.0, "y_upper": 0.0}
+            cqr_by_date[day]["y_pred"] += float(row.get("y_pred", 0))
+            cqr_by_date[day]["y_lower"] += float(row.get("y_lower", 0))
+            cqr_by_date[day]["y_upper"] += float(row.get("y_upper", 0))
+        cqr_predictions = cqr_by_date
+        report = _read_json(spend_dir / "report.json") if spend_dir else {}
+        cqr_report = report.get("cqr", {})
+        cqr_coverage = cqr_report.get("coverage")
+
     calendar = CalendarService()
     spend_calendar = {}
     for row in spend_predictions:
@@ -303,6 +325,8 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "predictions": spend_predictions,
             "prediction_file": str(spend_pred_path.resolve()) if spend_pred_path and spend_pred_path.exists() else "",
             "baseline_predictions": _read_csv_rows(old_spend_path, 20000, from_end=True),
+            "cqr_predictions": cqr_predictions,
+            "cqr_coverage": cqr_coverage,
             "calendar": spend_calendar,
             "source": str(spend_dir) if spend_dir else "",
             "stats": spend_stats["overall"] if spend_stats else None,
@@ -654,8 +678,16 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
       <input type="text" id="drAppSearch" placeholder="搜索应用ID…" style="width:160px;" />
       <button onclick="loadDailyRevenueChart()" type="button">查询</button>
     </div>
-    <div id="dailyRevenueChart" style="width:100%;height:450px;border:1px solid var(--line);border-radius:16px;background:#fff;"></div>
+    <div id="dailyRevenueChart" style="width:100%;height:320px;border:1px solid var(--line);border-radius:16px;background:#fff;"></div>
+    <div id="dailyRevenueCarryoverChart" style="width:100%;height:280px;border:1px solid var(--line);border-radius:16px;background:#fff;margin-top:8px;"></div>
     <div id="dailyRevenueStats" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel" style="margin-top:16px;">
+    <div class="section-title"><h2>应用曲线诊断</h2><span style="font-size:11px;color:var(--muted);">Carryover MAPE ↓ = 释放曲线越可靠 → 月末ROI推算越可信</span></div>
+    <div id="dailyRevenueAppSummary" class="table-wrap" style="max-height:360px;">
+      <div class="plain-note">加载中...</div>
+    </div>
   </div>
 
   <div class="panel" style="margin-top:16px;">
@@ -703,28 +735,21 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
 
 <div class="view hidden" id="view-monitor">
   <div class="panel">
-    <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap;">
-      <div id="monitorAlertStats" style="padding:10px 16px;background:var(--bg);border:1px solid var(--line);border-radius:10px;flex:1;min-width:200px;">
-        <div style="font-size:13px;color:var(--muted);">告警统计 (7天)</div>
-        <div style="font-size:20px;font-weight:700;margin-top:4px;" id="monitorAlertTotal">--</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px;" id="monitorAlertBreakdown"></div>
-      </div>
-      <div id="monitorHealthCard" style="padding:10px 16px;background:var(--bg);border:1px solid var(--line);border-radius:10px;flex:1;min-width:200px;">
-        <div style="font-size:13px;color:var(--muted);">最新健康快照</div>
-        <div style="font-size:20px;font-weight:700;margin-top:4px;" id="monitorHealthStatus">--</div>
-        <div style="font-size:11px;color:var(--muted);margin-top:2px;" id="monitorHealthDetail"></div>
-      </div>
+    <div class="section-title"><h2>告警与健康</h2></div>
+    <div class="grid4">
+      <div class="metric"><div class="k">告警总数 (7天)</div><div class="v" id="monitorAlertTotal">--</div><div class="d" id="monitorAlertBreakdown"></div></div>
+      <div class="metric"><div class="k">漂移状态</div><div class="v" id="monitorDriftStatus">--</div><div class="d" id="monitorDriftDetail"></div></div>
+      <div class="metric"><div class="k">数据状态</div><div class="v" id="monitorDataStatus">--</div><div class="d" id="monitorDataDetail"></div></div>
+      <div class="metric"><div class="k">训练 & 日历</div><div class="v" id="monitorTrainStatus">--</div><div class="d" id="monitorCalStatus"></div></div>
     </div>
-    <div style="display:flex;gap:12px;">
-      <div style="flex:2;">
-        <div style="font-size:14px;font-weight:600;margin-bottom:8px;">健康趋势 (30天)</div>
-        <div id="healthTrendChart" style="width:100%;height:280px;"></div>
-      </div>
-      <div style="flex:1;min-width:280px;">
-        <div style="font-size:14px;font-weight:600;margin-bottom:8px;">告警历史</div>
-        <div class="table-wrap" style="max-height:280px;" id="monitorAlertTable"></div>
-      </div>
-    </div>
+  </div>
+  <div class="panel">
+    <div class="section-title"><h2>健康趋势 (30天)</h2></div>
+    <div id="healthTrendChart" style="width:100%;height:340px;border:1px solid var(--line);border-radius:16px;background:#fff;"></div>
+  </div>
+  <div class="panel">
+    <div class="section-title"><h2>告警历史</h2></div>
+    <div class="table-wrap" style="max-height:320px;" id="monitorAlertTable"></div>
   </div>
 </div>
 
@@ -1542,9 +1567,54 @@ function renderChartSeries(data, unit, target) {{
     {{ name: actualName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.actual) }},
     {{ name: predName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.pred) }},
   ];
+  // CQR prediction interval bands for spend chart (all-apps only, CQR data is aggregated)
+  if (target === 'spend' && !selectedAppId && payload.spend.cqr_predictions) {{
+    const cqrData = payload.spend.cqr_predictions;
+    const cqrLower = dates.map(d => cqrData[d] ? cqrData[d].y_lower : null);
+    const cqrUpper = dates.map(d => cqrData[d] ? cqrData[d].y_upper : null);
+    const cqrPred  = dates.map(d => cqrData[d] ? cqrData[d].y_pred  : null);
+    // remove the predName series so we can re-order
+    const predSeries = series.pop();
+    series.push({{
+      name: '区间下界', type: 'line', data: cqrLower,
+      lineStyle: {{opacity: 0}}, stack: 'cqr-band', symbol: 'none',
+      silent: true, emphasis: {{disabled: true}},
+    }});
+    series.push({{
+      name: '预测区间(P05-P95)', type: 'line', data: cqrUpper,
+      lineStyle: {{opacity: 0}},
+      areaStyle: {{color: 'rgba(66,133,244,0.15)'}},
+      stack: 'cqr-band', symbol: 'none', silent: true,
+    }});
+    series.push({{
+      name: '预测值(CQR-P50)', type: 'line', data: cqrPred,
+      lineStyle: {{width: 2, type: 'dashed', color: '#4285f4'}},
+      itemStyle: {{color: '#4285f4'}}, symbol: 'none',
+    }});
+    series.push(predSeries);
+  }}
   charts.line.setOption({{
-    color: ['#16a34a', '#2563eb', '#f59e0b'],
-    tooltip: {{ trigger: 'axis' }},
+    color: ['#16a34a', '#2563eb', '#f59e0b', '#8ab4f8'],
+    tooltip: {{
+      trigger: 'axis',
+      formatter: function(params) {{
+        let html = '<b>' + params[0].axisValue + '</b><br/>';
+        let cqrVal = null;
+        for (let i = 0; i < params.length; i++) {{
+          const p = params[i];
+          if (p.seriesName === '区间下界' || p.seriesName === '预测区间(P05-P95)') continue;
+          if (p.seriesName === '预测值(CQR-P50)') {{ cqrVal = p.value; continue; }}
+          html += p.marker + p.seriesName + ': ' + fmt(p.value, target === 'roi' ? 4 : 2) + '<br/>';
+        }}
+        if (cqrVal !== null && target === 'spend' && payload.spend.cqr_predictions) {{
+          const c = payload.spend.cqr_predictions[params[0].axisValue];
+          if (c) {{
+            html += '<span style="color:#888;font-size:11px;">预测区间: ' + Math.round(c.y_lower) + ' ~ ' + Math.round(c.y_upper) + '</span><br/>';
+          }}
+        }}
+        return html;
+      }}
+    }},
     legend: {{ top: 8 }},
     title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
     grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
@@ -1701,7 +1771,7 @@ function renderSummary(rows) {{
     const r = payload.spend.report || {{}};
     const holidayRows = rows.filter(x => x.calendarLabel.includes('清明') || x.calendarLabel.includes('假期') || x.calendarLabel.includes('节后'));
     const avgImprove = holidayRows.length ? holidayRows.reduce((s,x)=>s+(Number.isFinite(x.improvement)?x.improvement:0),0)/holidayRows.length : NaN;
-    document.getElementById('modelSummary').innerHTML = `Spend 当前使用 <b>目标日历特征 + 假期切换校准</b>：最优模型=${{r.best_model_by_mape || '模型输出'}}，MAPE=${{fmt(num(r.best_mape_pct),2)}}%。表格已增加“旧预测/旧APE/新APE/改善幅度/T+1日历标签”，清明与节后样本平均改善=${{pct(avgImprove)}}。`;
+    document.getElementById('modelSummary').innerHTML = `Spend 当前使用 <b>目标日历特征 + 假期切换校准</b>：最优模型=${{r.best_model_by_mape || '模型输出'}}，MAPE=${{fmt(num(r.best_mape_pct),2)}}%。表格已增加“旧预测/旧APE/新APE/改善幅度/T+1日历标签”，清明与节后样本平均改善=${{pct(avgImprove)}}。${{payload.spend.cqr_coverage != null ? ` CQR预测区间覆盖率=${{pct(payload.spend.cqr_coverage)}}。` : ''}}`;
   }}
 }}
 
@@ -1854,7 +1924,7 @@ function setActiveView(view) {{
   document.getElementById('view-daily-revenue').classList.toggle('hidden', view !== 'daily-revenue');
   document.getElementById('view-monitor').classList.toggle('hidden', view !== 'monitor');
   hideAppPopup(true);
-  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') loadDailyRevenueChart(); if (view === 'monitor') loadMonitorView(); }}, 0);
+  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') {{ loadDailyRevenueChart(); loadDailyRevenueAppSummary(); }} if (view === 'monitor') loadMonitorView(); }}, 0);
 }}
 document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
 
@@ -1865,26 +1935,32 @@ async function loadDailyRevenueChart() {{
   const data = await resp.json();
 
   const chartDom = document.getElementById('dailyRevenueChart');
+  const coChartDom = document.getElementById('dailyRevenueCarryoverChart');
   const statsDiv = document.getElementById('dailyRevenueStats');
 
   if (!data.rows || data.rows.length === 0) {{
     chartDom.innerHTML = '<div class="plain-note">暂无预测数据，请先执行每日预测回测。</div>';
+    coChartDom.innerHTML = '';
     statsDiv.innerHTML = '';
     return;
   }}
 
-  // Aggregate by date (sum across all apps shown)
+  // Aggregate by date for both combined and carryover
   const dateMap = {{}};
   data.rows.forEach(r => {{
     const d = r['日期'];
-    if (!dateMap[d]) dateMap[d] = {{ y_true: 0, y_pred: 0 }};
+    if (!dateMap[d]) dateMap[d] = {{ y_true: 0, y_pred: 0, co_true: 0, co_pred: 0 }};
     dateMap[d].y_true += parseFloat(r.y_true || 0);
     dateMap[d].y_pred += parseFloat(r.y_pred || 0);
+    dateMap[d].co_true += parseFloat(r.y_true_carryover || 0);
+    dateMap[d].co_pred += parseFloat(r.y_pred_carryover || 0);
   }});
 
   const dates = Object.keys(dateMap).sort();
   const yTrue = dates.map(d => dateMap[d].y_true);
   const yPred = dates.map(d => dateMap[d].y_pred);
+  const coTrue = dates.map(d => dateMap[d].co_true);
+  const coPred = dates.map(d => dateMap[d].co_pred);
 
   // 双口径 MAPE (days >= 30 filter)
   let combinedSum = 0, combinedCount = 0, carryoverSum = 0, carryoverCount = 0;
@@ -1911,26 +1987,112 @@ async function loadDailyRevenueChart() {{
     + ` | 组合MAPE(D1已知) <b>${{combinedMape}}%</b>`
     + ` | CarryoverMAPE(曲线) <b>${{carryoverMape}}%</b>`;
 
+  // ---- 上图：组合收入（D1 + Carryover） ----
   echarts.dispose(chartDom);
   const chart = echarts.init(chartDom);
   chart.setOption({{
     color: ['#16a34a', '#2563eb'],
-    title: {{ text: '每日买量收入：预测 vs 实际', left: 16, top: 6, textStyle: {{ fontSize: 14 }} }},
+    title: {{ text: '每日买量收入（D1 + Carryover）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
     tooltip: {{ trigger: 'axis' }},
-    legend: {{ data: ['实际', '预测'], top: 6 }},
-    grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
-    xAxis: {{ type: 'category', data: dates }},
-    yAxis: {{ type: 'value' }},
-    dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 18, bottom: 12 }}],
+    legend: {{ data: ['实际总收入', '预测总收入'], top: 4 }},
+    grid: {{ left: 64, right: 28, top: 48, bottom: 48 }},
+    xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
+    yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
+    dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
     series: [
-      {{ name: '实际', type: 'line', data: yTrue, smooth: true,
+      {{ name: '实际总收入', type: 'line', data: yTrue, smooth: true,
         lineStyle: {{ width: 2 }}, symbol: 'none' }},
-      {{ name: '预测', type: 'line', data: yPred, smooth: true,
+      {{ name: '预测总收入', type: 'line', data: yPred, smooth: true,
         lineStyle: {{ width: 2, type: 'dashed' }}, symbol: 'none' }},
     ],
   }});
 
-  window.addEventListener('resize', () => chart.resize());
+  // ---- 下图：Carryover 尾量 ----
+  echarts.dispose(coChartDom);
+  const coChart = echarts.init(coChartDom);
+  coChart.setOption({{
+    color: ['#dc2626', '#f59e0b'],
+    title: {{ text: 'Carryover 尾量（仅释放曲线预测部分）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
+    tooltip: {{ trigger: 'axis' }},
+    legend: {{ data: ['实际Carryover', '预测Carryover'], top: 4 }},
+    grid: {{ left: 64, right: 28, top: 48, bottom: 48 }},
+    xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
+    yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
+    dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
+    series: [
+      {{ name: '实际Carryover', type: 'line', data: coTrue, smooth: true,
+        lineStyle: {{ width: 2 }}, symbol: 'none' }},
+      {{ name: '预测Carryover', type: 'line', data: coPred, smooth: true,
+        lineStyle: {{ width: 2, type: 'dashed' }}, symbol: 'none' }},
+    ],
+  }});
+
+  window.addEventListener('resize', () => {{ chart.resize(); coChart.resize(); }});
+}}
+
+async function loadDailyRevenueAppSummary() {{
+  const wrap = document.getElementById('dailyRevenueAppSummary');
+  wrap.innerHTML = '<div class="plain-note">加载中...</div>';
+  const resp = await fetch('/web/predictions/daily_revenue');
+  const data = await resp.json();
+  if (!data.rows || data.rows.length === 0) {{
+    wrap.innerHTML = '<div class="plain-note">暂无数据</div>';
+    return;
+  }}
+
+  // Per-app aggregation (only days >= 30 for stable metrics)
+  const appMap = {{}};
+  data.rows.forEach(r => {{
+    const app = r['应用ID'];
+    if (!appMap[app]) appMap[app] = {{ co_sum:0, co_count:0, comb_sum:0, comb_count:0, total_buy:0, total_d1:0, n:0 }};
+    const a = appMap[app];
+    const yt = parseFloat(r.y_true||0), yp = parseFloat(r.y_pred||0);
+    const coT = parseFloat(r.y_true_carryover||0), coP = parseFloat(r.y_pred_carryover||0);
+    const d1 = parseFloat(r.y_true_d1||0);
+    if (parseInt(r.days_since_start) >= 30) {{
+      if (yt > 0) {{ a.comb_sum += Math.abs(yt-yp)/yt; a.comb_count++; }}
+      if (coT > 0) {{ a.co_sum += Math.abs(coT-coP)/coT; a.co_count++; }}
+    }}
+    a.total_buy += yt;
+    a.total_d1 += d1;
+    a.n++;
+  }});
+
+  const apps = Object.entries(appMap)
+    .map(([id, a]) => ({{
+      id,
+      n: a.n,
+      co_mape: a.co_count > 0 ? a.co_sum / a.co_count * 100 : null,
+      comb_mape: a.comb_count > 0 ? a.comb_sum / a.comb_count * 100 : null,
+      total_buy: a.total_buy,
+      d1_ratio: a.total_buy > 0 ? a.total_d1 / a.total_buy * 100 : 0,
+    }}))
+    .filter(a => a.co_mape !== null)
+    .sort((a, b) => a.co_mape - b.co_mape);
+
+  if (apps.length === 0) {{
+    wrap.innerHTML = '<div class="plain-note">无足够样本（需 days≥30）</div>';
+    return;
+  }}
+
+  const totalBuy = apps.reduce((s,a) => s + a.total_buy, 0);
+  let html = '<table><thead><tr><th>#</th><th>应用ID</th><th class="num">样本</th><th class="num">Carryover MAPE</th><th class="num">组合 MAPE</th><th class="num">总买量收入</th><th class="num">收入占比</th><th class="num">D1占比</th></tr></thead><tbody>';
+  apps.forEach((a, i) => {{
+    const coCls = a.co_mape < 50 ? 's-ok' : a.co_mape < 100 ? '' : 'bad';
+    const share = (a.total_buy / totalBuy * 100).toFixed(1);
+    html += '<tr>'
+      + '<td>' + (i+1) + '</td>'
+      + '<td><a href="#" onclick="document.getElementById(&#39;drAppSearch&#39;).value=&#39;' + a.id + '&#39;;document.getElementById(&#39;drTableSearch&#39;).value=&#39;' + a.id + '&#39;;loadDailyRevenueChart();loadDailyRevenueTable();return false">' + a.id + '</a></td>'
+      + '<td class="num">' + a.n + '</td>'
+      + '<td class="num ' + coCls + '"><b>' + a.co_mape.toFixed(1) + '%</b></td>'
+      + '<td class="num">' + (a.comb_mape !== null ? a.comb_mape.toFixed(1) + '%' : '-') + '</td>'
+      + '<td class="num">' + a.total_buy.toLocaleString() + '</td>'
+      + '<td class="num">' + share + '%</td>'
+      + '<td class="num">' + a.d1_ratio.toFixed(1) + '%</td>'
+      + '</tr>';
+  }});
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
 }}
 
 async function loadDailyRevenueTable() {{
@@ -2140,10 +2302,16 @@ async function loadMonitorAlerts() {{
     const drift = h.drift || {{}};
     const cal = h.calendar_health || {{}};
     const training = h.training || {{}};
-    document.getElementById('monitorHealthStatus').textContent =
-      '漂移:' + (drift.overall||'--') + ' 数据:' + ((h.data||{{}}).status||'--');
-    document.getElementById('monitorHealthDetail').textContent =
-      '训练:' + (training.overall||'--') + ' 日历:' + (cal.status||'--');
+    const dataStatus = (h.data||{{}}).status || '--';
+    const driftOverall = drift.overall || '--';
+    const trainOverall = training.overall || '--';
+    const calStatus = cal.status || '--';
+    document.getElementById('monitorDriftStatus').textContent = driftOverall === 'ok' ? '正常' : driftOverall;
+    document.getElementById('monitorDriftDetail').innerHTML = 'Spend MAPE: ' + ((drift.spend_mape||0)*100).toFixed(1) + '%';
+    document.getElementById('monitorDataStatus').textContent = dataStatus === 'healthy' ? '正常' : dataStatus;
+    document.getElementById('monitorDataDetail').textContent = '滞后 ' + ((h.data||{{}}).days_behind||'--') + ' 天';
+    document.getElementById('monitorTrainStatus').textContent = trainOverall === 'success' ? '正常' : trainOverall;
+    document.getElementById('monitorCalStatus').textContent = '日历: ' + calStatus;
   }} catch(e) {{}}
 }}
 
@@ -2168,18 +2336,20 @@ async function loadHealthTrend() {{
       healthTrendChart = echarts.init(el);
     }}
     healthTrendChart.setOption({{
+      color: ['#94a3b8', '#f59e0b', '#10b981'],
       tooltip: {{ trigger: 'axis' }},
-      legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], bottom: 4 }},
-      grid: {{ left: 55, right: 24, top: 10, bottom: 48 }},
-      xAxis: {{ type: 'category', data: dates, axisLabel: {{ rotate: 30, fontSize: 10 }} }},
+      legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], top: 8 }},
+      grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
+      xAxis: {{ type: 'category', data: dates }},
       yAxis: [
-        {{ type: 'value', name: '天数', min: 0 }},
-        {{ type: 'value', name: 'MAPE%', min: 0 }},
+        {{ type: 'value', min: 0 }},
+        {{ type: 'value', min: 0 }},
       ],
+      dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 18, bottom: 12 }}],
       series: [
-        {{ name: '数据滞后(天)', type: 'bar', data: behind, itemStyle: {{ color: '#94a3b8' }} }},
-        {{ name: 'Spend MAPE%', type: 'line', yAxisIndex: 1, data: driftSpend, lineStyle: {{ color: '#f59e0b' }}, itemStyle: {{ color: '#f59e0b' }} }},
-        {{ name: 'ROI MAPE%', type: 'line', yAxisIndex: 1, data: driftRoi, lineStyle: {{ color: '#10b981' }}, itemStyle: {{ color: '#10b981' }} }},
+        {{ name: '数据滞后(天)', type: 'bar', data: behind }},
+        {{ name: 'Spend MAPE%', type: 'line', yAxisIndex: 1, data: driftSpend }},
+        {{ name: 'ROI MAPE%', type: 'line', yAxisIndex: 1, data: driftRoi }},
       ],
     }});
   }} catch(e) {{}}
