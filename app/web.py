@@ -1640,7 +1640,7 @@ function renderChartSeries(data, unit, target) {{
         return html;
       }}
     }},
-    legend: {{ bottom: 8 }},
+    legend: {{ top: 4, left: 260 }},
     title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
     grid: {{ left: 64, right: 28, top: 48, bottom: 60 }},
     xAxis: {{ type: 'category', data: dates }},
@@ -2019,7 +2019,7 @@ async function loadDailyRevenueChart() {{
     color: ['#16a34a', '#2563eb'],
     title: {{ text: '每日买量收入（D1 + Carryover）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
     tooltip: {{ trigger: 'axis' }},
-    legend: {{ data: ['实际总收入', '预测总收入'], bottom: 8 }},
+    legend: {{ data: ['实际总收入', '预测总收入'], top: 4, left: 200 }},
     grid: {{ left: 64, right: 28, top: 48, bottom: 56 }},
     xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
     yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
@@ -2039,7 +2039,7 @@ async function loadDailyRevenueChart() {{
     color: ['#dc2626', '#f59e0b'],
     title: {{ text: 'Carryover 尾量（仅释放曲线预测部分）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
     tooltip: {{ trigger: 'axis' }},
-    legend: {{ data: ['实际Carryover', '预测Carryover'], bottom: 8 }},
+    legend: {{ data: ['实际Carryover', '预测Carryover'], top: 4, left: 200 }},
     grid: {{ left: 64, right: 28, top: 48, bottom: 56 }},
     xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
     yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
@@ -2363,7 +2363,7 @@ async function loadHealthTrend() {{
     healthTrendChart.setOption({{
       color: ['#94a3b8', '#f59e0b', '#10b981'],
       tooltip: {{ trigger: 'axis' }},
-      legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], bottom: 8 }},
+      legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], top: 4, left: 200 }},
       grid: {{ left: 64, right: 28, top: 48, bottom: 60 }},
       xAxis: {{ type: 'category', data: dates }},
       yAxis: [
