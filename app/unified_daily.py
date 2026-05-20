@@ -179,20 +179,28 @@ def _build_cohort_features(raw: pd.DataFrame) -> pd.DataFrame:
     # 预计算加权列（避免 agg 内用 apply）
     active["_spend_times_age"] = active["消耗金额"] * active["cohort_age_days"].clip(lower=0)
 
-    # age bucket tags
+    # age bucket tags：对齐 D7/D30 里程碑
+    # young(<7): ramp-up 期，ROI 波动大但含领先信号
+    # mid(7-30): 稳定期，ROI 最具代表性
+    # mature(>=30): 成熟期，ROI 最稳定，反映长期质量
     active["_is_young"] = (
-        (active["cohort_age_days"] >= 0) & (active["cohort_age_days"] < 3)
+        (active["cohort_age_days"] >= 0) & (active["cohort_age_days"] < 7)
     ).astype(float)
-    active["_is_mature"] = (active["cohort_age_days"] >= 7).astype(float)
+    active["_is_mid"] = (
+        (active["cohort_age_days"] >= 7) & (active["cohort_age_days"] < 30)
+    ).astype(float)
+    active["_is_mature"] = (active["cohort_age_days"] >= 30).astype(float)
 
     active["_young_spend"] = active["_is_young"] * active["消耗金额"]
     active["_mature_spend"] = active["_is_mature"] * active["消耗金额"]
 
-    # ROI 加权列
+    # ROI 加权列（三个年龄段）
     roi_filled = active["cohort_roi_d1"].fillna(0.0)
     active["_young_roi_wt"] = active["_is_young"] * roi_filled * active["消耗金额"]
+    active["_mid_roi_wt"] = active["_is_mid"] * roi_filled * active["消耗金额"]
     active["_mature_roi_wt"] = active["_is_mature"] * roi_filled * active["消耗金额"]
     active["_young_spend_wt"] = active["_is_young"] * active["消耗金额"]
+    active["_mid_spend_wt"] = active["_is_mid"] * active["消耗金额"]
     active["_mature_spend_wt"] = active["_is_mature"] * active["消耗金额"]
 
     # 集中度：top3 share 需要先排序
@@ -211,9 +219,11 @@ def _build_cohort_features(raw: pd.DataFrame) -> pd.DataFrame:
         cohort_young_spend_ratio=("_young_spend", "sum"),
         cohort_mature_spend_ratio=("_mature_spend", "sum"),
         cohort_young_roi_d1=("_young_roi_wt", "sum"),
+        cohort_mid_roi_d1=("_mid_roi_wt", "sum"),
         cohort_mature_roi_d1=("_mature_roi_wt", "sum"),
-        cohort_young_spend=("_young_spend_wt", "sum"),
-        cohort_mature_spend=("_mature_spend_wt", "sum"),
+        _young_spend=("_young_spend_wt", "sum"),
+        _mid_spend=("_mid_spend_wt", "sum"),
+        _mature_spend=("_mature_spend_wt", "sum"),
     )
 
     # 归一化加权年龄
@@ -235,18 +245,36 @@ def _build_cohort_features(raw: pd.DataFrame) -> pd.DataFrame:
         0.0,
     )
 
-    # 归一化加权 ROI
+    # 归一化加权 ROI（三段）
     agg["cohort_young_roi_d1"] = np.where(
-        agg["cohort_young_spend"] > 1e-8,
-        agg["cohort_young_roi_d1"] / agg["cohort_young_spend"],
+        agg["_young_spend"] > 1e-8,
+        agg["cohort_young_roi_d1"] / agg["_young_spend"],
+        np.nan,
+    )
+    agg["cohort_mid_roi_d1"] = np.where(
+        agg["_mid_spend"] > 1e-8,
+        agg["cohort_mid_roi_d1"] / agg["_mid_spend"],
         np.nan,
     )
     agg["cohort_mature_roi_d1"] = np.where(
-        agg["cohort_mature_spend"] > 1e-8,
-        agg["cohort_mature_roi_d1"] / agg["cohort_mature_spend"],
+        agg["_mature_spend"] > 1e-8,
+        agg["cohort_mature_roi_d1"] / agg["_mature_spend"],
         np.nan,
     )
-    agg["cohort_roi_momentum"] = agg["cohort_young_roi_d1"] - agg["cohort_mature_roi_d1"]
+    # ratio 动量（scale-invariant，>1 = 新生优于成熟）
+    agg["cohort_roi_young_vs_mature"] = np.where(
+        (agg["cohort_mature_roi_d1"] > 1e-8),
+        agg["cohort_young_roi_d1"] / agg["cohort_mature_roi_d1"],
+        np.nan,
+    )
+    agg["cohort_roi_young_vs_mid"] = np.where(
+        (agg["cohort_mid_roi_d1"] > 1e-8),
+        agg["cohort_young_roi_d1"] / agg["cohort_mid_roi_d1"],
+        np.nan,
+    )
+    # clip 极端 ratio 防止除零/tiny 分母导致的 outlier
+    agg["cohort_roi_young_vs_mature"] = agg["cohort_roi_young_vs_mature"].clip(0, 5)
+    agg["cohort_roi_young_vs_mid"] = agg["cohort_roi_young_vs_mid"].clip(0, 5)
 
     # top3 合并
     agg = agg.join(top3, on=["应用ID", "日期"])
@@ -258,7 +286,8 @@ def _build_cohort_features(raw: pd.DataFrame) -> pd.DataFrame:
 
     # 删除中间列，只保留特征
     drop_cols = [
-        "_total_spend", "_top3_share", "cohort_young_spend", "cohort_mature_spend",
+        "_total_spend", "_top3_share",
+        "_young_spend", "_mid_spend", "_mature_spend",
     ]
     result = agg.drop(columns=[c for c in drop_cols if c in agg.columns]).reset_index()
 
