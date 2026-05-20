@@ -2267,11 +2267,12 @@ async function loadDataStatus() {{
 
     // Use drift data for MAPE display
     const drift = h.drift || {{}};
-      const dLabels = {{'ok':'正常','warning':'预警','critical':'异常','error':'--'}};
-      bar.innerHTML += '<span>|</span><span>漂移: <b style="color:' + (dColors[drift.overall]||'var(--muted)') + ';">' + (dLabels[drift.overall]||drift.overall) + '</b></span>';
+    if (drift.overall) {{
+      const elSpendMape = document.getElementById('monitorSpendMape');
+      const elRoiMape = document.getElementById('monitorRoiMape');
+      if (elSpendMape) elSpendMape.textContent = 'Spend MAPE: ' + ((drift.spend_mape||0)*100).toFixed(1) + '%';
+      if (elRoiMape) elRoiMape.textContent = 'ROI MAPE: ' + ((drift.roi_mape||0)*100).toFixed(1) + '%';
     }}
-    if (cal.status) {{
-      const cColors = {{'ok':'var(--green)','warning':'#e6a817','error':'var(--red)','unknown':'var(--muted)'}};
   }} catch(e) {{
     console.error('loadDataStatus:', e);
   }}
