@@ -1618,7 +1618,6 @@ function renderChartSeries(data, unit, target) {{
     }});
     series.push(predSeries);
   }}
-  charts.line.clear();
   charts.line.setOption({{
     color: ['#16a34a', '#2563eb', '#f59e0b', '#8ab4f8'],
     tooltip: {{
@@ -1641,15 +1640,14 @@ function renderChartSeries(data, unit, target) {{
         return html;
       }}
     }},
-    legend: {{ top: 8, right: 16 }},
+    legend: {{ bottom: 8 }},
     title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
-    grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
+    grid: {{ left: 64, right: 28, top: 48, bottom: 60 }},
     xAxis: {{ type: 'category', data: dates }},
     yAxis: {{ type: 'value' }},
     dataZoom: [{{type:'inside'}}, {{type:'slider', height: 18, bottom: 12}}],
     series
-  }});
-  charts.scatter.clear();
+  }}, {{notMerge: true}});
   charts.scatter.setOption({{
     color: ['#2563eb'],
     tooltip: {{ formatter: p => `实际：${{fmt(p.value[0], target==='roi'?4:2)}}<br/>预测：${{fmt(p.value[1], target==='roi'?4:2)}}` }},
@@ -1657,8 +1655,7 @@ function renderChartSeries(data, unit, target) {{
     xAxis: {{ type:'value' }},
     yAxis: {{ type:'value' }},
     series: [{{ name:'每日预测校准', type:'scatter', symbolSize: 9, data: data.map(x => [x.actual, x.pred]) }}]
-  }});
-  charts.error.clear();
+  }}, {{notMerge: true}});
   charts.error.setOption({{
     color: ['#dc2626'],
     tooltip: {{ trigger:'axis', valueFormatter: v => fmt(v, 2) + '%' }},
@@ -1667,7 +1664,7 @@ function renderChartSeries(data, unit, target) {{
     yAxis: {{ type:'value' }},
     dataZoom: [{{type:'inside'}}, {{type:'slider', height: 18, bottom: 12}}],
     series: [{{ name:'每日汇总绝对百分比误差', type:'bar', data: data.map(x => x.ape * 100) }}]
-  }});
+  }}, {{notMerge: true}});
 }}
 
 function showAppPopup(appId, rowData, evt) {{
