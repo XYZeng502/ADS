@@ -1440,6 +1440,31 @@ def run_app_level_last_day_prediction(csv_path: Path, output_dir: Path, kpi: flo
 
     _save_per_app_curves(per_app_curves)
 
+    # 三档预算推荐（基于CQR预测区间）
+    cqr_path = output_dir / "experiments" / "exp_01c_cqr" / "predictions_XGBoost_CQR.csv"
+    if cqr_path.exists():
+        cqr_rows: Dict[str, dict] = {}
+        with cqr_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                app_id = str(row.get("应用ID", ""))
+                day = str(row.get("日期", ""))
+                if app_id and day and (app_id not in cqr_rows or day >= cqr_rows[app_id].get("日期", "")):
+                    cqr_rows[app_id] = row
+        if cqr_rows:
+            tiered_path = output_dir / "tiered_budget_recommendations.csv"
+            with tiered_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["应用ID", "保守预算(P05)", "中性预算(P50)", "激进预算(P95)"])
+                for app_id in sorted(cqr_rows.keys()):
+                    row = cqr_rows[app_id]
+                    writer.writerow([
+                        app_id,
+                        round(float(row.get("y_lower", 0)), 2),
+                        round(float(row.get("y_pred", 0)), 2),
+                        round(float(row.get("y_upper", 0)), 2),
+                    ])
+
     return {
         "summary_file": str(summary_file),
         "suggestion_file": str(detail_file),

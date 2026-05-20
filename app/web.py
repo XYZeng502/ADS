@@ -343,6 +343,20 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "source": str(app_month_roi_path.resolve()) if app_month_roi_path.exists() else "",
         },
     }
+
+    # 合并三档预算推荐数据（CQR 区间）
+    tiered_path = root / "tiered_budget_recommendations.csv"
+    if tiered_path.exists():
+        tiered_rows = _read_csv(tiered_path, 5000)
+        tiered_map = {r.get("应用ID", ""): r for r in tiered_rows if r.get("应用ID")}
+        for row in payload["app_month_roi"]["rows"]:
+            tid = row.get("app_id", "")
+            if tid in tiered_map:
+                t = tiered_map[tid]
+                row["conservative_budget"] = t.get("保守预算(P05)", "")
+                row["neutral_budget"] = t.get("中性预算(P50)", "")
+                row["aggressive_budget"] = t.get("激进预算(P95)", "")
+
     return payload
 
 
@@ -967,6 +981,9 @@ function appMonthRoiRows() {{
       topSuggestionsRaw: r.top_suggestions || '',
       alertsRaw: r.alerts || '',
       trainDays: num(r.train_days),
+      conservativeBudget: num(r.conservative_budget),
+      neutralBudget: num(r.neutral_budget),
+      aggressiveBudget: num(r.aggressive_budget),
       roiGap: monthEndRoi - kpi,
     }};
     const decision = appRoiDecision(row);
@@ -1074,6 +1091,9 @@ function renderAppMonthRoiTable() {{
     ['spendT1Calibrated', 'T+1 Spend(校准)'],
     ['roiD1T1Calibrated', 'T+1 ROI_D1(校准)'],
     ['priorityScore', '处理优先级'],
+    ['conservativeBudget', '保守预算(P05)'],
+    ['neutralBudget', '中性预算(P50)'],
+    ['aggressiveBudget', '激进预算(P95)'],
   ];
   const headEl = document.getElementById('appRoiHead');
   const bodyEl = document.getElementById('appRoiBody');
@@ -1120,6 +1140,9 @@ function renderAppMonthRoiTable() {{
       <td>${{fmt(r.spendT1Calibrated,2)}}</td>
       <td>${{fmt(r.roiD1T1Calibrated,4)}}</td>
       <td>${{fmt(r.priorityScore,2)}}</td>
+      <td>${{r.conservativeBudget ? fmt(r.conservativeBudget,2) : '-'}}</td>
+      <td>${{r.neutralBudget ? fmt(r.neutralBudget,2) : '-'}}</td>
+      <td>${{r.aggressiveBudget ? fmt(r.aggressiveBudget,2) : '-'}}</td>
     </tr>`;
   }}).join('');
 
