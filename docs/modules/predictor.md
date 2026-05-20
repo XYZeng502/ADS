@@ -1,44 +1,37 @@
-# 预测模块（PredictorService）
+# 多维预测模块
 
 ## 位置
 
-- `app/services/predictor.py`
+- `app/services/predictor.py`: 释放曲线 + 月末 ROI 推算
+- `app/experiments/core.py`: T+1 模型训练核心 + CQR 区间校准
+- `scripts/run_parallel_models_spend_t1.py`: Spend T+1 训练
+- `scripts/run_parallel_models_roi_d1.py`: ROI T+1 训练
 
-## 职责
+## 预测能力
 
-- 估计当日“历史 cohort 释放回收”
-- 预测月末 ROI 与月末规模
-- 输出偏差归因（SPEND / D1_ANCHOR / CURVE）
+| 预测目标 | 模型 | 指标 | 输出 |
+|---------|------|------|------|
+| T+1 Spend | XGBoost log1p | MAPE ~58% | 点预测 |
+| T+1 Spend 区间 | CQR 分桶校准 | 覆盖率 75% | P05/P50/P95 |
+| T+1 ROI D1 | XGBoost | MAPE ~35% | 首日回收率 |
+| 30 天释放曲线 | 倍率模板 | per-app | 日级乘数 |
+| 每日买量收入 | 释放曲线反向 | - | 预测 vs 实际 |
 
-## 月末 ROI 口径（当前实现）
+## CQR 区间原理
 
-- 分母：当月累计消耗 + 剩余期预测消耗
-- 分子：当月 cohort 在月内可释放回收（最多观察 30 天增量）
-- 跨月处理：只计“当月内可归属部分”
-- 不使用“买量总收入”作为核心评估分子
+1. 训练 3 个分位数 XGBoost (P05/P50/P95)
+2. 按 app 历史 spend 分 Q1-Q4 四桶
+3. 每桶独立 Conformalized Quantile Regression 校准
+4. 输出 [y_lower, y_pred, y_upper]
 
-## 与离线 roi_d1 脚本对齐
+业务用途：保守(P05) / 中性(P50) / 激进(P95) 三档预算决策。
 
-- 离线默认：`run_parallel_models_roi_d1_by_flow.py` 使用细粒度零消耗清洗后，在 **应用ID + 推广流量名称** 上训练/评估；在线服务中槽位级信号经 **消耗加权** 融合后，与上述「按流量权重看 D1」一致。
-- 求解器内产品内参考 D1 汇总方式见 `docs/modules/solver.md`（`solver_slot_d1_normalize_mode`）。
+## 关键参数
 
-## 核心组件
-
-- D1锚点：近期真实D1 + 预测D1 + 槽位加权信号融合
-- 释放曲线：可读取外部曲线 CSV，缺失回退默认模板
-- 花费轨迹：结合日历窗口（节假日/暑寒假/周末）调整
-
-## 输出
-
-- `month_end_roi`
-- `month_total_scale_forecast`
-- `roi_forecast_attribution`
-
-## 已落地价值
-
-- 已能解释“为什么偏差大”，而非只给单点结果。
-
-## 待优化方向
-
-- 增加“产品族群模板曲线”而非单模板。
-- 引入不确定性区间（P25/P50/P75）用于风险边界策略。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| min_train_days | 20 | 最少历史天数 |
+| min_spend_train | 2.0 | 最低消耗过滤 |
+| weight_exponent | 0.35 | 权重 spend^exponent |
+| eval_recent_days | 40 | 评估窗口 |
+| q4_confidence | 0.85 | CQR Q4 覆盖率 |
