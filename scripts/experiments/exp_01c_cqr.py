@@ -145,7 +145,6 @@ def _assign_static_bucket_label(df):
     train_holdout = df["target_t1_spend"] if "target_t1_spend" in df.columns else df["消耗金额"]
     app_avg = df.groupby("应用ID")[train_holdout.name].transform("mean")
     return pd.qcut(app_avg, q=4, labels=["Q1_low", "Q2", "Q3", "Q4_high"])
-    })
 
 
 def main():
