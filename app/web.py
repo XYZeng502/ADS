@@ -1618,6 +1618,7 @@ function renderChartSeries(data, unit, target) {{
     series.push(predSeries);
   }}
   charts.line.setOption({{
+    notMerge: true,
     color: ['#16a34a', '#2563eb', '#f59e0b', '#8ab4f8'],
     tooltip: {{
       trigger: 'axis',
@@ -1648,6 +1649,7 @@ function renderChartSeries(data, unit, target) {{
     series
   }});
   charts.scatter.setOption({{
+    notMerge: true,
     color: ['#2563eb'],
     tooltip: {{ formatter: p => `实际：${{fmt(p.value[0], target==='roi'?4:2)}}<br/>预测：${{fmt(p.value[1], target==='roi'?4:2)}}` }},
     grid: {{ left: 62, right: 24, top: 36, bottom: 54 }},
@@ -1656,6 +1658,7 @@ function renderChartSeries(data, unit, target) {{
     series: [{{ name:'每日预测校准', type:'scatter', symbolSize: 9, data: data.map(x => [x.actual, x.pred]) }}]
   }});
   charts.error.setOption({{
+    notMerge: true,
     color: ['#dc2626'],
     tooltip: {{ trigger:'axis', valueFormatter: v => fmt(v, 2) + '%' }},
     grid: {{ left: 64, right: 28, top: 36, bottom: 55 }},
