@@ -264,14 +264,18 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     spend_predictions = _read_csv_rows(spend_pred_path, 50000, from_end=True)
 
     # CQR interval predictions
-    cqr_path = spend_dir / "predictions_XGBoost_CQR.csv" if spend_dir else None
-    cqr_predictions = None
+    cqr_predictions = None       # aggregate by date (for total chart band)
+    cqr_by_app_date = None       # per-app: {app_id: {date: {y_pred, y_lower, y_upper}}}
     cqr_coverage = None
+    cqr_path = spend_dir / "predictions_XGBoost_CQR.csv" if spend_dir else None
     if cqr_path and cqr_path.exists():
         cqr_raw = _read_csv_rows(cqr_path, 50000, from_end=True)
+        # Total aggregate per date
         cqr_by_date: dict[str, dict] = {}
+        cqr_app_map: dict[str, dict] = {}
         for row in cqr_raw:
             day = str(row.get("日期", ""))[:10]
+            app = str(row.get("应用ID", ""))
             if not day:
                 continue
             if day not in cqr_by_date:
@@ -279,7 +283,16 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             cqr_by_date[day]["y_pred"] += float(row.get("y_pred", 0))
             cqr_by_date[day]["y_lower"] += float(row.get("y_lower", 0))
             cqr_by_date[day]["y_upper"] += float(row.get("y_upper", 0))
+            # Per-app
+            if app not in cqr_app_map:
+                cqr_app_map[app] = {}
+            cqr_app_map[app][day] = {
+                "y_pred": float(row.get("y_pred", 0)),
+                "y_lower": float(row.get("y_lower", 0)),
+                "y_upper": float(row.get("y_upper", 0)),
+            }
         cqr_predictions = cqr_by_date
+        cqr_by_app_date = cqr_app_map
         report = _read_json(spend_dir / "report.json") if spend_dir else {}
         cqr_report = report.get("cqr", {})
         cqr_coverage = cqr_report.get("coverage")
@@ -327,6 +340,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "prediction_file": str(spend_pred_path.resolve()) if spend_pred_path and spend_pred_path.exists() else "",
             "baseline_predictions": _read_csv_rows(old_spend_path, 20000, from_end=True),
             "cqr_predictions": cqr_predictions,
+            "cqr_by_app_date": cqr_by_app_date,
             "cqr_coverage": cqr_coverage,
             "calendar": spend_calendar,
             "source": str(spend_dir) if spend_dir else "",
@@ -853,6 +867,9 @@ function rowsForTarget(target) {{
     if (cal.target_holiday_name) flags.push(cal.target_holiday_name);
     if (Number(cal.target_is_last_holiday_day) === 1) flags.push('假期最后一天');
     if (Number(cal.target_is_first_workday_after_holiday) === 1) flags.push('节后首个工作日');
+    // Merge CQR per-app interval data
+    const cqrApp = (payload.spend.cqr_by_app_date || {{}})[r.app] || {{}};
+    const cqrDay = cqrApp[r.date] || null;
     return {{
       ...r,
       oldPred: Number.isFinite(old.pred) ? old.pred : null,
@@ -861,6 +878,8 @@ function rowsForTarget(target) {{
       improvement: Number.isFinite(oldApe) && Number.isFinite(newApe) ? oldApe - newApe : null,
       targetDate: cal.target_date || '',
       calendarLabel: flags.join(' / ') || (cal.target_day_type || '-'),
+      cqrLower: cqrDay ? cqrDay.y_lower : null,
+      cqrUpper: cqrDay ? cqrDay.y_upper : null,
     }};
   }});
 }}
@@ -1231,7 +1250,7 @@ function loadAppDetail() {{
   const {{ appId, page, limit }} = detailState;
   if (!appId) {{ renderTable(currentRows()); return; }}
   const offset = page * limit;
-  document.getElementById('detailBody').innerHTML = '<tr><td colspan="10" style="text-align:center;padding:20px;">加载中…</td></tr>';
+  document.getElementById('detailBody').innerHTML = '<tr><td colspan="11" style="text-align:center;padding:20px;">加载中…</td></tr>';
   fetch(`/web/data/${{target}}/app/${{encodeURIComponent(appId)}}?offset=${{offset}}&limit=${{limit}}`)
     .then(r => r.json())
     .then(data => {{
@@ -1239,7 +1258,7 @@ function loadAppDetail() {{
       renderDetailTable(target, data.rows, data.total, data.offset, data.limit);
     }})
     .catch(() => {{
-      document.getElementById('detailBody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--red);padding:20px;">加载失败，请重试</td></tr>';
+      document.getElementById('detailBody').innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--red);padding:20px;">加载失败，请重试</td></tr>';
     }});
 }}
 
@@ -1248,7 +1267,7 @@ function renderDetailTable(target, rows, total, offset, limit) {{
   const headers = target === 'roi'
     ? [['日期','日期'],['应用ID','应用ID'],['y_true','实际 ROI_D1'],['y_pred','预测 ROI_D1'],['ape','APE'],['model','模型']]
     : [['日期','日期'],['target_date','T+1日期'],['calendar_label','日历标签'],['应用ID','应用ID'],['y_true','实际 Spend'],
-       ['y_pred','新版预测'],['y_pred_old','旧版预测'],['ape','APE'],['model','模型']];
+       ['cqr_lower','CQR下限(P05)'],['y_pred','预测(P50)'],['cqr_upper','CQR上限(P95)'],['y_pred_old','旧版预测'],['ape','APE'],['model','模型']];
   document.getElementById('detailHead').innerHTML = '<tr>' + headers.map(([key, name]) => {{
     return `<th>${{name}}</th>`;
   }}).join('') + '</tr>';
@@ -1265,7 +1284,9 @@ function renderDetailTable(target, rows, total, offset, limit) {{
     const oldApe = y > 1e-8 && Number.isFinite(oldPred) ? Math.abs((y - oldPred) / y) : null;
     const improvement = Number.isFinite(oldApe) && ape !== null ? oldApe - ape : null;
     const impCls = Number.isFinite(improvement) && improvement >= 0 ? 'good' : 'bad';
-    return `<tr><td>${{date}}</td><td>${{r.target_date || '-'}}</td><td>${{r.calendar_label || '-'}}</td><td>${{app}}</td><td>${{fmt(y,digits)}}</td><td>${{fmt(p,digits)}}</td><td>${{fmt(oldPred,digits)}}</td><td class="${{cls}}">${{pct(ape)}}</td><td>${{r.model || '-'}}</td></tr>`;
+    const cqrLo = Number.isFinite(r.cqrLower) ? fmt(r.cqrLower, digits) : '-';
+    const cqrHi = Number.isFinite(r.cqrUpper) ? fmt(r.cqrUpper, digits) : '-';
+    return `<tr><td>${{date}}</td><td>${{r.target_date || '-'}}</td><td>${{r.calendar_label || '-'}}</td><td>${{app}}</td><td>${{fmt(y,digits)}}</td><td>${{cqrLo}}</td><td>${{fmt(p,digits)}}</td><td>${{cqrHi}}</td><td>${{fmt(oldPred,digits)}}</td><td class="${{cls}}">${{pct(ape)}}</td><td>${{r.model || '-'}}</td></tr>`;
   }}).join('');
   const currentPage = Math.floor(offset / Math.max(limit, 1));
   const totalPages = Math.max(1, Math.ceil(total / limit));
@@ -1592,31 +1613,43 @@ function renderChartSeries(data, unit, target) {{
     {{ name: actualName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.actual) }},
     {{ name: predName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.pred) }},
   ];
-  // CQR prediction interval bands for spend chart (all-apps only, CQR data is aggregated)
-  if (target === 'spend' && !selectedAppId && payload.spend.cqr_predictions) {{
-    const cqrData = payload.spend.cqr_predictions;
-    const cqrLower = dates.map(d => cqrData[d] ? cqrData[d].y_lower : null);
-    const cqrUpper = dates.map(d => cqrData[d] ? cqrData[d].y_upper : null);
-    const cqrPred  = dates.map(d => cqrData[d] ? cqrData[d].y_pred  : null);
-    // remove the predName series so we can re-order
-    const predSeries = series.pop();
-    series.push({{
-      name: '区间下界', type: 'line', data: cqrLower,
-      lineStyle: {{opacity: 0}}, stack: 'cqr-band', symbol: 'none',
-      silent: true, emphasis: {{disabled: true}},
-    }});
-    series.push({{
-      name: '预测区间(P05-P95)', type: 'line', data: cqrUpper,
-      lineStyle: {{opacity: 0}},
-      areaStyle: {{color: 'rgba(66,133,244,0.15)'}},
-      stack: 'cqr-band', symbol: 'none', silent: true,
-    }});
-    series.push({{
-      name: '预测值(CQR-P50)', type: 'line', data: cqrPred,
-      lineStyle: {{width: 2, type: 'dashed', color: '#4285f4'}},
-      itemStyle: {{color: '#4285f4'}}, symbol: 'none',
-    }});
-    series.push(predSeries);
+  // CQR prediction interval bands for spend chart
+  if (target === 'spend' && payload.spend.cqr_predictions) {{
+    let cqrLower, cqrUpper, cqrPred;
+    if (selectedAppId && payload.spend.cqr_by_app_date) {{
+      // Per-app CQR
+      const appCqr = payload.spend.cqr_by_app_date[selectedAppId] || {{}};
+      cqrLower = dates.map(d => appCqr[d] ? appCqr[d].y_lower : null);
+      cqrUpper = dates.map(d => appCqr[d] ? appCqr[d].y_upper : null);
+      cqrPred  = dates.map(d => appCqr[d] ? appCqr[d].y_pred  : null);
+    }} else {{
+      // Aggregate CQR
+      const cqrData = payload.spend.cqr_predictions;
+      cqrLower = dates.map(d => cqrData[d] ? cqrData[d].y_lower : null);
+      cqrUpper = dates.map(d => cqrData[d] ? cqrData[d].y_upper : null);
+      cqrPred  = dates.map(d => cqrData[d] ? cqrData[d].y_pred  : null);
+    }}
+    const hasCqr = cqrLower.some(v => v !== null);
+    if (hasCqr) {{
+      const predSeries = series.pop();
+      series.push({{
+        name: '区间下界', type: 'line', data: cqrLower,
+        lineStyle: {{opacity: 0}}, stack: 'cqr-band', symbol: 'none',
+        silent: true, emphasis: {{disabled: true}},
+      }});
+      series.push({{
+        name: '预测区间(P05-P95)', type: 'line', data: cqrUpper,
+        lineStyle: {{opacity: 0}},
+        areaStyle: {{color: 'rgba(66,133,244,0.15)'}},
+        stack: 'cqr-band', symbol: 'none', silent: true,
+      }});
+      series.push({{
+        name: '预测值(CQR-P50)', type: 'line', data: cqrPred,
+        lineStyle: {{width: 2, type: 'dashed', color: '#4285f4'}},
+        itemStyle: {{color: '#4285f4'}}, symbol: 'none',
+      }});
+      series.push(predSeries);
+    }}
   }}
   charts.line.setOption({{
     color: ['#16a34a', '#2563eb', '#f59e0b', '#8ab4f8'],
@@ -1631,8 +1664,14 @@ function renderChartSeries(data, unit, target) {{
           if (p.seriesName === '预测值(CQR-P50)') {{ cqrVal = p.value; continue; }}
           html += p.marker + p.seriesName + ': ' + fmt(p.value, target === 'roi' ? 4 : 2) + '<br/>';
         }}
-        if (cqrVal !== null && target === 'spend' && payload.spend.cqr_predictions) {{
-          const c = payload.spend.cqr_predictions[params[0].axisValue];
+        if (cqrVal !== null && target === 'spend') {{
+          let c = null;
+          if (selectedAppId && payload.spend.cqr_by_app_date) {{
+            const appCqr = payload.spend.cqr_by_app_date[selectedAppId] || {{}};
+            c = appCqr[params[0].axisValue];
+          }} else if (payload.spend.cqr_predictions) {{
+            c = payload.spend.cqr_predictions[params[0].axisValue];
+          }}
           if (c) {{
             html += '<span style="color:#888;font-size:11px;">预测区间: ' + Math.round(c.y_lower) + ' ~ ' + Math.round(c.y_upper) + '</span><br/>';
           }}
