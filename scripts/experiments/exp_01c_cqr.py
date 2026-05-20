@@ -70,16 +70,15 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
             m.fit(x_proper, y_proper)
         estimators.append(m)
 
-    # CQR calibration — prefit=True because we already fitted the 3 quantile models
+    # CQR calibration — prefit=True: estimators already fitted, use conformalize()
     cqr = ConformalizedQuantileRegressor(
         estimator=estimators,
         confidence_level=TARGET_COVERAGE,
         prefit=True,
     )
-    cqr.fit(x_calib, y_calib)
-
-    # Predict
-    y_pred, y_pis = cqr.predict(x_test)
+    cqr.conformalize(x_calib, y_calib)
+    y_pred, y_pis = cqr.predict_interval(x_test)
+    y_pis = y_pis.squeeze(-1)  # (n, 2, 1) -> (n, 2)
     y_pred = apply_holiday_transition_calibration(test, y_pred)
 
     return pd.DataFrame({
