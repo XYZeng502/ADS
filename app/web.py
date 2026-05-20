@@ -527,13 +527,6 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     <button class="navbtn" id="monitorNav" data-view="monitor">系统监控</button>
   </div>
 
-  <div id="dataStatusBar" style="display:flex;gap:16px;flex-wrap:wrap;padding:8px 16px;background:var(--bg);border:1px solid var(--line);border-radius:12px;margin-bottom:6px;font-size:12px;align-items:center;">
-    <span class="hint">数据状态：</span><span id="dsLoading">加载中...</span>
-  </div>
-  <div id="retrainStatusBar" style="display:flex;gap:12px;flex-wrap:wrap;padding:6px 16px;background:var(--bg);border:1px solid var(--line);border-radius:12px;margin-bottom:12px;font-size:12px;align-items:center;">
-    <span class="hint">重训状态：</span><span id="rsLoading">加载中...</span>
-    <button id="retrainTriggerBtn" onclick="triggerRetrain()" style="margin-left:auto;padding:4px 14px;font-size:11px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:#fff;cursor:pointer;">触发重训</button>
-  </div>
 
   <div class="view" id="view-predict">
   <div class="panel">
@@ -763,6 +756,21 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
 </div>
 
 <div class="view hidden" id="view-monitor">
+  <div class="panel">
+    <div class="section-title"><h2>模型管理</h2></div>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
+      <span style="font-size:13px;">重训状态：</span>
+      <b id="monitorRetrainOverall" style="font-size:14px;">--</b>
+      <span style="color:var(--muted);font-size:12px;" id="monitorRetrainTime"></span>
+      <button onclick="triggerRetrain()" style="margin-left:auto;padding:6px 20px;font-size:13px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer;">触发重训</button>
+    </div>
+    <div class="grid4" style="margin-bottom:8px;">
+      <div class="metric"><div class="k">数据日期</div><div class="v" id="monitorDataDate">--</div><div class="d" id="monitorDataBehind"></div></div>
+      <div class="metric"><div class="k">数据行数</div><div class="v" id="monitorDataRows">--</div><div class="d" id="monitorDataApps"></div></div>
+      <div class="metric"><div class="k">Spend模型</div><div class="v" id="monitorSpendModel">--</div><div class="d" id="monitorSpendMape"></div></div>
+      <div class="metric"><div class="k">ROI模型</div><div class="v" id="monitorRoiModel">--</div><div class="d" id="monitorRoiMape"></div></div>
+    </div>
+  </div>
   <div class="panel">
     <div class="section-title"><h2>告警与健康</h2></div>
     <div class="grid4">
@@ -2234,43 +2242,38 @@ async function loadDataStatus() {{
   try {{
     const resp = await fetch('/health');
     const h = await resp.json();
-    const bar = document.getElementById('dataStatusBar');
-    if (!bar) return;
     const d = h.data || {{}};
+
+    // Update monitor page model management cards
+    const elDate = document.getElementById('monitorDataDate');
+    if (elDate) {{
+      const dsDays = d.days_behind;
+      let daysStyle = dsDays <= 1 ? 'var(--green)' : dsDays <= 3 ? '#e6a817' : 'var(--red)';
+      elDate.innerHTML = '<span style="color:' + daysStyle + ';">' + (d.last_date || 'N/A') + '</span>';
+      const elBehind = document.getElementById('monitorDataBehind');
+      if (elBehind) elBehind.textContent = (dsDays === null ? '未知' : dsDays === 0 ? '今日更新' : '滞后 ' + dsDays + ' 天') + (dsDays > 3 ? ' ⚠' : '');
+    }}
+    const elRows = document.getElementById('monitorDataRows');
+    if (elRows) elRows.textContent = (d.row_count ? (d.row_count/1e4).toFixed(0) + '万' : '--');
+    const elApps = document.getElementById('monitorDataApps');
+    if (elApps) elApps.textContent = d.app_count ? d.app_count + ' apps' : '';
+
+    // Model files
     const m = h.models || {{}};
-    const dsDays = d.days_behind;
-    let daysStyle = dsDays <= 1 ? 'var(--green)' : dsDays <= 3 ? '#e6a817' : 'var(--red)';
-    let daysLabel = dsDays === null ? '未知' : dsDays === 0 ? '今日' : dsDays + '天前';
-    const modelOk = Object.values(m).filter(Boolean).length;
-    const modelTotal = Object.values(m).length;
-    bar.innerHTML = `<span class="hint">数据:</span>`
-      + `<b style="color:${{daysStyle}};">${{d.last_date || 'N/A'}}</b>`
-      + `<span style="color:var(--muted);">(${{daysLabel}})</span>`
-      + `<span>|</span>`
-      + `<span>${{(d.row_count/1e4).toFixed(0)}}万行</span>`
-      + `<span>|</span>`
-      + `<span>${{d.app_count}} apps</span>`
-      + `<span>|</span>`
-      + `<span style="color:var(--muted);">空值: 消耗${{((d.critical_null_rate||{{}})['消耗金额']*100||0).toFixed(1)}}% D1${{((d.critical_null_rate||{{}})['首日广告收入']*100||0).toFixed(1)}}%</span>`
-      + `<span>|</span>`
-      + `<span>模型: <b>${{modelOk}}/${{modelTotal}}</b></span>`
-      + (dsDays > 3 ? '<span style="color:var(--red);margin-left:4px;">⚠ 数据滞后，建议更新 daily_merged.csv</span>' : '');
+    const elSpend = document.getElementById('monitorSpendModel');
+    const elRoi = document.getElementById('monitorRoiModel');
+    if (elSpend) elSpend.textContent = m.spend_t1_predictions ? '已产出' : '缺失';
+    if (elRoi) elRoi.textContent = m.roi_d1_predictions ? '已产出' : '缺失';
+
+    // Use drift data for MAPE display
     const drift = h.drift || {{}};
-    const cal = h.calendar_health || {{}};
-    if (drift.overall) {{
-      const dColors = {{'ok':'var(--green)','warning':'#e6a817','critical':'var(--red)','error':'var(--muted)'}};
       const dLabels = {{'ok':'正常','warning':'预警','critical':'异常','error':'--'}};
       bar.innerHTML += '<span>|</span><span>漂移: <b style="color:' + (dColors[drift.overall]||'var(--muted)') + ';">' + (dLabels[drift.overall]||drift.overall) + '</b></span>';
     }}
     if (cal.status) {{
       const cColors = {{'ok':'var(--green)','warning':'#e6a817','error':'var(--red)','unknown':'var(--muted)'}};
-      const cLabels = {{'ok':'正常','warning':'预警','error':'异常','unknown':'--'}};
-      bar.innerHTML += '<span>|</span><span>日历: <b style="color:' + (cColors[cal.status]||'var(--muted)') + ';">' + (cLabels[cal.status]||cal.status) + '</b>' + (cal.status==='warning'?' (未来30d缺)':'') + '</span>';
-    }}
   }} catch(e) {{
     console.error('loadDataStatus:', e);
-    const el = document.getElementById('dsLoading');
-    if (el) el.textContent = '获取失败';
   }}
 }}
 
@@ -2278,31 +2281,18 @@ async function loadRetrainStatus() {{
   try {{
     const resp = await fetch('/health');
     const h = await resp.json();
-    const bar = document.getElementById('retrainStatusBar');
-    if (!bar || !h.training) return;
+    if (!h.training) return;
     const t = h.training;
-    const btn = document.getElementById('retrainTriggerBtn');
     const statusColors = {{'success': 'var(--green)', 'partial': '#e6a817', 'failed': 'var(--red)', 'running': 'var(--accent)', 'never': 'var(--muted)'}};
     const color = statusColors[t.overall] || 'var(--muted)';
     const labels = {{'success': '全部通过', 'partial': '部分失败', 'failed': '失败', 'running': '运行中', 'never': '无记录'}};
-    const stepLabels = {{'health_check': '数据', 'spend_t1': 'Spend', 'roi_d1': 'ROI', 'app_curves': '曲线', 'daily_revenue': '收入'}};
-    let stepsHtml = (t.steps || []).map(s => {{
-      const sColor = s.status === 'ok' ? 'var(--green)' : s.status === 'failed' ? 'var(--red)' : s.status === 'running' ? 'var(--accent)' : 'var(--muted)';
-      return '<span style="color:' + sColor + ';">' + (stepLabels[s.step] || s.step) + '</span>';
-    }}).join(' <span style="color:var(--muted);">·</span> ');
     const lastRun = t.last_run ? new Date(t.last_run).toLocaleString('zh-CN') : '--';
-    bar.innerHTML = '<span class="hint">重训:</span>'
-      + '<b style="color:' + color + ';">' + (labels[t.overall] || t.overall) + '</b>'
-      + '<span style="color:var(--muted);">(' + lastRun + ')</span>'
-      + (stepsHtml ? '<span>|</span>' + stepsHtml : '');
-    if (btn) {{
-      btn.disabled = t.overall === 'running';
-      btn.style.opacity = t.overall === 'running' ? '0.5' : '1';
-    }}
-  }} catch(e) {{
-    const el = document.getElementById('rsLoading');
-    if (el) el.textContent = '获取失败';
-  }}
+
+    const elOverall = document.getElementById('monitorRetrainOverall');
+    if (elOverall) {{ elOverall.textContent = labels[t.overall] || t.overall; elOverall.style.color = color; }}
+    const elTime = document.getElementById('monitorRetrainTime');
+    if (elTime) elTime.textContent = lastRun !== '--' ? '(' + lastRun + ')' : '';
+  }} catch(e) {{ console.error('loadRetrainStatus:', e); }}
 }}
 
 async function triggerRetrain() {{
