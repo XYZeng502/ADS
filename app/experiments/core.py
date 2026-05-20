@@ -441,3 +441,128 @@ def run(df: pd.DataFrame, min_train_days: int, alpha: float,
         metrics = evaluate(pred_df["y_true"].values, pred_df["y_pred"].values)
         results.append(ModelResult(model_name=name, metrics=metrics, prediction_df=pred_df))
     return results
+
+
+def build_cqr_prediction(pred_q05: pd.DataFrame,
+                         pred_q50: pd.DataFrame,
+                         pred_q95: pd.DataFrame,
+                         weight_exponent: float = 0.35,
+                         q4_confidence: float = 0.85,
+                         random_state: int = 42) -> pd.DataFrame:
+    """Post-hoc CQR calibration on quantile variant predictions.
+
+    Takes three quantile XGBoost prediction DataFrames (from
+    extra_model_variants with alpha=0.05/0.5/0.95), applies per-bucket
+    CQR calibration, and returns a single DataFrame with calibrated
+    point predictions and prediction intervals.
+
+    Args:
+        pred_q05: DataFrame with columns [日期, 应用ID, y_true, y_pred, model]
+        pred_q50: DataFrame with columns [日期, 应用ID, y_true, y_pred, model]
+        pred_q95: DataFrame with columns [日期, 应用ID, y_true, y_pred, model]
+        q4_confidence: Target coverage for Q4 bucket (others use 0.80)
+
+    Returns:
+        DataFrame with columns [日期, 应用ID, y_true, y_pred, y_lower, y_upper, model]
+    """
+    from mapie.regression import ConformalizedQuantileRegressor
+
+    df_q05 = pred_q05.copy()
+    df_q50 = pred_q50.copy()
+    df_q95 = pred_q95.copy()
+
+    # Assign static spend buckets based on overall y_true mean per app
+    all_y_true = pd.concat([
+        df_q05[["日期", "应用ID", "y_true"]],
+        df_q50[["日期", "应用ID", "y_true"]],
+        df_q95[["日期", "应用ID", "y_true"]],
+    ])
+    app_avg = all_y_true.groupby("应用ID")["y_true"].mean()
+    bucket_map = pd.qcut(app_avg, q=4, labels=SPEND_BUCKET_LABELS)
+
+    for df_part in [df_q05, df_q50, df_q95]:
+        df_part["_bucket"] = df_part["应用ID"].map(bucket_map)
+
+    bucket_conf = {b: (q4_confidence if b == "Q4_high" else 0.80)
+                   for b in SPEND_BUCKET_LABELS}
+
+    results = []
+    for dt in sorted(df_q05["日期"].unique()):
+        mask05 = df_q05["日期"] == dt
+        mask50 = df_q50["日期"] == dt
+        mask95 = df_q95["日期"] == dt
+
+        sub05 = df_q05[mask05].set_index("应用ID").sort_index()
+        sub50 = df_q50[mask50].set_index("应用ID").sort_index()
+        sub95 = df_q95[mask95].set_index("应用ID").sort_index()
+
+        common_apps = sub05.index.intersection(sub50.index)
+        common_apps = common_apps.intersection(sub95.index)
+        if len(common_apps) < 5:
+            continue
+
+        n = len(common_apps)
+        y_lower_all = np.full(n, np.nan)
+        y_upper_all = np.full(n, np.nan)
+        y_pred_all = sub50.loc[common_apps, "y_pred"].values
+        y_true_all = sub05.loc[common_apps, "y_true"].values
+        buckets_all = sub05.loc[common_apps, "_bucket"].values
+
+        q_preds = np.column_stack([
+            sub05.loc[common_apps, "y_pred"].values,
+            sub50.loc[common_apps, "y_pred"].values,
+            sub95.loc[common_apps, "y_pred"].values,
+        ])
+        # Ensure non-crossing
+        q_preds = np.sort(q_preds, axis=1)
+
+        for bucket in SPEND_BUCKET_LABELS:
+            bm = buckets_all == bucket
+            if bm.sum() < 10:
+                continue
+
+            q_bucket = q_preds[bm]
+            y_bucket = y_true_all[bm]
+
+            n_b = len(q_bucket)
+            n_calib = max(int(n_b * 0.3), 5)
+            np.random.seed(random_state)
+            perm = np.random.permutation(n_b)
+            x_calib = q_bucket[perm[:n_calib]]
+            y_calib = y_bucket[perm[:n_calib]]
+            x_test = q_bucket[perm[n_calib:]]
+            test_indices = np.where(bm)[0][perm[n_calib:]]
+
+            try:
+                cqr = ConformalizedQuantileRegressor(
+                    estimator=None,
+                    confidence_level=bucket_conf[bucket],
+                )
+                cqr.fit(x_calib, y_calib)
+                _, y_pis = cqr.predict(x_test)
+                y_pis = y_pis.squeeze(-1)
+                y_lower_all[test_indices] = np.min(y_pis, axis=1)
+                y_upper_all[test_indices] = np.max(y_pis, axis=1)
+            except Exception:
+                # Fall back to raw quantile predictions
+                y_lower_all[test_indices] = x_test[:, 0]
+                y_upper_all[test_indices] = x_test[:, 2]
+
+        valid = ~np.isnan(y_lower_all) & ~np.isnan(y_upper_all)
+        if valid.sum() == 0:
+            continue
+
+        results.append(pd.DataFrame({
+            "日期": dt,
+            "应用ID": common_apps[valid],
+            "y_true": y_true_all[valid],
+            "y_pred": np.clip(y_pred_all[valid], 0.0, None),
+            "y_lower": np.clip(y_lower_all[valid], 0.0, None),
+            "y_upper": np.clip(y_upper_all[valid], 0.0, None),
+            "model": "XGBoost_CQR",
+        }))
+
+    if not results:
+        raise ValueError("CQR calibration produced no results.")
+
+    return pd.concat(results, ignore_index=True)
