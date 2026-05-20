@@ -88,6 +88,8 @@ CALENDAR_PACING_FEATURE_COLS = [
     "app_label",
 ]
 
+SPEND_BUCKET_LABELS = ["Q1_low", "Q2", "Q3", "Q4_high"]
+
 
 def feature_cols(feature_set: str = "base") -> List[str]:
     if feature_set == "calendar_pacing":
@@ -175,16 +177,20 @@ def compute_interval_width(lower: np.ndarray, upper: np.ndarray, median: np.ndar
 
 def apply_holiday_transition_calibration(test_df: pd.DataFrame, pred: np.ndarray) -> np.ndarray:
     adjusted = np.asarray(pred, dtype=float).copy()
-    current_spend = pd.to_numeric(test_df["消耗金额"], errors="coerce").fillna(0.0).to_numpy()
-    roll3 = pd.to_numeric(test_df.get("spend_roll_mean_3", 0.0), errors="coerce").fillna(0.0).to_numpy()
-    roll7 = pd.to_numeric(test_df.get("spend_roll_mean_7", 0.0), errors="coerce").fillna(0.0).to_numpy()
+
+    # Batch-convert all columns to numpy once
+    def _col(name, default=0.0, as_bool=False):
+        arr = pd.to_numeric(test_df.get(name, default), errors="coerce").fillna(default).to_numpy()
+        return arr == 1 if as_bool else arr
+
+    current_spend = _col("消耗金额")
+    roll3 = _col("spend_roll_mean_3")
+    roll7 = _col("spend_roll_mean_7")
     recent_ref = np.maximum(current_spend, roll3)
     wider_ref = np.maximum(recent_ref, roll7)
 
-    last_holiday_day = pd.to_numeric(test_df.get("target_is_last_holiday_day", 0), errors="coerce").fillna(0).to_numpy() == 1
-    first_workday_after_holiday = (
-        pd.to_numeric(test_df.get("target_is_first_workday_after_holiday", 0), errors="coerce").fillna(0).to_numpy() == 1
-    )
+    last_holiday_day = _col("target_is_last_holiday_day", as_bool=True)
+    first_workday_after_holiday = _col("target_is_first_workday_after_holiday", as_bool=True)
 
     adjusted[last_holiday_day] = np.maximum(adjusted[last_holiday_day], recent_ref[last_holiday_day] * 0.80)
     adjusted[first_workday_after_holiday] = np.minimum(
@@ -192,13 +198,13 @@ def apply_holiday_transition_calibration(test_df: pd.DataFrame, pred: np.ndarray
         recent_ref[first_workday_after_holiday] * 0.45,
     )
 
-    target_is_holiday = pd.to_numeric(test_df.get("target_is_holiday", 0), errors="coerce").fillna(0).to_numpy() == 1
-    target_is_weekend = pd.to_numeric(test_df.get("target_is_weekend", 0), errors="coerce").fillna(0).to_numpy() == 1
+    target_is_holiday = _col("target_is_holiday", as_bool=True)
+    target_is_weekend = _col("target_is_weekend", as_bool=True)
     mid_holiday_weekday = target_is_holiday & ~target_is_weekend & ~last_holiday_day & ~first_workday_after_holiday
     adjusted[mid_holiday_weekday] = np.maximum(adjusted[mid_holiday_weekday], wider_ref[mid_holiday_weekday] * 0.90)
 
-    target_is_rest_day = pd.to_numeric(test_df.get("target_is_rest_day", 0), errors="coerce").fillna(0).to_numpy() == 1
-    days_since_holiday = pd.to_numeric(test_df.get("target_days_since_prev_holiday", 99), errors="coerce").fillna(99).to_numpy()
+    target_is_rest_day = _col("target_is_rest_day", as_bool=True)
+    days_since_holiday = _col("target_days_since_prev_holiday", default=99.0)
 
     early_ph_rest = target_is_rest_day & ~target_is_holiday & (days_since_holiday >= 3) & (days_since_holiday <= 4)
     adjusted[early_ph_rest] = np.maximum(adjusted[early_ph_rest], wider_ref[early_ph_rest] * 0.90)
@@ -275,12 +281,74 @@ def ewma_spend(train_df: pd.DataFrame, test_df: pd.DataFrame, alpha: float) -> p
     return pd.DataFrame(preds)
 
 
+def assign_spend_bucket(df: pd.DataFrame, value_col: str = "y_true") -> pd.DataFrame:
+    """Assign Q1-Q4 spend buckets based on per-app mean of value_col."""
+    app_avg = df.groupby("应用ID")[value_col].mean().rename("_app_avg_spend")
+    df = df.join(app_avg, on="应用ID")
+    df["spend_bucket"] = pd.qcut(df["_app_avg_spend"], q=4, labels=SPEND_BUCKET_LABELS)
+    return df
+
+
+def compute_expanding_window_encodings(df: pd.DataFrame) -> tuple:
+    """Build expanding-window target encodings (no leakage).
+
+    Returns (model_df, enc_feats) where enc_feats lists the new column names.
+    """
+    spend_col = "target_t1_spend"
+    model_df = df.sort_values(["应用ID", "日期"]).reset_index(drop=True).copy()
+    grp_spend = model_df.groupby("应用ID")[spend_col]
+    model_df["app_avg_spend"] = (
+        grp_spend.cumsum().sub(model_df[spend_col])
+        / grp_spend.cumcount().clip(lower=1)
+    )
+    model_df["app_avg_spend"] = model_df["app_avg_spend"].fillna(model_df[spend_col].median())
+    enc_feats = ["app_avg_spend"]
+    if "roi_d1" in model_df.columns:
+        grp_roi = model_df.groupby("应用ID")["roi_d1"]
+        model_df["app_avg_roi_d1"] = (
+            grp_roi.cumsum().sub(model_df["roi_d1"])
+            / grp_spend.cumcount().clip(lower=1)
+        )
+        model_df["app_avg_roi_d1"] = model_df["app_avg_roi_d1"].fillna(model_df["roi_d1"].median())
+        enc_feats.append("app_avg_roi_d1")
+    return model_df, enc_feats
+
+
+def coverage_verdict(coverage: float, target: float = 0.80,
+                     promising_pp: float = 5.0, inconclusive_pp: float = 15.0) -> str:
+    """Classify experiment result based on coverage error in percentage points."""
+    error = abs((coverage - target) * 100)
+    if error <= promising_pp:
+        return "promising"
+    elif error <= inconclusive_pp:
+        return "inconclusive"
+    return "regress"
+
+
+def walk_forward_windows(model_df, eval_recent_days=20, min_train_days=20):
+    """Generator yielding (train, test, cutoff_date) for walk-forward evaluation."""
+    dates = sorted(model_df["日期"].dropna().unique())
+    cutoffs = list(dates[:-1])
+    if eval_recent_days > 0 and len(cutoffs) > eval_recent_days:
+        cutoffs = cutoffs[-eval_recent_days:]
+    n = len(cutoffs)
+    for i, cutoff in enumerate(cutoffs):
+        t_cutoff = pd.Timestamp(cutoff)
+        next_day = cutoff + np.timedelta64(1, "D")
+        train = model_df[model_df["日期"] <= t_cutoff]
+        test = model_df[model_df["日期"] == next_day]
+        if test.empty or train["日期"].nunique() < min_train_days:
+            continue
+        print(f"  [{i+1}/{n}] cutoff={t_cutoff.date()} train={len(train)} test={len(test)}", flush=True)
+        yield train, test, t_cutoff, next_day
+
+
 def run(df: pd.DataFrame, min_train_days: int, alpha: float,
         use_log_target: bool, feature_set: str = "base",
         min_target_spend_train: float = 0.0, min_target_spend_eval: float = 0.0,
         *, eval_recent_days: Optional[int] = None,
         tree_models: Optional[List[str]] = None,
-        skip_baseline_two_stage: bool = False, use_gpu: bool = False,
+        use_gpu: bool = False,
         weight_exponent: float = 0.35,
         model_overrides: Optional[Dict] = None,
         extra_model_variants: Optional[List[Dict]] = None) -> List[ModelResult]:

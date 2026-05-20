@@ -297,7 +297,6 @@ def main() -> None:
 
     eval_recent: Optional[int] = int(args.eval_recent_days) if args.eval_recent_days > 0 else None
     tree_override: Optional[List[str]] = [x.strip() for x in str(args.tree_models).split(",") if x.strip()] or None
-    skip_bs = True
     if args.fast:
         if eval_recent is None:
             eval_recent = 40
@@ -324,7 +323,6 @@ def main() -> None:
         min_target_spend_eval=float(args.min_target_spend_eval),
         eval_recent_days=eval_recent,
         tree_models=tree_override,
-        skip_baseline_two_stage=skip_bs,
         use_gpu=bool(args.use_gpu),
         weight_exponent=args.weight_exponent,
     )
@@ -377,7 +375,6 @@ def main() -> None:
         "fast_mode": bool(args.fast),
         "eval_recent_days": eval_recent,
         "tree_models": tree_override,
-        "skip_baseline_two_stage": skip_bs,
         "clean_meta": clean_meta,
         "min_spend_train": 2.0,
         "feature_set": args.feature_set,

@@ -23,19 +23,17 @@ from app.experiments.core import (
     build_model,
     feature_cols,
     apply_holiday_transition_calibration,
+    assign_spend_bucket,
+    compute_expanding_window_encodings,
+    walk_forward_windows,
+    coverage_verdict,
+    SPEND_BUCKET_LABELS,
 )
 from app.unified_daily import build_unified_daily
 from app.prediction_artifacts import validate_merged_daily_csv
 
 EXPERIMENT_NAME = "exp_01c_cqr"
 TARGET_COVERAGE = 0.80
-
-
-def _assign_spend_bucket(df: pd.DataFrame) -> pd.DataFrame:
-    app_avg = df.groupby("应用ID")["y_true"].mean().rename("app_avg_spend")
-    df = df.join(app_avg, on="应用ID")
-    df["spend_bucket"] = pd.qcut(df["app_avg_spend"], q=4, labels=["Q1_low", "Q2", "Q3", "Q4_high"])
-    return df
 
 
 def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
@@ -162,40 +160,11 @@ def main():
     df, _ = build_unified_daily(args.input, min_spend_train=2.0)
     feats = feature_cols("base")
 
-    model_df = df.sort_values(["应用ID", "日期"]).reset_index(drop=True).copy()
-    grp_spend = model_df.groupby("应用ID")["target_t1_spend"]
-    model_df["app_avg_spend"] = (
-        grp_spend.cumsum().sub(model_df["target_t1_spend"])
-        / grp_spend.cumcount().clip(lower=1)
-    )
-    model_df["app_avg_spend"] = model_df["app_avg_spend"].fillna(model_df["target_t1_spend"].median())
-    if "roi_d1" in model_df.columns:
-        grp_roi = model_df.groupby("应用ID")["roi_d1"]
-        model_df["app_avg_roi_d1"] = (
-            grp_roi.cumsum().sub(model_df["roi_d1"])
-            / grp_spend.cumcount().clip(lower=1)
-        )
-        model_df["app_avg_roi_d1"] = model_df["app_avg_roi_d1"].fillna(model_df["roi_d1"].median())
-        feats_all = feats + ["app_avg_spend", "app_avg_roi_d1"]
-    else:
-        feats_all = feats + ["app_avg_spend"]
-
-    dates = sorted(model_df["日期"].dropna().unique())
-    cutoffs = list(dates[:-1])
-    eval_recent = args.eval_recent_days
-    if eval_recent > 0 and len(cutoffs) > eval_recent:
-        cutoffs = cutoffs[-eval_recent:]
+    model_df, enc_feats = compute_expanding_window_encodings(df)
+    feats_all = feats + enc_feats
 
     all_preds = []
-    n_cutoffs = len(cutoffs)
-    for i, cutoff in enumerate(cutoffs):
-        t_cutoff = pd.Timestamp(cutoff)
-        next_day = cutoff + np.timedelta64(1, "D")
-        train = model_df[model_df["日期"] <= t_cutoff].copy()
-        test = model_df[model_df["日期"] == next_day].copy()
-        if test.empty or train["日期"].nunique() < 20:
-            continue
-        print(f"  [{i+1}/{n_cutoffs}] cutoff={t_cutoff.date()} train={len(train)} test={len(test)}", flush=True)
+    for train, test, _, _ in walk_forward_windows(model_df, args.eval_recent_days):
         pred_df = _train_cqr_predict(train, test, feats_all, args.weight_exponent, use_gpu=False)
         if pred_df is not None and not pred_df.empty:
             all_preds.append(pred_df)
@@ -204,7 +173,7 @@ def main():
         raise ValueError("No results.")
 
     pred_df = pd.concat(all_preds, ignore_index=True)
-    pred_df = _assign_spend_bucket(pred_df)
+    pred_df = assign_spend_bucket(pred_df)
 
     y_true = pred_df["y_true"].values
     y_lower = pred_df["y_lower"].values
@@ -216,7 +185,7 @@ def main():
     point_metrics = evaluate(y_true, y_pred)
 
     bucket_stats = {}
-    for bucket in ["Q1_low", "Q2", "Q3", "Q4_high"]:
+    for bucket in SPEND_BUCKET_LABELS:
         b = pred_df[pred_df["spend_bucket"] == bucket]
         if b.empty:
             continue
@@ -229,10 +198,8 @@ def main():
             "mape_pct": round(evaluate(b["y_true"].values, b["y_pred"].values)["mape_pct"], 2),
         }
 
-    coverage_err = abs(coverage - TARGET_COVERAGE)
-    verdict = "promising" if coverage_err <= 0.05 else ("inconclusive" if coverage_err <= 0.15 else "regress")
+    verdict = coverage_verdict(coverage, TARGET_COVERAGE)
 
-    # Heteroscedasticity score: stddev of per-bucket coverage (lower = more balanced)
     bucket_coverages = [s["coverage"] for s in bucket_stats.values()]
     het_score = float(np.std(bucket_coverages)) if len(bucket_coverages) > 1 else 0.0
 
@@ -244,7 +211,7 @@ def main():
         "config": {"eval_recent_days": args.eval_recent_days, "weight_exponent": args.weight_exponent},
         "metrics": {
             "coverage": round(coverage, 4),
-            "coverage_error_pp": round(coverage_err * 100, 2),
+            "coverage_error_pp": round(abs(coverage - TARGET_COVERAGE) * 100, 2),
             "interval_width_median": round(width_median, 4),
             "mape_pct": round(point_metrics["mape_pct"], 2),
             "heteroscedasticity_score": round(het_score, 4),
