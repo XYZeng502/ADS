@@ -1642,9 +1642,9 @@ function renderChartSeries(data, unit, target) {{
     }},
     legend: {{ top: 4, left: 260 }},
     title: {{ text: (target === 'roi' ? 'T+1 ROI_D1' : 'T+1 Spend') + titleSuffix, left: 16, top: 6, textStyle: {{fontSize:14}} }},
-    grid: {{ left: 64, right: 28, top: 48, bottom: 60 }},
+    grid: {{ left: 72, right: 28, top: 48, bottom: 60 }},
     xAxis: {{ type: 'category', data: dates }},
-    yAxis: {{ type: 'value' }},
+    yAxis: {{ type: 'value', axisLabel: {{ formatter: v => v >= 10000 ? (v/10000).toFixed(1)+'万' : v }} }},
     dataZoom: [{{type:'inside'}}, {{type:'slider', height: 18, bottom: 12}}],
     series
   }}, {{notMerge: true}});
@@ -2020,9 +2020,9 @@ async function loadDailyRevenueChart() {{
     title: {{ text: '每日买量收入（D1 + Carryover）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
     tooltip: {{ trigger: 'axis' }},
     legend: {{ data: ['实际总收入', '预测总收入'], top: 4, left: 200 }},
-    grid: {{ left: 64, right: 28, top: 48, bottom: 56 }},
+    grid: {{ left: 80, right: 28, top: 48, bottom: 56 }},
     xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
-    yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
+    yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10, formatter: v => v >= 10000 ? (v/10000).toFixed(1)+'万' : v }} }},
     dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
     series: [
       {{ name: '实际总收入', type: 'line', data: yTrue, smooth: true,
@@ -2040,9 +2040,9 @@ async function loadDailyRevenueChart() {{
     title: {{ text: 'Carryover 尾量（仅释放曲线预测部分）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
     tooltip: {{ trigger: 'axis' }},
     legend: {{ data: ['实际Carryover', '预测Carryover'], top: 4, left: 200 }},
-    grid: {{ left: 64, right: 28, top: 48, bottom: 56 }},
+    grid: {{ left: 80, right: 28, top: 48, bottom: 56 }},
     xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
-    yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
+    yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10, formatter: v => v >= 10000 ? (v/10000).toFixed(1)+'万' : v }} }},
     dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
     series: [
       {{ name: '实际Carryover', type: 'line', data: coTrue, smooth: true,
@@ -2364,7 +2364,7 @@ async function loadHealthTrend() {{
       color: ['#94a3b8', '#f59e0b', '#10b981'],
       tooltip: {{ trigger: 'axis' }},
       legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], top: 4, left: 200 }},
-      grid: {{ left: 64, right: 28, top: 48, bottom: 60 }},
+      grid: {{ left: 72, right: 28, top: 48, bottom: 60 }},
       xAxis: {{ type: 'category', data: dates }},
       yAxis: [
         {{ type: 'value', min: 0 }},
