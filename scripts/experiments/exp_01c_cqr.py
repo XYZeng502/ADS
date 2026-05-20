@@ -70,10 +70,11 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
             m.fit(x_proper, y_proper)
         estimators.append(m)
 
-    # CQR calibration
+    # CQR calibration — prefit=True because we already fitted the 3 quantile models
     cqr = ConformalizedQuantileRegressor(
         estimator=estimators,
         confidence_level=TARGET_COVERAGE,
+        prefit=True,
     )
     cqr.fit(x_calib, y_calib)
 
