@@ -77,3 +77,4 @@ catboost_info/
 # data：默认忽略；仅保留业务日历配置（CalendarService 依赖）
 /data/*
 !/data/business_calendar_2026.json
+智能预算决策系统_业务场景与问题定义(2).md
