@@ -539,7 +539,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel">
     <div class="controls">
       <label>评估目标
-        <select id="targetSel" onchange="render()">
+        <select id="targetSel">
           <option value="roi">T+1 ROI_D1 预测</option>
           <option value="spend">T+1 Spend 预测</option>
         </select>
@@ -1988,6 +1988,7 @@ function setActiveView(view) {{
   document.getElementById('view-daily-revenue').classList.toggle('hidden', view !== 'daily-revenue');
   document.getElementById('view-monitor').classList.toggle('hidden', view !== 'monitor');
   hideAppPopup(true);
+  if (view === 'predict') {{ render(); }}
   setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') {{ loadDailyRevenueChart(); loadDailyRevenueAppSummary(); }} if (view === 'monitor') loadMonitorView(); }}, 0);
 }}
 document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
