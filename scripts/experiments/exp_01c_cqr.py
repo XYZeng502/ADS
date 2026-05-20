@@ -36,7 +36,7 @@ EXPERIMENT_NAME = "exp_01c_cqr"
 TARGET_COVERAGE = 0.80
 
 
-def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
+def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu, q4_confidence=0.85):
     train = train_df.dropna(subset=feats + ["target_t1_spend"]).copy()
     test = test_df.dropna(subset=feats + ["target_t1_spend"]).copy()
     if train.empty or test.empty or len(train) < 60:
@@ -73,13 +73,12 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
             m.fit(x_proper, y_proper)
         estimators.append(m)
 
-    def _calibrate_and_predict(x_cal, y_cal, x_test_subset):
-        """Calibrate CQR on bucket-specific calibration data and predict."""
+    def _calibrate_and_predict(x_cal, y_cal, x_test_subset, conf_level):
         if len(x_cal) < 20:
-            return None  # too few samples for calibration
+            return None
         cqr = ConformalizedQuantileRegressor(
             estimator=estimators,
-            confidence_level=TARGET_COVERAGE,
+            confidence_level=conf_level,
             prefit=True,
         )
         cqr.conformalize(x_cal, y_cal)
@@ -87,12 +86,13 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
         y_pis = y_pis.squeeze(-1)
         return y_pis
 
-    # Per-bucket calibration + prediction
+    # Per-bucket confidence levels: Q4 gets higher target
+    bucket_conf = {"Q4_high": q4_confidence, "Q3": TARGET_COVERAGE,
+                   "Q2": TARGET_COVERAGE, "Q1_low": TARGET_COVERAGE}
+
     n_test = len(x_test)
     y_pis_all = np.zeros((n_test, 2))
-    y_pred_raw_all = np.zeros(n_test)
 
-    # Use median model for point predictions (same for all buckets)
     y_pred_raw_all = estimators[1].predict(x_test)
 
     test_buckets = test["_bucket"].values
@@ -103,13 +103,14 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
         test_mask = test_buckets == bucket
 
         if not calib_mask.any() or calib_mask.sum() < 20:
-            continue  # skip buckets with too few calibration samples
+            continue
 
         x_cal_bucket = x_calib[calib_mask]
         y_cal_bucket = y_calib[calib_mask]
         x_test_bucket = x_test[test_mask]
 
-        y_pis_bucket = _calibrate_and_predict(x_cal_bucket, y_cal_bucket, x_test_bucket)
+        conf = bucket_conf.get(bucket, TARGET_COVERAGE)
+        y_pis_bucket = _calibrate_and_predict(x_cal_bucket, y_cal_bucket, x_test_bucket, conf)
         if y_pis_bucket is not None:
             y_pis_all[test_mask] = y_pis_bucket
             buckets_used.add(bucket)
@@ -117,7 +118,7 @@ def _train_cqr_predict(train_df, test_df, feats, weight_exponent, use_gpu):
     # Fallback: global CQR for buckets without enough calibration samples
     missing_mask = ~np.array([b in buckets_used for b in test_buckets])
     if missing_mask.any():
-        y_pis_global = _calibrate_and_predict(x_calib, y_calib, x_test[missing_mask])
+        y_pis_global = _calibrate_and_predict(x_calib, y_calib, x_test[missing_mask], TARGET_COVERAGE)
         if y_pis_global is not None:
             y_pis_all[missing_mask] = y_pis_global
 
@@ -150,6 +151,8 @@ def main():
     parser.add_argument("--input", default="daily_merged.csv")
     parser.add_argument("--eval-recent-days", type=int, default=20)
     parser.add_argument("--weight-exponent", type=float, default=0.35)
+    parser.add_argument("--q4-confidence", type=float, default=0.85,
+                        help="Target coverage for Q4 high-spend bucket (default 0.85)")
     args = parser.parse_args()
 
     validate_merged_daily_csv(Path(args.input))
@@ -165,7 +168,7 @@ def main():
 
     all_preds = []
     for train, test, _, _ in walk_forward_windows(model_df, args.eval_recent_days):
-        pred_df = _train_cqr_predict(train, test, feats_all, args.weight_exponent, use_gpu=False)
+        pred_df = _train_cqr_predict(train, test, feats_all, args.weight_exponent, use_gpu=False, q4_confidence=args.q4_confidence)
         if pred_df is not None and not pred_df.empty:
             all_preds.append(pred_df)
 
@@ -208,7 +211,7 @@ def main():
         "method": "ConformalizedQuantileRegressor (MAPIE CQR) + XGBoost",
         "target_coverage": TARGET_COVERAGE,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "config": {"eval_recent_days": args.eval_recent_days, "weight_exponent": args.weight_exponent},
+        "config": {"eval_recent_days": args.eval_recent_days, "weight_exponent": args.weight_exponent, "q4_confidence": args.q4_confidence},
         "metrics": {
             "coverage": round(coverage, 4),
             "coverage_error_pp": round(abs(coverage - TARGET_COVERAGE) * 100, 2),
