@@ -1386,7 +1386,7 @@ function renderBusinessSnapshot() {{
     color: ['#2563eb'],
     tooltip: {{ trigger:'axis' }},
     legend: {{ bottom: 8 }},
-    grid: {{ left: 72, right: 24, top: 36, bottom: 54 }},
+    grid: {{ left: 72, right: 24, top: 36, bottom: 62 }},
     xAxis: {{ type:'category', data:[...factorCounts.keys()] }},
     yAxis: {{ type:'value' }},
     series: [{{ name:'应用数', type:'bar', data:[...factorCounts.values()] }}]
@@ -1752,7 +1752,7 @@ function _renderPopupChart(chart, data, unit, isSpend) {{
       {{ name: predName, type: 'line', smooth: true, symbolSize: 3, data: data.map(x => x.pred) }},
     ],
     color: ['#16a34a', '#2563eb'],
-    legend: {{ top: 8, right: 16, textStyle: {{fontSize:10}} }},
+    legend: {{ bottom: 8, textStyle: {{fontSize:10}} }},
   }});
 }}
 
@@ -2019,8 +2019,8 @@ async function loadDailyRevenueChart() {{
     color: ['#16a34a', '#2563eb'],
     title: {{ text: '每日买量收入（D1 + Carryover）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
     tooltip: {{ trigger: 'axis' }},
-    legend: {{ data: ['实际总收入', '预测总收入'], top: 8, right: 16 }},
-    grid: {{ left: 64, right: 28, top: 48, bottom: 48 }},
+    legend: {{ data: ['实际总收入', '预测总收入'], bottom: 8 }},
+    grid: {{ left: 64, right: 28, top: 48, bottom: 56 }},
     xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
     yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
     dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
@@ -2039,8 +2039,8 @@ async function loadDailyRevenueChart() {{
     color: ['#dc2626', '#f59e0b'],
     title: {{ text: 'Carryover 尾量（仅释放曲线预测部分）', left: 16, top: 4, textStyle: {{ fontSize: 13 }} }},
     tooltip: {{ trigger: 'axis' }},
-    legend: {{ data: ['实际Carryover', '预测Carryover'], top: 8, right: 16 }},
-    grid: {{ left: 64, right: 28, top: 48, bottom: 48 }},
+    legend: {{ data: ['实际Carryover', '预测Carryover'], bottom: 8 }},
+    grid: {{ left: 64, right: 28, top: 48, bottom: 56 }},
     xAxis: {{ type: 'category', data: dates, axisLabel: {{ fontSize: 10 }} }},
     yAxis: {{ type: 'value', axisLabel: {{ fontSize: 10 }} }},
     dataZoom: [{{ type: 'inside' }}, {{ type: 'slider', height: 16, bottom: 8 }}],
@@ -2363,8 +2363,8 @@ async function loadHealthTrend() {{
     healthTrendChart.setOption({{
       color: ['#94a3b8', '#f59e0b', '#10b981'],
       tooltip: {{ trigger: 'axis' }},
-      legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], top: 8, right: 16 }},
-      grid: {{ left: 64, right: 28, top: 58, bottom: 55 }},
+      legend: {{ data: ['数据滞后(天)', 'Spend MAPE%', 'ROI MAPE%'], bottom: 8 }},
+      grid: {{ left: 64, right: 28, top: 48, bottom: 60 }},
       xAxis: {{ type: 'category', data: dates }},
       yAxis: [
         {{ type: 'value', min: 0 }},
@@ -2847,7 +2847,7 @@ def web_recommendation_dashboard():
       chart.setOption({{
         title: {{ text: 'ROI对比（筛选样本）', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
         tooltip: {{ trigger: 'axis' }},
-        legend: {{ top: 24, right: 16, textStyle: {{ color: '#c9d7f5' }} }},
+        legend: {{ bottom: 8, textStyle: {{ color: '#c9d7f5' }} }},
         xAxis: {{ type: 'category', data: x, axisLabel: {{ color: '#a9bddf' }} }},
         yAxis: {{ type: 'value', axisLabel: {{ color: '#a9bddf' }} }},
         series: [
@@ -2884,7 +2884,7 @@ def web_recommendation_dashboard():
       chart.setOption({{
         title: {{ text: '建议预算 vs 实际消耗', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
         tooltip: {{ trigger: 'axis' }},
-        legend: {{ top: 24, right: 16, textStyle: {{ color: '#c9d7f5' }} }},
+        legend: {{ bottom: 8, textStyle: {{ color: '#c9d7f5' }} }},
         xAxis: {{ type: 'category', data: x, axisLabel: {{ color: '#a9bddf', interval: 0, rotate: 30 }} }},
         yAxis: {{ type: 'value', axisLabel: {{ color: '#a9bddf' }} }},
         series: [
@@ -2942,7 +2942,7 @@ def web_recommendation_dashboard():
       chart.setOption({{
         title: {{ text: '阶段成果对比（25天子集）', left: 'center', textStyle: {{ color: '#e8eefc', fontSize: 14 }} }},
         tooltip: {{ trigger: 'axis' }},
-        legend: {{ top: 24, right: 16, textStyle: {{ color: '#c9d7f5' }} }},
+        legend: {{ bottom: 8, textStyle: {{ color: '#c9d7f5' }} }},
         xAxis: {{ type: 'category', data: labels, axisLabel: {{ color: '#a9bddf' }} }},
         yAxis: [
           {{ type: 'value', name: '预测月末ROI', axisLabel: {{ color: '#a9bddf' }} }},
