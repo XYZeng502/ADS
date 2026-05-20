@@ -195,8 +195,7 @@ def _get_base_feature_cols() -> List[str]:
         "cohort_hhi", "cohort_top1_pct", "cohort_top3_pct",
         "cohort_n_active", "cohort_log_n_active", "cohort_new_spend_ratio",
         "cohort_spend_wt_age", "cohort_mature_spend_ratio", "cohort_young_spend_ratio",
-        "cohort_young_roi_d1", "cohort_mid_roi_d1", "cohort_mature_roi_d1",
-        "cohort_roi_young_vs_mature", "cohort_roi_young_vs_mid",
+        "cohort_young_roi_d1", "cohort_mature_roi_d1", "cohort_roi_momentum",
         "app_label",
     ]
 
