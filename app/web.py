@@ -246,6 +246,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     )
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1",
             root / "model_parallel_spend_t1_exp035",
             root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1_v11_001",
@@ -3191,6 +3192,7 @@ def _resolve_prediction_path(target: str) -> Path | None:
         return resolve_roi_predictions_csv(roi_dir)
     spend_dir = _pick_existing(
         [
+            root / "model_parallel_spend_t1",
             root / "model_parallel_spend_t1_exp035",
             root / "model_parallel_spend_t1_v12_unified",
             root / "model_parallel_spend_t1_v11_001",
