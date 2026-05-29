@@ -114,7 +114,7 @@ def _build_composition_features(raw: pd.DataFrame) -> pd.DataFrame:
 
 def build_unified_daily(
     input_csv: str,
-    min_spend_train: float = 2.0,
+    min_spend_train: float = 5.0,
     min_app_days: int = 30,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """构建 ROI / Spend 共享的 应用-日期 底表。

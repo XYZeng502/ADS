@@ -23,12 +23,6 @@ def _extract_app_id(entity_id: str) -> str:
     return s.split("|")[0] if "|" in s else s
 
 
-def _evaluate_with_wmape(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    base = evaluate(y_true, y_pred)
-    wmape = float(np.sum(np.abs(y_true - y_pred)) / max(np.sum(np.abs(y_true)), 1e-8))
-    base["wmape"] = wmape
-    base["wmape_pct"] = wmape * 100.0
-    return base
 
 
 def _build_reconciled_prediction(
@@ -68,9 +62,9 @@ def _build_reconciled_prediction(
     out["y_pred_fused"] = fused_pred
 
     y_true = out["y_true"].values
-    app_metrics = _evaluate_with_wmape(y_true, out["y_pred_app"].values)
-    split_metrics = _evaluate_with_wmape(y_true, out["y_pred_split_agg"].values)
-    fused_metrics = _evaluate_with_wmape(y_true, out["y_pred_fused"].values)
+    app_metrics = evaluate(y_true, out["y_pred_app"].values)
+    split_metrics = evaluate(y_true, out["y_pred_split_agg"].values)
+    fused_metrics = evaluate(y_true, out["y_pred_fused"].values)
     report = {
         "samples": int(len(out)),
         "rule": f"if split_entity_cnt>={int(min_entities)}: fused={w:.2f}*split + {1.0-w:.2f}*app else app",
@@ -170,9 +164,9 @@ def _build_online_reconciled_prediction(
         "samples": int(len(result)),
         "mode": "online_calibrated",
         "min_history_days": int(min_history_days),
-        "app_metrics": _evaluate_with_wmape(y_true, result["y_pred_app"].values),
-        "split_agg_metrics": _evaluate_with_wmape(y_true, result["y_pred_split_agg"].values),
-        "fused_metrics": _evaluate_with_wmape(y_true, result["y_pred_fused"].values),
+        "app_metrics": evaluate(y_true, result["y_pred_app"].values),
+        "split_agg_metrics": evaluate(y_true, result["y_pred_split_agg"].values),
+        "fused_metrics": evaluate(y_true, result["y_pred_fused"].values),
         "choices_tail": choices[-5:],
     }
     return result, report
@@ -328,7 +322,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     df, clean_meta = build_unified_daily(
         args.input,
-        min_spend_train=2.0,
+        min_spend_train=5.0,
     )
     if args.target_type == "ratio":
         df["target_t1_spend"] = df["target_spend_ratio_t1"]
@@ -434,7 +428,7 @@ def main() -> None:
         "eval_recent_days": eval_recent,
         "tree_models": tree_override,
         "clean_meta": clean_meta,
-        "min_spend_train": 2.0,
+        "min_spend_train": 30.0,
         "feature_set": args.feature_set,
         "feature_count": len(feature_cols(args.feature_set)),
         "use_gpu": bool(args.use_gpu),

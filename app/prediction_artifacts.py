@@ -79,6 +79,7 @@ def resolve_spend_predictions_csv(spend_dir: Optional[Path]) -> Optional[Path]:
     metrics = spend_dir / "metrics_summary.csv"
     best = latest_metric_model_name(metrics, "ExtraTrees_log")
     candidates = [
+        spend_dir / "predictions_XGBoost_CQR.csv",  # CQR P50 优于日历校准
         spend_dir / f"predictions_{safe_model_filename(best)}.csv",
         spend_dir / "predictions_reconciled.csv",
         spend_dir / "predictions_LightGBM_log.csv",

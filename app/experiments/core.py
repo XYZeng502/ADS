@@ -158,7 +158,9 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
         float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])))
         if np.any(mask) else np.nan
     )
-    return {"mae": mae, "rmse": rmse, "mape": mape, "mape_pct": mape * 100.0 if np.isfinite(mape) else np.nan}
+    wmape = float(np.sum(np.abs(y_true - y_pred)) / max(np.sum(np.abs(y_true)), 1e-8))
+    return {"mae": mae, "rmse": rmse, "mape": mape, "mape_pct": mape * 100.0 if np.isfinite(mape) else np.nan,
+            "wmape": wmape, "wmape_pct": wmape * 100.0}
 
 
 def evaluate_pinball(y_true: np.ndarray, y_pred: np.ndarray, alpha: float) -> float:

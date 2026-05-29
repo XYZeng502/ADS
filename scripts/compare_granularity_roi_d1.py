@@ -6,7 +6,8 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_squared_error
+from app.experiments.core import evaluate
 from sklearn.linear_model import Ridge
 
 
@@ -161,13 +162,11 @@ def _to_app_level_eval(pred_df: pd.DataFrame) -> pd.DataFrame:
 def _metrics(df: pd.DataFrame, name: str) -> Dict[str, float]:
     y = df["y_true"].values
     p = df["y_pred"].values
-    mask = y > 1e-8
+    metrics = evaluate(y, p)
     return {
         "model": name,
         "samples": int(len(df)),
-        "mae": float(mean_absolute_error(y, p)),
-        "rmse": float(np.sqrt(mean_squared_error(y, p))),
-        "mape": float(np.mean(np.abs((y[mask] - p[mask]) / y[mask]))) if np.any(mask) else np.nan,
+        **metrics,
     }
 
 

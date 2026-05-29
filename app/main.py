@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
@@ -50,10 +51,31 @@ from app.services.risk import RiskService
 from app.web import router as web_router
 
 app = FastAPI(title=settings.app_name, version=settings.version)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 orchestrator = DailyOrchestrator()
 risk_service = RiskService()
 mpc_snapshot_service = MPCSnapshotService()
 app.include_router(web_router)
+
+
+def _warm_multi_horizon():
+    from app.web import _warm_multi_horizon as _wmh
+    _wmh()
+
+def _warm_watchlist():
+    """预热盯盘：预计算并写入排序文件"""
+    import logging
+    logger = logging.getLogger("startup")
+    try:
+        from app.web import _build_watchlist_snapshot, _load_wl_snapshot
+        snap = _build_watchlist_snapshot()
+        if snap:
+            logger.info(f"盯盘预热完成: {snap['total']} apps -> {snap.get('_WL_SNAPSHOT_PATH', '')}")
+        else:
+            _load_wl_snapshot()  # 尝试加载已有文件
+            logger.info("盯盘预热: 使用已有快照")
+    except Exception as e:
+        logger.warning(f"盯盘预热失败: {e}")
 
 
 @app.on_event("startup")
@@ -66,6 +88,8 @@ def _warm_cache():
         _data_summary()
         _drift_summary()
         _calendar_summary()
+        _warm_watchlist()
+        _warm_multi_horizon()
         logger.info("缓存预热完成")
     except Exception:
         logger.warning("缓存预热部分失败", exc_info=True)

@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor, RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from app.experiments.core import evaluate
 
 from app.config import settings
 from app.prediction_artifacts import validate_merged_daily_csv
@@ -195,12 +195,6 @@ def _get_base_feature_cols() -> List[str]:
     ]
 
 
-def _evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    mae = float(mean_absolute_error(y_true, y_pred))
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    mask = y_true > 1e-8
-    mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask]))) if np.any(mask) else np.nan
-    return {"mae": mae, "rmse": rmse, "mape": mape}
 
 
 def _ewma_predict(train_df: pd.DataFrame, test_df: pd.DataFrame, alpha: float) -> pd.DataFrame:
@@ -972,7 +966,7 @@ def _run_backtest_parallel(
         pred_df = pd.concat(frames, ignore_index=True).dropna(subset=["y_true", "y_pred"])
         if pred_df.empty:
             continue
-        metrics = _evaluate(pred_df["y_true"].values, pred_df["y_pred"].values)
+        metrics = evaluate(pred_df["y_true"].values, pred_df["y_pred"].values)
         results.append(ModelResult(model_name=model_name, metrics=metrics, prediction_df=pred_df))
     return results
 
@@ -1013,7 +1007,7 @@ def main() -> None:
     validate_merged_daily_csv(Path(args.input))
     app_daily, _ = build_unified_daily(
         args.input,
-        min_spend_train=2.0,
+        min_spend_train=5.0,
     )
 
     selected_tree_models = [m.strip() for m in str(args.models).split(",") if m.strip()]

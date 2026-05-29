@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from app.experiments.core import evaluate
 
 DEFAULT_CLEAN_GROUP_COLS = [
     "应用ID",
@@ -30,12 +30,6 @@ def _build_model(model_name: str):
     return None
 
 
-def _evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    mae = float(mean_absolute_error(y_true, y_pred))
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    mask = y_true > 1e-8
-    mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask]))) if np.any(mask) else np.nan
-    return {"mae": mae, "rmse": rmse, "mape": mape}
 
 
 def _normalize_cols(raw_cols: List[str]) -> List[str]:
@@ -259,7 +253,7 @@ def run_by_flow(
 
     rows = []
     for (flow, model), g in pred_all.groupby(["split_value", "model"]):
-        metrics = _evaluate(g["y_true"].values, g["y_pred"].values)
+        metrics = evaluate(g["y_true"].values, g["y_pred"].values)
         rows.append(
             {
                 "flow": flow,
@@ -274,7 +268,7 @@ def run_by_flow(
 
     overall_rows = []
     for model, g in pred_all.groupby("model"):
-        metrics = _evaluate(g["y_true"].values, g["y_pred"].values)
+        metrics = evaluate(g["y_true"].values, g["y_pred"].values)
         overall_rows.append(
             {
                 "model": model,

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from app.experiments.core import evaluate
 
 
 def main() -> None:
@@ -68,13 +69,9 @@ def main() -> None:
     out_path = out_dir / "predictions_EWMA_quick.csv"
     df.to_csv(out_path, index=False, encoding="utf-8-sig")
 
-    abs_err = (df["y_true"] - df["y_pred"]).abs()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ape = abs_err / np.maximum(df["y_true"].to_numpy(), 1e-8)
-    mape = float(np.nanmean(ape))
-    mae = float(abs_err.mean())
+    metrics = evaluate(df["y_true"].values, df["y_pred"].values)
     pd.DataFrame(
-        [{"model": "EWMA_quick", "mae": mae, "mape": mape, "mape_pct": mape * 100, "samples": len(df)}]
+        [{"model": "EWMA_quick", **metrics, "samples": len(df)}]
     ).to_csv(out_dir / "metrics_summary.csv", index=False, encoding="utf-8-sig")
 
     report = {

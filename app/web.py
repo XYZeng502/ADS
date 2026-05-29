@@ -18,6 +18,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from app.config import settings
 from app.core.calendar import CalendarService
 from app.prediction_artifacts import resolve_roi_predictions_csv, resolve_spend_predictions_csv
+from app.services.rule_config import RuleConfigStore
 from scripts.offline_backtest import run_app_level_last_day_prediction, run_backtest
 
 router = APIRouter(tags=["web"])
@@ -331,9 +332,9 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     roi_stats = _compute_prediction_stats("roi")
     spend_stats = _compute_prediction_stats("spend")
 
-    # 全量日期聚合图表数据（不受显示行数限制）
-    roi_chart_data = _compute_chart_data("roi")
-    spend_chart_data = _compute_chart_data("spend")
+    release_mult = _read_json(root / "app_release_multipliers.json")
+    if release_mult is None:
+        release_mult = {"global_d7": 1.29, "apps": {}}
 
     payload = {
         "roi": {
@@ -344,7 +345,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "source": str(roi_dir) if roi_dir else "",
             "stats": roi_stats["overall"] if roi_stats else None,
             "apps": roi_stats["apps"] if roi_stats else [],
-            "chart_data": roi_chart_data or [],
+            "chart_data": roi_stats["chart_data"] if roi_stats else [],
         },
         "spend": {
             "title": "T+1 Spend 预测效果（目标日历 + 假期切换校准）",
@@ -359,10 +360,11 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "source": str(spend_dir) if spend_dir else "",
             "stats": spend_stats["overall"] if spend_stats else None,
             "apps": spend_stats["apps"] if spend_stats else [],
-            "chart_data": spend_chart_data or [],
+            "chart_data": spend_stats["chart_data"] if spend_stats else [],
         },
         "date_feature_compare": _read_json(date_feature_dir / "date_feature_business_compare.json"),
         "date_feature_source": str(date_feature_dir),
+        "release_multipliers": release_mult,
         "app_month_roi": {
             "title": "不同应用月末 ROI 预测",
             "rows": _read_csv_rows(app_month_roi_path, 5000),
@@ -398,7 +400,8 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>智能预算决策系统 - 模型评估看板</title>
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="/static/echarts.min.js"></script>
+  <script src="/static/rule_editor.js" defer></script>
   <style>
     :root {{
       --bg: #f6f8fb;
@@ -440,8 +443,8 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .metric .k {{ color: var(--muted); font-size: 12px; }}
     .metric .v {{ font-size: 26px; font-weight: 780; margin-top: 6px; }}
     .metric .d {{ color: var(--muted); font-size: 12px; margin-top: 6px; }}
-    .section-title {{ display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 10px; }}
-    .section-title h2 {{ font-size: 18px; margin: 0; }}
+    .section-title {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 10px; flex-wrap: nowrap; }}
+    .section-title h2 {{ font-size: 18px; margin: 0; white-space: nowrap; }}
     .hint {{ color: var(--muted); font-size: 12px; }}
     .charts {{ display: grid; grid-template-columns: 1.25fr .75fr; gap: 14px; }}
     .chart {{ height: 360px; border: 1px solid var(--line); border-radius: 16px; background: #fff; }}
@@ -511,7 +514,6 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .compact-metrics {{ display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:10px; margin: 10px 0 12px; }}
     .compact-metrics .metric {{ padding:10px 12px; border-radius:12px; }}
     .compact-metrics .metric .v {{ font-size:20px; }}
-    .recommend-summary-title {{ margin:18px 0 8px; font-size:16px; font-weight:760; }}
     .app-popup {{ position: fixed; z-index: 9999; background: #fff; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 16px 48px rgba(16,24,40,.18); padding: 16px; min-width: 540px; max-width: 620px; pointer-events: auto; }}
     .app-popup-header {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }}
     .app-popup-header b {{ font-size: 16px; color: var(--blue); }}
@@ -522,6 +524,19 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .app-popup-chart {{ height: 200px; border: 1px solid var(--line); border-radius: 10px; }}
     .popup-app-id {{ cursor: pointer; color: var(--blue); text-decoration: underline; text-underline-offset: 2px; }}
     .popup-app-id:hover {{ color: #1d4ed8; }}
+    .modal-overlay {{ position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center; }}
+    .modal-dialog {{ background:#fff;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,0.3);max-height:85vh;display:flex;flex-direction:column; }}
+    .modal-lg {{ width:90vw;max-width:1100px; }}
+    .modal-header {{ display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #e2e8f0;flex-shrink:0; }}
+    .modal-header h2,.modal-header h3 {{ margin:0; }}
+    .modal-header .btn {{ padding:6px 14px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer;font-size:13px;color:#172033; }}
+    .modal-body {{ padding:16px 20px;overflow-y:auto;flex:1; }}
+    .modal-body .btn {{ padding:6px 14px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;cursor:pointer;font-size:13px;color:#172033; }}
+    .modal-body .btn:hover,.modal-header .btn:hover {{ background:#f1f5f9; }}
+    .modal-body .btn.secondary {{ color:#64748b; }}
+    .modal-close {{ background:none;border:none;font-size:24px;cursor:pointer;color:#94a3b8;padding:0 4px;line-height:1; }}
+    .modal-body label {{ display:block;font-size:12px;color:#64748b;margin-bottom:2px; }}
+    .modal-body input,.modal-body select {{ width:100%;padding:6px 8px;border:1px solid #e2e8f0;border-radius:4px;font-size:13px;box-sizing:border-box; }}
     @media (max-width: 1100px) {{ .shell {{ display:block; }} .topnav {{ position:static; flex-direction:row; margin-bottom:14px; }} .controls, .roi-controls, .grid4, .grid2, .charts, .trace-grid {{ grid-template-columns: 1fr; }} .hero {{ flex-direction: column; }} }}
   </style>
 </head>
@@ -538,6 +553,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     <button class="navbtn active" id="predictNav" data-view="predict">预测模块</button>
     <button class="navbtn" id="recommendNav" data-view="recommend">推荐模块</button>
     <button class="navbtn" id="dailyRevenueNav" data-view="daily-revenue">每日收入验证</button>
+    <button class="navbtn" id="watchlistNav" data-view="watchlist">盯盘预警</button>
     <button class="navbtn" id="monitorNav" data-view="monitor">系统监控</button>
   </div>
 
@@ -571,6 +587,11 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   <div class="panel">
     <div class="section-title">
       <h2 id="lineTitle">预测值 vs 实际值</h2>
+      <label id="forecastLabel" style="display:none;font-size:12px;">预测天数
+        <select id="forecastDays" onchange="render()" style="font-size:12px;">
+          <option value="0">仅T+1</option><option value="3">3天</option><option value="7" selected>7天</option>
+        </select>
+      </label>
     </div>
     <div class="charts">
       <div id="lineChart" class="chart"></div>
@@ -628,11 +649,11 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
 
 <div class="view hidden" id="view-recommend">
   <div class="panel recommend-hero" id="businessPanel">
-    <div class="section-title">
-      <h2>应用推荐模块</h2>
-      <div style="display:flex;gap:8px;align-items:center;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:nowrap;">
+      <h2 style="font-size:18px;margin:0;">应用推荐模块</h2>
+      <div style="display:flex;gap:8px;flex-shrink:0;">
         <a href="/web/export/recommendations" download class="chip" style="text-decoration:none;font-size:12px;">导出CSV</a>
-        <span class="hint" id="mpcSourceHint"></span>
+        <button id="ruleConfigBtn" class="chip" style="cursor:pointer;font-size:12px;" onclick="openRuleModal()">⚙ 规则配置</button>
       </div>
     </div>
     <div class="panel" style="margin-top:0;">
@@ -692,20 +713,22 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
       </div>
       <div class="compact-metrics" id="appRoiCards"></div>
     </div>
-    <div class="recommend-summary-title">推荐总览</div>
-    <div class="grid4" id="businessCards"></div>
-    <div class="grid2" style="margin-top:14px;">
-      <div id="budgetChart" class="chart"></div>
-      <div id="productChart" class="chart"></div>
+    <div class="panel" style="margin-top:14px;">
+      <div class="section-title"><h2>推荐总览</h2></div>
+      <div class="grid4" id="businessCards"></div>
+      <div class="grid2" style="margin-top:14px;">
+        <div id="budgetChart" class="chart"></div>
+        <div id="productChart" class="chart"></div>
+      </div>
     </div>
     <div class="grid2" style="margin-top:14px;">
       <div id="layerChart" class="chart"></div>
       <div class="note" id="decisionNote"></div>
     </div>
-    <div class="section-title" style="margin-top:16px;">
-      <h2>六层决策面板</h2>
+    <div class="panel" style="margin-top:14px;background:#f8fafc;">
+      <div class="section-title"><h2>六层决策面板</h2></div>
+      <div class="layer-panels" id="layerPanels"></div>
     </div>
-    <div class="layer-panels" id="layerPanels"></div>
   </div>
 </div>
 
@@ -773,6 +796,49 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
   </div>
 </div>
 
+<div class="view hidden" id="view-watchlist">
+  <div class="panel recommend-hero">
+    <div class="section-title"><h2>盯盘预警 — 当月实际 ROI 实时监控</h2></div>
+    <div class="grid4" id="wlCards" style="margin:8px 0;"></div>
+
+    <div style="display:flex;gap:10px;padding:4px 16px 10px;flex-wrap:wrap;">
+      <button class="chip" data-filter="all" onclick="watchlistFilter('all')" style="cursor:pointer;">全部</button>
+      <button class="chip" data-filter="star" onclick="watchlistFilter('star')" style="cursor:pointer;">🌟 爆品候选</button>
+      <button class="chip" data-filter="critical" onclick="watchlistFilter('critical')" style="cursor:pointer;color:#dc2626;">🔴 严重问题</button>
+      <button class="chip" data-filter="watch" onclick="watchlistFilter('watch')" style="cursor:pointer;">🟡 需要关注</button>
+      <button class="chip" data-filter="good" onclick="watchlistFilter('good')" style="cursor:pointer;">✅ 达标</button>
+      <button class="chip" data-filter="spike_up" onclick="watchlistFilter('spike_up')" style="cursor:pointer;">📈 ROI突升</button>
+      <button class="chip" data-filter="spike_down" onclick="watchlistFilter('spike_down')" style="cursor:pointer;">📉 ROI骤降</button>
+      <button class="chip" data-filter="extreme" onclick="watchlistFilter('extreme')" style="cursor:pointer;color:#dc2626;">⚠️ 异常</button>
+    </div>
+
+    <div style="padding:0 16px 12px;">
+      <div style="overflow-x:auto;">
+        <table class="data-table" style="width:100%;font-size:13px;">
+          <thead><tr>
+            <th class="sortable" style="width:120px;" onclick="wlSort('app_id')">应用ID ↕</th>
+            <th class="sortable" style="width:100px;" onclick="wlSort('cur_spend')">当月消耗 ↕</th>
+            <th class="sortable" style="width:100px;" onclick="wlSort('cur_roi')">当月ROI ↕</th>
+            <th class="sortable" style="width:100px;" onclick="wlSort('prev_roi')">上月ROI ↕</th>
+            <th class="sortable" style="width:100px;" onclick="wlSort('roi_change')">ROI变化 ↕</th>
+            <th class="sortable" style="width:100px;" onclick="wlSort('daily_spend')">日消耗 ↕</th>
+            <th style="width:120px;">状态</th>
+            <th>异常</th>
+          </tr></thead>
+          <tbody id="wlBody"><tr><td colspan="8" style="color:var(--muted);padding:16px;">加载中...</td></tr></tbody>
+        </table>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;">
+        <span style="color:var(--muted);font-size:12px;" id="wlPageInfo"></span>
+        <div style="display:flex;gap:4px;">
+          <button class="chip" onclick="wlPage(-1)" style="cursor:pointer;">上一页</button>
+          <button class="chip" onclick="wlPage(1)" style="cursor:pointer;">下一页</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="view hidden" id="view-monitor">
   <div class="panel">
     <div class="section-title"><h2>模型管理</h2></div>
@@ -825,6 +891,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
 <script>
 const payload = {safe_payload_js};
 const initialView = {safe_initial_view_js};
+const actColors = {{'放量':'#bbf7d0','控量':'#fecaca','维稳':'#e2e8f0','暂停':'#fde68a','加预算':'#bfdbfe','减预算':'#fecaca','调整出价':'#fef08a','收紧':'#fecaca'}};
 const charts = {{
   budget: echarts.init(document.getElementById('budgetChart')),
   product: echarts.init(document.getElementById('productChart')),
@@ -941,6 +1008,14 @@ function appRoiDecision(r) {{
   const kpiT = num(r.kpiTarget || 1.05);
   const budgetChange = r.actualSpend > 1e-8 ? (r.plannedBudget - r.actualSpend) / r.actualSpend : 0;
   const mode = String(r.mode || '').toUpperCase();
+  if (typeof _cachedRules !== 'undefined' && _cachedRules.length && typeof matchRuleRow === 'function') {{
+    const hit = _cachedRules.find(rule => matchRuleRow(rule, r));
+    if (hit) {{
+      const act = hit.action || hit.override_mode || 'STABLE';
+      const label = ACTION_LABELS[act] || act;
+      return {{ action: label, basis: [`规则: ${{hit.name}} → ${{label}}`, `月末ROI ${{fmt(r.monthEndRoi,4)}} vs KPI ${{fmt(kpiT,4)}}`].join(' | '), budgetChange }};
+    }}
+  }}
   const scaleMode = mode === 'SCALE';
   const guardMode = mode === 'GUARD';
 
@@ -990,6 +1065,7 @@ function appMonthRoiRows() {{
   return (payload.app_month_roi.rows || []).map(r => {{
     const monthEndRoi = num(r.month_end_roi_prediction);
     const kpi = num(payload.app_month_roi.kpi || 1.05);
+    const calibratedRoi = monthEndRoi + 0.05;  // 老用户跨月回收校准
     const alertCount = num(r.alert_count);
     const srcRaw = r.canonical_month_end_roi_source
       || (payload.app_month_roi.summary || {{}}).canonical_month_end_roi_source
@@ -1008,6 +1084,7 @@ function appMonthRoiRows() {{
       plannedDailyPredOnly: num(r.planned_daily_spend_pred_only),
       plannedDailyFused: num(r.planned_daily_spend_fused),
       monthEndRoi,
+      calibratedRoi,
       monthEndRoiStable: num(r.month_end_roi_stable_anchor),
       monthEndRoiPredOnly: num(r.month_end_roi_pred_only),
       monthEndRoiFused: num(r.month_end_roi_fused),
@@ -1023,6 +1100,7 @@ function appMonthRoiRows() {{
       d1Calibrated: num(r.d1_anchor_calibrated_mean),
       spendT1Calibrated: num(r.spend_t1_pred_calibrated),
       roiD1T1Calibrated: num(r.roi_d1_t1_pred_calibrated),
+      trend7d: (()=>{{ const d1=num(r.roi_d1_t1_pred_calibrated); if(!d1||d1<=0) return '-'; const rm=payload.release_multipliers||{{}}; const app=rm.apps||{{}}; const c=app[r.app]||{{}}; const d3r=c.d3||rm.global_d3||1.20; const d7r=c.d7||rm.global_d7||1.29; const steps=[1.0,1.0+(d3r-1.0)*0.5,d3r,d3r+(d7r-d3r)*0.25,d3r+(d7r-d3r)*0.5,d3r+(d7r-d3r)*0.75,d7r]; const bars=steps.map(function(m,i){{ const v=Math.min(1,Math.max(0,d1*m/1.5)); const h=8+Math.round(v*16); const c=d1*m>=1.05?'#16a34a':d1*m>=0.8?'#f59e0b':'#dc2626'; return '<span title=D'+(i+1)+':'+fmt(d1*m,3)+' style=display:inline-block;width:6px;height:'+h+'px;background:'+c+';border-radius:2px;margin:0 1px;vertical-align:middle;></span>'; }}).join(''); return bars; }})(),
       topActions: r.top_actions || '',
       topSuggestionsRaw: r.top_suggestions || '',
       alertsRaw: r.alerts || '',
@@ -1030,7 +1108,7 @@ function appMonthRoiRows() {{
       conservativeBudget: num(r.conservative_budget),
       neutralBudget: num(r.neutral_budget),
       aggressiveBudget: num(r.aggressive_budget),
-      roiGap: monthEndRoi - kpi,
+      roiGap: calibratedRoi - kpi,  // 校准后差距
     }};
     const decision = appRoiDecision(row);
     const absBudgetDelta = Math.abs(row.plannedBudget - row.actualSpend);
@@ -1075,8 +1153,8 @@ function currentAppRoiRows() {{
     (!kpiStatus || (kpiStatus === 'above' ? r.roiGap >= 0 : r.roiGap < 0)) &&
     (!action || r.action === action) &&
     (!risk || (risk === 'has_alert' ? r.alertCount > 0 : r.alertCount <= 0)) &&
-    (minRoi === null || r.monthEndRoi >= minRoi) &&
-    (maxRoi === null || r.monthEndRoi <= maxRoi)
+    (minRoi === null || r.calibratedRoi >= minRoi) &&
+    (maxRoi === null || r.calibratedRoi <= maxRoi)
   ).sort((a,b) => {{
     return compareRows(a, b, appRoiSort);
   }});
@@ -1101,7 +1179,7 @@ function renderAppMonthRoiTable() {{
   const allRows = appMonthRoiRows();
   const visibleRows = currentAppRoiRows();
   const aboveKpi = visibleRows.filter(r => r.roiGap >= 0).length;
-  const avgRoi = visibleRows.reduce((s,r)=>s+r.monthEndRoi,0) / Math.max(visibleRows.length, 1);
+  const avgRoi = visibleRows.reduce((s,r)=>s+r.calibratedRoi,0) / Math.max(visibleRows.length, 1);
   const totalSpend = visibleRows.reduce((s,r)=>s+r.monthEndSpend,0);
   const highRisk = visibleRows.filter(r => r.alertCount > 0 || r.roiGap < 0).length;
   const cardsEl = document.getElementById('appRoiCards');
@@ -1121,6 +1199,7 @@ function renderAppMonthRoiTable() {{
     ['monthEndRoiPredOnly', '纯预测'],
     ['monthEndRoiFused', '融合'],
     ['roiGap', '较KPI差距'],
+    ['trend7d', 'T+1 → T+7'],
     ['action', '建议动作'],
     ['monthEndSpend', '预测月末消耗'],
     ['plannedBudget', '主用计划预算'],
@@ -1159,7 +1238,8 @@ function renderAppMonthRoiTable() {{
   }}
   bodyEl.innerHTML = visibleRows.map(r => {{
     const roiCls = r.roiGap >= 0 ? 'good' : 'bad';
-    const actionCls = r.action.includes('收紧') || r.action.includes('控量') ? 'bad' : 'good';
+    const actionColor = Object.entries(actColors).find(([k])=>r.action.includes(k));
+    const actBg = actionColor ? actionColor[1] : '#f8fafc';
     return `<tr>
       <td class="popup-app-id" data-app="${{r.app}}">${{r.app}}</td>
       <td>${{r.mode}}</td>
@@ -1170,7 +1250,8 @@ function renderAppMonthRoiTable() {{
       <td>${{fmt(r.monthEndRoiPredOnly,4)}}</td>
       <td>${{fmt(r.monthEndRoiFused,4)}}</td>
       <td class="${{roiCls}}">${{pct(r.roiGap)}}</td>
-      <td><span class="pill ${{actionCls}}">${{r.action}}</span></td>
+      <td style="white-space:nowrap;text-align:center;">${{r.trend7d || '-'}}</td>
+      <td><span class="pill" style="background:${{actBg}};">${{r.action}}</span></td>
       <td>${{fmt(r.monthEndSpend,2)}}</td>
       <td>${{fmt(r.plannedBudget,2)}}</td>
       <td>${{pct(r.budgetChange)}}</td>
@@ -1379,7 +1460,8 @@ function businessLayers(snapshot) {{
 
 function renderBusinessSnapshot() {{
   const rows = appMonthRoiRows();
-  document.getElementById('mpcSourceHint').textContent = `推荐来源：${{payload.app_month_roi.source || '暂无'}}`;
+  const hintEl = document.getElementById('mpcSourceHint');
+  if (hintEl) hintEl.textContent = `推荐来源：${{payload.app_month_roi.source || '暂无'}}`;
   if (!rows.length) {{
     document.getElementById('businessCards').innerHTML = '<div class="metric"><div class="k">暂无推荐数据</div><div class="v">-</div><div class="d">请先生成应用层月末 ROI 预测结果</div></div>';
     return;
@@ -1547,13 +1629,15 @@ function renderBusinessSnapshot() {{
         : '全部应用达标且无告警，暂无风险',
       body: riskRows.length ? `
         <table><thead><tr><th>应用ID</th><th>月末ROI</th><th>ROI差距</th><th>告警数</th><th>建议动作</th></tr></thead><tbody>
-          ${{[...riskRows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 15).map(r => `<tr>
+          ${{[...riskRows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 15).map(r => {{
+            const aBg = Object.entries(actColors).find(([k])=>r.action.includes(k));
+            return `<tr>
             <td><b>${{r.app}}</b></td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{pct(r.roiGap)}}</td>
             <td>${{r.alertCount}}</td>
-            <td><span class="pill ${{r.action.includes('控量')||r.action.includes('收紧') ? 'bad' : 'good'}}">${{r.action}}</span></td>
-          </tr>`).join('')}}
+            <td><span class="pill" style="background:${{aBg ? aBg[1] : '#f8fafc'}};">${{r.action}}</span></td>
+          </tr>`;}}).join('')}}
         </tbody></table>
         ${{riskRows.length > 15 ? `<div class="hint" style="margin-top:8px;">仅展示前 15 个，共 ${{riskRows.length}} 个风险应用</div>` : ''}}
       ` : '<div class="note-body" style="color:#15803d;padding: 8px 0;">✅ 当前全部应用达标且无告警</div>'
@@ -1565,13 +1649,15 @@ function renderBusinessSnapshot() {{
       body: `
         <div class="plain-note" style="margin-bottom:12px;">按产品比例分配后依节假日节奏微调，优先处理ROI差距最大的应用。</div>
         <table><thead><tr><th>优先级</th><th>应用ID</th><th>月末ROI</th><th>ROI差距</th><th>建议动作</th></tr></thead><tbody>
-          ${{[...rows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 10).map((r, i) => `<tr>
+          ${{[...rows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 10).map((r, i) => {{
+            const aBg = Object.entries(actColors).find(([k])=>r.action.includes(k));
+            return `<tr>
             <td>${{i + 1}}</td>
             <td><b>${{r.app}}</b></td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{pct(r.roiGap)}}</td>
-            <td><span class="pill ${{r.action.includes('控量')||r.action.includes('收紧') ? 'bad' : 'good'}}">${{r.action}}</span></td>
-          </tr>`).join('')}}
+            <td><span class="pill" style="background:${{aBg ? aBg[1] : '#f8fafc'}};">${{r.action}}</span></td>
+          </tr>`;}}).join('')}}
         </tbody></table>
       `
     }},
@@ -1630,13 +1716,22 @@ function renderChartsForApp(target, unit) {{
 }}
 
 function renderChartSeries(data, unit, target) {{
-  const dates = data.map(x => x.date);
+  // 预测天数过滤
+  const fdEl = document.getElementById('forecastDays');
+  const maxForeDays = fdEl ? parseInt(fdEl.value) || 0 : 0;
+  let foreCount = 0;
+  const filtered = data.filter(x => {{
+    if (!x.forecast) return true;
+    foreCount++;
+    return maxForeDays > 0 && foreCount <= maxForeDays;
+  }});
+  const dates = filtered.map(x => x.date);
   const actualName = target === 'roi' ? '实际 T+1 ROI_D1' : '实际 T+1 Spend';
-  const predName = target === 'roi' ? '预测 T+1 ROI_D1' : '目标日历校准预测 T+1 Spend';
+  const predName = target === 'roi' ? '预测 T+1 ROI_D1' : '预测 T+1 Spend';
   const titleSuffix = selectedAppId ? ` — 应用 ${{selectedAppId}}` : '';
   const series = [
-    {{ name: actualName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.actual) }},
-    {{ name: predName, type: 'line', smooth: true, symbolSize: 6, data: data.map(x => x.pred) }},
+    {{ name: actualName, type: 'line', smooth: true, symbolSize: 6, data: filtered.map(x => x.forecast ? null : x.actual) }},
+    {{ name: predName, type: 'line', smooth: true, symbolSize: 6, data: filtered.map(x => x.pred), connectNulls: true }},
   ];
   // CQR prediction interval bands for spend chart
   if (target === 'spend' && payload.spend.cqr_predictions) {{
@@ -1682,24 +1777,11 @@ function renderChartSeries(data, unit, target) {{
       trigger: 'axis',
       formatter: function(params) {{
         let html = '<b>' + params[0].axisValue + '</b><br/>';
-        let cqrVal = null;
         for (let i = 0; i < params.length; i++) {{
           const p = params[i];
+          if (!p.value && p.value !== 0) continue;
           if (p.seriesName === '区间下界' || p.seriesName === '预测区间(P05-P95)') continue;
-          if (p.seriesName === '预测值(CQR-P50)') {{ cqrVal = p.value; continue; }}
           html += p.marker + p.seriesName + ': ' + fmt(p.value, target === 'roi' ? 4 : 2) + '<br/>';
-        }}
-        if (cqrVal !== null && target === 'spend') {{
-          let c = null;
-          if (selectedAppId && payload.spend.cqr_by_app_date) {{
-            const appCqr = payload.spend.cqr_by_app_date[selectedAppId] || {{}};
-            c = appCqr[params[0].axisValue];
-          }} else if (payload.spend.cqr_predictions) {{
-            c = payload.spend.cqr_predictions[params[0].axisValue];
-          }}
-          if (c) {{
-            html += '<span style="color:#888;font-size:11px;">预测区间: ' + Math.round(c.y_lower) + ' ~ ' + Math.round(c.y_upper) + '</span><br/>';
-          }}
         }}
         return html;
       }}
@@ -1939,7 +2021,7 @@ function render() {{
   if (el) el.addEventListener('change', () => {{ selectedAppId = ''; _chartAppId = ''; document.getElementById('appSelectHint').style.display = 'none'; detailState = {{ appId: '', page: 0, limit: 200, total: 0 }}; render(); }});
 }});
 const targetSelEl = document.getElementById('targetSel');
-if (targetSelEl) targetSelEl.addEventListener('change', () => {{ _chartAppId = ''; detailState = selectedAppId ? {{ appId: selectedAppId, page: 0, limit: 200, total: 0 }} : {{ appId: '', page: 0, limit: 200, total: 0 }}; const link = document.getElementById('exportCsvLink'); if (link) link.href = '/web/export/predictions/' + targetSelEl.value; render(); }});
+if (targetSelEl) targetSelEl.addEventListener('change', () => {{ _chartAppId = ''; detailState = selectedAppId ? {{ appId: selectedAppId, page: 0, limit: 200, total: 0 }} : {{ appId: '', page: 0, limit: 200, total: 0 }}; const link = document.getElementById('exportCsvLink'); if (link) link.href = '/web/export/predictions/' + targetSelEl.value; document.getElementById('forecastLabel').style.display = targetSelEl.value === 'spend' ? '' : 'none'; render(); setTimeout(() => Object.values(charts).forEach(c => c.resize()), 100); }});
 const appTableSearchEl = document.getElementById('appTableSearch');
 if (appTableSearchEl) appTableSearchEl.addEventListener('input', renderAppSummary);
 const detailAppSearchEl = document.getElementById('detailAppSearch');
@@ -2012,8 +2094,10 @@ function setActiveView(view) {{
   document.getElementById('view-predict').classList.toggle('hidden', view !== 'predict');
   document.getElementById('view-recommend').classList.toggle('hidden', view !== 'recommend');
   document.getElementById('view-daily-revenue').classList.toggle('hidden', view !== 'daily-revenue');
+  document.getElementById('view-watchlist').classList.toggle('hidden', view !== 'watchlist');
   document.getElementById('view-monitor').classList.toggle('hidden', view !== 'monitor');
   hideAppPopup(true);
+  if (view === 'watchlist') loadWatchlist();
   if (view === 'predict') {{ render(); }}
   setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') {{ loadDailyRevenueChart(); loadDailyRevenueAppSummary(); }} if (view === 'monitor') loadMonitorView(); }}, 0);
 }}
@@ -2338,6 +2422,118 @@ async function triggerRetrain() {{
 
 let healthTrendChart = null;
 
+let _wlData = [], _wlFilter = 'all', _wlSortKey = '', _wlSortDir = 1, _wlPageNum = 1;
+
+const WL_PAGE_SIZE = 50;
+
+function wlSort(key) {{
+  if (_wlSortKey === key) {{ _wlSortDir *= -1; }} else {{ _wlSortKey = key; _wlSortDir = 1; }}
+  _wlPageNum = 1;
+  renderWatchlist();
+}}
+
+function wlPage(dir) {{
+  const apps = getWlFilteredApps();
+  const total = Math.max(1, Math.ceil(apps.length / WL_PAGE_SIZE));
+  _wlPageNum = Math.max(1, Math.min(total, _wlPageNum + dir));
+  renderWatchlist();
+}}
+
+function getWlFilteredApps() {{
+  let apps = _wlFilter === 'all' ? _wlData :
+    _wlFilter === 'extreme' ? _wlData.filter(a => a.is_extreme) :
+    _wlData.filter(a => a.status === _wlFilter || a.anomaly === _wlFilter);
+  if (_wlSortKey) {{
+    apps = [...apps].sort((a, b) => {{
+      const va = a[_wlSortKey], vb = b[_wlSortKey];
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1; if (vb == null) return -1;
+      return (va > vb ? 1 : va < vb ? -1 : 0) * _wlSortDir;
+    }});
+  }}
+  return apps;
+}}
+
+async function loadWatchlist() {{
+  try {{
+    const r = await fetch('/web/api/watchlist?page_size=5000');
+    const d = await r.json();
+    _wlData = d.apps || [];
+    _wlPageNum = 1;
+    renderWatchlist();
+    renderWlCards();
+  }} catch(e) {{ console.error(e); }}
+}}
+
+function renderWlCards() {{
+  const apps = _wlData;
+  const el = document.getElementById('wlCards');
+  if (!el) return;
+  const star = apps.filter(a => a.status === 'star').length;
+  const critical = apps.filter(a => a.status === 'critical').length;
+  const spikes = apps.filter(a => a.anomaly === 'spike_up').length;
+  const drops = apps.filter(a => a.anomaly === 'spike_down').length;
+  el.innerHTML = [
+    ['总应用', String(apps.length), '当月消耗>=5的应用'],
+    ['🌟 爆品候选', String(star), 'ROI >= 1.2'],
+    ['🔴 严重问题', String(critical), 'ROI < 0.8'],
+    ['📈 ROI突升', String(spikes), '较上月提升>0.3'],
+  ].map(c => `<div class="metric"><div class="k">${{c[0]}}</div><div class="v">${{c[1]}}</div><div class="d">${{c[2]}}</div></div>`).join('');
+}}
+
+function watchlistFilter(f) {{
+  _wlFilter = f;
+  _wlPageNum = 1;
+  document.querySelectorAll('#view-watchlist .chip').forEach(c => c.classList.toggle('active', c.dataset.filter === f));
+  renderWatchlist();
+}}
+
+function wlRow(a, showChange) {{
+  const statusLabel = {{star:'🌟 爆品', good:'✅ 达标', watch:'🟡 关注', critical:'🔴 严重'}};
+  const anomalyLabel = {{spike_up:'📈 突升', spike_down:'📉 骤降', normal:'-'}};
+  const statusBg = {{star:'#bbf7d0', good:'#e2e8f0', watch:'#fde68a', critical:'#fecaca'}};
+  const roiCls = a.cur_roi >= 1.05 ? 'good' : a.cur_roi >= 0.8 ? '' : 'bad';
+  if (!showChange || a.roi_change == null) {{
+    return `<tr>
+      <td><b>${{a.app_id}}</b></td>
+      <td class="num">${{money(a.cur_spend)}}</td>
+      <td class="${{roiCls}} num">${{fmt(a.cur_roi, 4)}}</td>
+      <td class="num">${{a.prev_roi != null ? fmt(a.prev_roi, 4) : '数据不足'}}</td>
+      <td class="num" style="color:var(--muted);">数据不足</td>
+      <td class="num">${{money(a.daily_spend)}}</td>
+      <td><span class="pill" style="background:${{statusBg[a.status]||'#f8fafc'}};">${{statusLabel[a.status]||a.status}}</span></td>
+      <td>${{anomalyLabel[a.anomaly]||'-'}}</td>
+    </tr>`;
+  }}
+  const changeCls = a.roi_change > 0 ? 'good' : 'bad';
+  const changeSign = a.roi_change > 0 ? '+' : '';
+  return `<tr>
+    <td><b>${{a.app_id}}</b></td>
+    <td class="num">${{money(a.cur_spend)}}</td>
+    <td class="${{roiCls}} num">${{fmt(a.cur_roi, 4)}}</td>
+    <td class="num">${{a.prev_roi != null ? fmt(a.prev_roi, 4) : '数据不足'}}</td>
+    <td class="${{changeCls}} num">${{changeSign}}${{fmt(a.roi_change, 4)}}</td>
+    <td class="num">${{money(a.daily_spend)}}</td>
+    <td><span class="pill" style="background:${{statusBg[a.status]||'#f8fafc'}};">${{statusLabel[a.status]||a.status}}</span></td>
+    <td>${{anomalyLabel[a.anomaly]||'-'}}</td>
+  </tr>`;
+}}
+
+function renderWatchlist() {{
+  const apps = getWlFilteredApps();
+  const total = Math.ceil(apps.length / WL_PAGE_SIZE);
+  if (_wlPageNum > total) _wlPageNum = total;
+  const page = apps.slice((_wlPageNum - 1) * WL_PAGE_SIZE, _wlPageNum * WL_PAGE_SIZE);
+
+  const body = document.getElementById('wlBody');
+  if (!body) return;
+  if (!apps.length) {{ body.innerHTML = '<tr><td colspan="8" style="color:var(--muted);padding:16px;">无匹配数据</td></tr>'; return; }}
+  body.innerHTML = page.map(a => wlRow(a, a.roi_change != null)).join('');
+
+  const info = document.getElementById('wlPageInfo');
+  if (info) info.textContent = `第 ${{_wlPageNum}}/${{total}} 页，共 ${{apps.length}} 条`;
+}}
+
 async function loadMonitorView() {{
   loadMonitorAlerts();
   loadHealthTrend();
@@ -2514,6 +2710,7 @@ if (rb) rb.addEventListener('click', () => {{
 window.addEventListener('resize', () => {{ Object.values(charts).forEach(c => c.resize()); if (_popupCharts.roi) _popupCharts.roi.resize(); if (_popupCharts.spend) _popupCharts.spend.resize(); }});
 render();
 setActiveView(initialView);
+document.getElementById('forecastLabel').style.display = document.getElementById('targetSel').value === 'spend' ? '' : 'none';
 loadDataStatus();
 loadRetrainStatus();
 </script>
@@ -2672,36 +2869,6 @@ def _resolve_prediction_path(target: str) -> Path | None:
     return resolve_spend_predictions_csv(spend_dir)
 
 
-def _compute_chart_data(target: str) -> list[dict] | None:
-    """全量CSV按日期聚合，供前端图表使用（不受行数限制）。"""
-    path = _resolve_prediction_path(target)
-    if path is None or not path.exists():
-        return None
-    date_map: dict[str, dict] = {}
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        for r in csv.DictReader(f):
-            day = str(r.get("日期", ""))[:10]
-            if not day:
-                continue
-            y = float(r.get("y_true", 0) or 0)
-            p = float(r.get("y_pred_fused", 0) or 0) or float(r.get("y_pred", 0) or 0)
-            if day not in date_map:
-                date_map[day] = {"date": day, "actual": 0.0, "pred": 0.0, "n": 0}
-            date_map[day]["actual"] += y
-            date_map[day]["pred"] += p
-            date_map[day]["n"] += 1
-    result = []
-    for day in sorted(date_map):
-        d = date_map[day]
-        ape = abs((d["actual"] - d["pred"]) / d["actual"]) if d["actual"] > 1e-8 else 0.0
-        result.append({
-            "date": day,
-            "actual": round(d["actual"], 4),
-            "pred": round(d["pred"], 4),
-            "n": d["n"],
-            "ape": round(ape, 6),
-        })
-    return result
 
 
 def _compute_prediction_stats(target: str) -> dict | None:
@@ -2718,6 +2885,7 @@ def _compute_prediction_stats(target: str) -> dict | None:
         return None
     app_stats: dict[str, dict] = {}
     all_y, all_p = [], []
+    date_map: dict[str, dict] = {}
     for r in rows:
         y = float(r.get("y_true", 0) or 0)
         p = float(r.get("y_pred_fused", 0) or 0) or float(r.get("y_pred", 0) or 0)
@@ -2730,6 +2898,13 @@ def _compute_prediction_stats(target: str) -> dict | None:
             app_stats[app_id] = {"y": [], "p": [], "app_id": app_id}
         app_stats[app_id]["y"].append(y)
         app_stats[app_id]["p"].append(p)
+        day = str(r.get("日期", ""))[:10]
+        if day:
+            if day not in date_map:
+                date_map[day] = {"date": day, "actual": 0.0, "pred": 0.0, "n": 0}
+            date_map[day]["actual"] += y
+            date_map[day]["pred"] += p
+            date_map[day]["n"] += 1
 
     y_arr = np.array(all_y)
     p_arr = np.array(all_p)
@@ -2755,9 +2930,20 @@ def _compute_prediction_stats(target: str) -> dict | None:
             "samples": len(s["y"]),
         })
     app_list.sort(key=lambda x: x["mape"])
+    cd = [{"date": d["date"], "actual": round(d["actual"],4), "pred": round(d["pred"],4), "n": d["n"], "ape": round(abs((d["actual"]-d["pred"])/d["actual"]) if d["actual"]>1e-8 else 0,6)} for d in [date_map[k] for k in sorted(date_map)]]
+    # T+1~T+7 预测延伸：仅 Spend
+    if cd and _mh_agg_forecast and target == "spend":
+        from datetime import timedelta
+        last = cd[-1]
+        last_date = datetime.strptime(last["date"], "%Y-%m-%d").date()
+        scale = last["pred"] / _mh_agg_forecast[0] if _mh_agg_forecast[0] > 0 else 1.0
+        for i in range(7):
+            dt = (last_date + timedelta(days=i+1)).strftime("%Y-%m-%d")
+            cd.append({"date": dt, "actual": None, "pred": round(_mh_agg_forecast[i] * scale, 4), "forecast": True})
     return {
         "overall": {"mae": round(mae, 4), "rmse": round(rmse, 4), "mape": round(mape, 4), "mape_pct": round(mape * 100, 2), "samples": len(rows), "apps": len(app_list)},
         "apps": app_list,
+        "chart_data": cd,
     }
 
 
@@ -2866,6 +3052,16 @@ def web_prediction_app_chart(target: str, app_id: str):
             "n": d["n"],
             "ape": round(ape, 6),
         })
+    # 单应用预测延伸
+    if result and target == "spend" and _mh_models and app_id in _mh_app_features:
+        from datetime import timedelta
+        feats = _mh_app_features[app_id]
+        s_preds = [max(float(_mh_models[h].predict(feats)[0]), 0) for h in range(7)]
+        last = result[-1]
+        last_date = datetime.strptime(last["date"], "%Y-%m-%d").date()
+        for i, s in enumerate(s_preds):
+            dt = (last_date + timedelta(days=i+1)).strftime("%Y-%m-%d")
+            result.append({"date": dt, "actual": None, "pred": round(s, 4), "forecast": True})
     return JSONResponse(content=result)
 
 
@@ -2982,6 +3178,261 @@ def export_predictions(target: str):
     if path is None or not path.exists():
         raise HTTPException(status_code=404, detail=f"无 {target} 预测文件，请先训练模型。")
     return FileResponse(path, media_type="text/csv", filename=f"predictions_{target}.csv")
+
+
+_rule_store = RuleConfigStore()
+
+@router.get("/web/api/rules")
+def api_list_rules():
+    return JSONResponse(content={"rules": [r.model_dump() for r in _rule_store.load()]})
+
+@router.post("/web/api/rules")
+async def api_save_rule(request: Request):
+    body = await request.json()
+    rule_id = body.get("id")
+    if rule_id and _rule_store.update(rule_id, body):
+        return JSONResponse(content={"ok": True})
+    from app.services.rule_config import RecommendationRule
+    _rule_store.add(RecommendationRule(**body))
+    return JSONResponse(content={"ok": True})
+
+@router.delete("/web/api/rules/{rule_id}")
+def api_delete_rule(rule_id: str):
+    return JSONResponse(content={"ok": _rule_store.delete(rule_id)})
+
+
+_wl_snapshot = None
+_WL_SNAPSHOT_PATH = _repo_root() / "outputs" / "watchlist_snapshot.json"
+
+# 多步预测模型缓存
+_mh_models = []
+_mh_app_features = {}
+_mh_pred_cache = None
+_mh_agg_forecast = []  # 预计算的聚合预测
+
+
+def _warm_multi_horizon():
+    """预热：加载7个horizon模型 + 所有app的最新特征"""
+    global _mh_models, _mh_app_features
+    import numpy as np, json as _json
+    model_dir = _repo_root() / "outputs" / "multi_horizon_models"
+    feat_file = model_dir / "features.json"
+    if not feat_file.exists():
+        return
+    try:
+        import logging
+        logger = logging.getLogger("startup")
+        feat_info = _json.loads(feat_file.read_text())
+        mh_feat_cols = feat_info["features"]
+        import xgboost as xgb
+        for h in range(1, 8):
+            m = xgb.XGBRegressor()
+            m.load_model(str(model_dir / f"spend_h{h}.json"))
+            _mh_models.append(m)
+        logger.info(f"多步预测: {len(_mh_models)} 模型已加载")
+
+        import pandas as pd
+        from app.unified_daily import build_unified_daily as _bud
+        udf, _ = _bud(str(_repo_root() / "daily_merged.csv"), min_spend_train=5.0)
+        udf['日期'] = pd.to_datetime(udf['日期'])
+        cols = [c for c in mh_feat_cols if c in udf.columns]
+        for aid, grp in udf.groupby('应用ID'):
+            grp = grp.sort_values('日期')
+            _mh_app_features[str(aid)] = grp[cols].fillna(0).iloc[-1:].values.astype(np.float32)
+        logger.info(f"多步预测: {len(_mh_app_features)} apps 特征已缓存")
+        # 预加载预测数据
+        global _mh_pred_cache
+        import pandas as pd
+        sp_p = _resolve_prediction_path("spend")
+        rp_p = _resolve_prediction_path("roi")
+        if sp_p and sp_p.exists() and rp_p and rp_p.exists():
+            sp = pd.read_csv(sp_p); rp = pd.read_csv(rp_p)
+            sp["日期"] = pd.to_datetime(sp["日期"]); rp["日期"] = pd.to_datetime(rp["日期"])
+            lt = sp["日期"].max()
+            _mh_pred_cache = (sp[sp["日期"] == lt].copy(), rp[rp["日期"] == lt].copy(), lt)
+            logger.info(f"多步预测: 预测缓存已加载 ({lt.date()})")
+        # 预计算聚合预测（所有app预测之和）
+        global _mh_agg_forecast
+        import numpy as np
+        agg = np.zeros(7)
+        for aid, feats in _mh_app_features.items():
+            for h in range(7):
+                agg[h] += max(float(_mh_models[h].predict(feats)[0]), 0)
+        _mh_agg_forecast = [float(x) for x in agg]
+        logger.info(f"多步预测: 聚合预测已计算")
+    except Exception as e:
+        import logging
+        logging.getLogger("startup").warning(f"多步预测预热失败: {e}")
+
+
+def _build_watchlist_snapshot():
+    """预计算盯盘数据并写入排序好的JSON文件"""
+    import numpy as np, pandas as pd, json as _json
+    from datetime import datetime
+    csv_path = _repo_root() / "daily_merged.csv"
+    if not csv_path.exists():
+        return None
+    df = pd.read_csv(csv_path, usecols=["应用ID", "日期", "消耗金额", "买量广告收入", "30日累计变现金额"],
+                     dtype={"应用ID": str, "消耗金额": float, "买量广告收入": float, "30日累计变现金额": float}, parse_dates=["日期"])
+    today = datetime.now().date()
+    cur_m = today.strftime("%Y-%m")
+    prev_m = (today.replace(day=1) - pd.DateOffset(months=1)).strftime("%Y-%m")
+    cur = df[df["日期"].dt.strftime("%Y-%m") == cur_m]
+    prev = df[df["日期"].dt.strftime("%Y-%m") == prev_m]
+    # 最近7天日级数据（含节假日标记）
+    from chinese_calendar import is_workday
+    recent7 = df[df["日期"] >= (today - pd.Timedelta(days=7)).strftime("%Y-%m-%d")].copy()
+    recent7["is_holiday"] = recent7["日期"].apply(lambda d: not is_workday(d.date())).astype(int)
+    recent_daily = recent7.groupby("应用ID").apply(
+        lambda g: g.sort_values("日期")[["日期","消耗金额","买量广告收入","is_holiday"]].tail(7)
+        .rename(columns={"消耗金额":"spend","买量广告收入":"buyout"}).to_dict("records")
+    ).to_dict()
+    ca = cur.groupby("应用ID").agg(s=("消耗金额","sum"), b=("买量广告收入","sum"), d30=("30日累计变现金额","sum"), d=("日期","nunique")).reset_index()
+    ca["revenue"] = np.where(ca["b"] / np.maximum(ca["s"], 1e-8) >= 0.05, ca["b"], ca["d30"])
+    ca["roi"] = ca["revenue"] / np.maximum(ca["s"], 1e-8)
+    pa = prev.groupby("应用ID").agg(ps=("消耗金额","sum"), pb=("买量广告收入","sum"), pd30=("30日累计变现金额","sum")).reset_index()
+    pa["prev_revenue"] = np.where(pa["pb"] / np.maximum(pa["ps"], 1e-8) >= 0.05, pa["pb"], pa["pd30"])
+    pa["proi"] = pa["prev_revenue"] / np.maximum(pa["ps"], 1e-8)
+    apps = ca.merge(pa, on="应用ID", how="left")
+    apps = apps[apps["s"] >= 30]
+    n = len(apps)
+    result = []
+    for _, r in apps.iterrows():
+        prev_roi = round(float(r["proi"]), 4) if not pd.isna(r.get("proi")) and r.get("proi", -1) >= 0 else None
+        has_prev = prev_roi is not None and r.get("ps", 0) >= 30
+        chg = round(float(r["roi"] - (r["proi"] if prev_roi else r["roi"])), 4) if has_prev else None
+        status = "star" if r["roi"] >= 1.2 else ("good" if r["roi"] >= 1.05 else ("watch" if r["roi"] >= 0.8 else "critical"))
+        anomaly = "normal"
+        if has_prev and chg is not None:
+            if chg >= 0.3 and r["roi"] >= 0.6: anomaly = "spike_up"
+            elif chg <= -0.2 and r["roi"] < 0.8: anomaly = "spike_down"
+        is_ext = (r["roi"] > 2.0 or r["roi"] < 0.2) and r["s"] >= 50
+        aid_str = str(r["应用ID"])
+        daily_7d = []
+        if aid_str in recent_daily:
+            for d in recent_daily[aid_str]:
+                s = float(d.get("spend", 0) or 0); b = float(d.get("buyout", 0) or 0)
+                daily_7d.append({
+                    "date": str(d["日期"].date()) if hasattr(d["日期"], "date") else str(d["日期"])[:10],
+                    "spend": round(s, 2), "roi": round(b / max(s, 1e-8), 4),
+                    "is_holiday": int(d.get("is_holiday", 0))
+                })
+        result.append({
+            "app_id": aid_str, "cur_spend": round(float(r["s"]), 2),
+            "cur_roi": round(float(r["roi"]), 4), "prev_roi": prev_roi,
+            "roi_change": chg, "daily_spend": round(float(r["s"]) / max(int(r["d"]), 1), 2),
+            "cur_days": int(r["d"]), "status": status, "anomaly": anomaly, "is_extreme": is_ext,
+            "recent_daily": daily_7d,
+        })
+    # 排名加权排序
+    if n > 1:
+        idx_s = sorted(range(n), key=lambda i: result[i]["cur_spend"])
+        idx_r = sorted(range(n), key=lambda i: max(result[i]["cur_roi"], 0.01))
+        rk_s = {idx_s[i]: i/(n-1) for i in range(n)}
+        rk_r = {idx_r[i]: i/(n-1) for i in range(n)}
+        for i, r in enumerate(result):
+            r["_score"] = rk_s[i] * 0.75 + rk_r[i] * 0.25
+        result.sort(key=lambda x: (-x["is_extreme"], -x["_score"]))
+        for r in result:
+            del r["_score"]
+    snapshot = {"apps": result, "month": cur_m, "prev_month": prev_m, "total": len(result)}
+    _WL_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _WL_SNAPSHOT_PATH.write_text(_json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    return snapshot
+
+
+def _load_wl_snapshot():
+    global _wl_snapshot
+    if _wl_snapshot is not None:
+        return _wl_snapshot
+    if _WL_SNAPSHOT_PATH.exists():
+        import json as _json
+        _wl_snapshot = _json.loads(_WL_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        return _wl_snapshot
+    return None
+
+
+@router.get("/web/api/watchlist")
+def api_watchlist(page: int = Query(1, ge=1), page_size: int = Query(50, ge=10, le=10000)):
+    """盯盘数据：预计算排序文件+分页，瞬时返回"""
+    snap = _load_wl_snapshot()
+    if snap is None:
+        return JSONResponse(content={"apps": [], "total": 0, "error": "数据未生成，请等待预热或手动刷新"})
+    apps = snap["apps"]
+    total = len(apps)
+    start = (page - 1) * page_size
+    end = min(start + page_size, total)
+    return JSONResponse(content={
+        "apps": apps[start:end], "total": total,
+        "page": page, "page_size": page_size, "pages": (total + page_size - 1) // page_size,
+        "month": snap["month"], "prev_month": snap["prev_month"],
+    })
+
+
+@router.get("/web/api/forecast")
+def api_forecast(app_id: str = Query(""), days: int = Query(7, ge=1, le=30)):
+    """T+1~T+N Spend 多步预测 + 累计ROI（释放曲线推算）"""
+    import numpy as np; import pandas as pd
+    if _mh_pred_cache is not None:
+        sp_latest, rp_latest, latest = _mh_pred_cache
+    else:
+        spend_p = _resolve_prediction_path("spend")
+        roi_p = _resolve_prediction_path("roi")
+        if not spend_p or not spend_p.exists() or not roi_p or not roi_p.exists():
+            return JSONResponse(content={"error": "预测文件未找到"})
+        sp = pd.read_csv(spend_p); rp = pd.read_csv(roi_p)
+        sp["日期"] = pd.to_datetime(sp["日期"]); rp["日期"] = pd.to_datetime(rp["日期"])
+        latest = sp["日期"].max()
+        sp_latest = sp[sp["日期"] == latest].copy()
+        rp_latest = rp[rp["日期"] == latest].copy()
+    if app_id:
+        sp_latest = sp_latest[sp_latest["应用ID"].astype(str) == app_id]
+        rp_latest = rp_latest[rp_latest["应用ID"].astype(str) == app_id]
+    if sp_latest.empty:
+        return JSONResponse(content={"error": f"未找到应用{app_id}的预测"})
+    # 全量查询时限制数量保护性能
+    if not app_id and len(sp_latest) > 20:
+        sp_latest = sp_latest.head(20)
+
+    # 加载释放曲线用于累计ROI推算
+    release = _read_json(_repo_root() / "outputs" / "app_release_multipliers.json") or {}
+    g_d7 = release.get("global_d7", 1.29)
+    app_curves = release.get("apps", {})
+
+    from datetime import timedelta
+    results = []
+    # 聚合模式：返回预计算的聚合预测
+    if not app_id and _mh_agg_forecast:
+        total_spend = sum(float(sr["y_pred"]) for _, sr in sp_latest.iterrows())
+        scale = total_spend / _mh_agg_forecast[0] if _mh_agg_forecast[0] > 0 else 1.0
+        daily = []
+        for d in range(1, days + 1):
+            i = min(d - 1, 6)
+            dt = (latest + timedelta(days=d)).strftime("%Y-%m-%d")
+            daily.append({"day": d, "date": dt, "spend": round(_mh_agg_forecast[i] * scale, 2), "cum_roi": 0})
+        results.append({"app_id": "aggregate", "spend_t1": round(total_spend, 2), "d1_roi": 0, "daily": daily})
+    else:
+        for _, sr in sp_latest.iterrows():
+            aid = str(sr["应用ID"])
+            r_row = rp_latest[rp_latest["应用ID"].astype(str) == aid]
+            if r_row.empty: continue
+            d1_roi = float(r_row.iloc[0]["y_pred"])
+            spend_t1 = float(sr["y_pred"])
+            d7r = app_curves.get(aid, {}).get("d7", g_d7)
+            s_preds = []
+            if _mh_models and aid in _mh_app_features:
+                feats = _mh_app_features[aid]
+                for h in range(min(days, 7)):
+                    s_preds.append(max(float(_mh_models[h].predict(feats)[0]), 0))
+            daily = []
+            for d in range(1, days + 1):
+                s_pred = s_preds[d-1] if d <= len(s_preds) else spend_t1
+                m = 1.0 + (d7r - 1.0) * (d - 1) / max(days - 1, 1)
+                dt = (latest + timedelta(days=d)).strftime("%Y-%m-%d")
+                daily.append({"day": d, "date": dt, "spend": round(s_pred, 2), "cum_roi": round(d1_roi * m, 4)})
+            results.append({"app_id": aid, "spend_t1": round(spend_t1, 2), "d1_roi": round(d1_roi, 4), "daily": daily})
+
+    return JSONResponse(content={"days": days, "apps": results, "total": len(results)})
 
 
 @router.get("/web/monitor", response_class=HTMLResponse)
