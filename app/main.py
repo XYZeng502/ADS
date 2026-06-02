@@ -89,7 +89,7 @@ def _warm_cache():
         _drift_summary()
         _calendar_summary()
         _warm_watchlist()
-        _warm_multi_horizon()
+        # 多步模型改为懒加载，不再启动时预热
         logger.info("缓存预热完成")
     except Exception:
         logger.warning("缓存预热部分失败", exc_info=True)

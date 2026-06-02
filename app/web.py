@@ -19,6 +19,7 @@ from app.config import settings
 from app.core.calendar import CalendarService
 from app.prediction_artifacts import resolve_roi_predictions_csv, resolve_spend_predictions_csv
 from app.services.rule_config import RuleConfigStore
+from app.model_manager import model_mgr
 from scripts.offline_backtest import run_app_level_last_day_prediction, run_backtest
 
 router = APIRouter(tags=["web"])
@@ -40,6 +41,15 @@ async def _require_api_key(credentials: HTTPAuthorizationCredentials | None = De
 def _repo_root() -> Path:
     """项目根目录（含 outputs），避免 uvicorn 从其它 cwd 启动时 Path('outputs') 读不到文件。"""
     return Path(__file__).resolve().parent.parent
+
+
+def _read_dataframe(path: str, **kwargs):
+    """读取数据文件，自动优先 Parquet（更快更小）。"""
+    import pandas as pd
+    pq_path = Path(path).with_suffix('.parquet')
+    if pq_path.exists():
+        return pd.read_parquet(pq_path, **kwargs)
+    return pd.read_csv(path, **kwargs)
 
 
 def _utc_now_iso() -> str:
@@ -269,13 +279,14 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     date_feature_dir = root / "model_parallel_spend_t1_date_features_lgbm"
     old_spend_path = root / "model_parallel_spend_t1_v12_unified" / "predictions_XGBoost_log.csv"
     app_month_roi_path = root / "app_level_last_day_suggestions.csv"
-    app_month_roi_summary = _read_json(root / "app_level_last_day_prediction.json")
+    app_month_roi_raw = _read_json(root / "app_level_last_day_prediction.json") or {}
+    app_month_roi_summary = {k: app_month_roi_raw.get(k) for k in ("kpi", "canonical_month_end_roi_source") if k in app_month_roi_raw}
 
     roi_metrics_path = roi_dir / "metrics_summary.csv" if roi_dir else None
     roi_pred_path = resolve_roi_predictions_csv(roi_dir) if roi_dir else None
     spend_pred_path = resolve_spend_predictions_csv(spend_dir) if spend_dir else None
 
-    spend_predictions = _read_csv_rows(spend_pred_path, 50000, from_end=True)
+    spend_predictions = _read_csv_rows(spend_pred_path, 500, from_end=True)
 
     # CQR interval predictions
     cqr_predictions = None       # aggregate by date (for total chart band)
@@ -283,7 +294,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
     cqr_coverage = None
     cqr_path = spend_dir / "predictions_XGBoost_CQR.csv" if spend_dir else None
     if cqr_path and cqr_path.exists():
-        cqr_raw = _read_csv_rows(cqr_path, 50000, from_end=True)
+        cqr_raw = _read_csv_rows(cqr_path, 500, from_end=True)
         # Total aggregate per date
         cqr_by_date: dict[str, dict] = {}
         cqr_app_map: dict[str, dict] = {}
@@ -340,7 +351,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
         "roi": {
             "title": "T+1 ROI_D1 预测效果",
             "metrics": _read_csv_rows(roi_metrics_path, 100),
-            "predictions": _read_csv_rows(roi_pred_path, 50000, from_end=True),
+            "predictions": _read_csv_rows(roi_pred_path, 500, from_end=True),
             "prediction_file": str(roi_pred_path.resolve()) if roi_pred_path and roi_pred_path.exists() else "",
             "source": str(roi_dir) if roi_dir else "",
             "stats": roi_stats["overall"] if roi_stats else None,
@@ -352,7 +363,7 @@ def _load_model_dashboard_payload() -> Dict[str, Any]:
             "report": _read_json(spend_dir / "report.json") if spend_dir else {},
             "predictions": spend_predictions,
             "prediction_file": str(spend_pred_path.resolve()) if spend_pred_path and spend_pred_path.exists() else "",
-            "baseline_predictions": _read_csv_rows(old_spend_path, 20000, from_end=True),
+            "baseline_predictions": _read_csv_rows(old_spend_path, 500, from_end=True),
             "cqr_predictions": cqr_predictions,
             "cqr_by_app_date": cqr_by_app_date,
             "cqr_coverage": cqr_coverage,
@@ -447,7 +458,7 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     .section-title h2 {{ font-size: 18px; margin: 0; white-space: nowrap; }}
     .hint {{ color: var(--muted); font-size: 12px; }}
     .charts {{ display: grid; grid-template-columns: 1.25fr .75fr; gap: 14px; }}
-    .chart {{ height: 360px; border: 1px solid var(--line); border-radius: 16px; background: #fff; }}
+    .chart {{ width: 100%; min-width: 0; height: 360px; border: 1px solid var(--line); border-radius: 16px; background: #fff; }}
     .wide {{ height: 330px; }}
     .note {{ background: #fffbeb; border: 1px solid #fde68a; color: #92400e; padding: 12px 14px; border-radius: 14px; line-height: 1.6; }}
     .note-section {{ padding: 6px 0; }}
@@ -716,18 +727,10 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
     <div class="panel" style="margin-top:14px;">
       <div class="section-title"><h2>推荐总览</h2></div>
       <div class="grid4" id="businessCards"></div>
-      <div class="grid2" style="margin-top:14px;">
-        <div id="budgetChart" class="chart"></div>
-        <div id="productChart" class="chart"></div>
-      </div>
     </div>
-    <div class="grid2" style="margin-top:14px;">
-      <div id="layerChart" class="chart"></div>
-      <div class="note" id="decisionNote"></div>
-    </div>
-    <div class="panel" style="margin-top:14px;background:#f8fafc;">
-      <div class="section-title"><h2>六层决策面板</h2></div>
-      <div class="layer-panels" id="layerPanels"></div>
+    <div class="panel" style="margin-top:14px;">
+      <div class="section-title" style="cursor:pointer;" onclick="document.getElementById('layerPanels').style.display=document.getElementById('layerPanels').style.display==='none'?'':'none'"><h2>决策链路</h2><span style="font-size:12px;color:var(--muted);">点击展开</span></div>
+      <div class="layer-panels" id="layerPanels" style="display:none;"></div>
     </div>
   </div>
 </div>
@@ -817,12 +820,12 @@ def _render_model_dashboard(payload: Dict[str, Any], initial_view: str = "predic
         <table class="data-table" style="width:100%;font-size:13px;">
           <thead><tr>
             <th class="sortable" style="width:120px;" onclick="wlSort('app_id')">应用ID ↕</th>
-            <th class="sortable" style="width:100px;" onclick="wlSort('cur_spend')">当月消耗 ↕</th>
+            <th class="sortable" style="width:100px;" onclick="wlSort('daily_spend')">日消耗 ↕</th>
             <th class="sortable" style="width:100px;" onclick="wlSort('cur_roi')">当月ROI ↕</th>
             <th class="sortable" style="width:100px;" onclick="wlSort('prev_roi')">上月ROI ↕</th>
             <th class="sortable" style="width:100px;" onclick="wlSort('roi_change')">ROI变化 ↕</th>
-            <th class="sortable" style="width:100px;" onclick="wlSort('daily_spend')">日消耗 ↕</th>
-            <th style="width:120px;">状态</th>
+            <th style="width:150px;">7日消耗走势</th>
+            <th style="width:110px;">状态</th>
             <th>异常</th>
           </tr></thead>
           <tbody id="wlBody"><tr><td colspan="8" style="color:var(--muted);padding:16px;">加载中...</td></tr></tbody>
@@ -893,9 +896,9 @@ const payload = {safe_payload_js};
 const initialView = {safe_initial_view_js};
 const actColors = {{'放量':'#bbf7d0','控量':'#fecaca','维稳':'#e2e8f0','暂停':'#fde68a','加预算':'#bfdbfe','减预算':'#fecaca','调整出价':'#fef08a','收紧':'#fecaca'}};
 const charts = {{
-  budget: echarts.init(document.getElementById('budgetChart')),
-  product: echarts.init(document.getElementById('productChart')),
-  layer: echarts.init(document.getElementById('layerChart')),
+  budget: document.getElementById('budgetChart') ? echarts.init(document.getElementById('budgetChart')) : null,
+  product: document.getElementById('productChart') ? echarts.init(document.getElementById('productChart')) : null,
+  layer: document.getElementById('layerChart') ? echarts.init(document.getElementById('layerChart')) : null,
   line: echarts.init(document.getElementById('lineChart')),
   scatter: echarts.init(document.getElementById('scatterChart')),
   error: echarts.init(document.getElementById('errorChart')),
@@ -1013,7 +1016,7 @@ function appRoiDecision(r) {{
     if (hit) {{
       const act = hit.action || hit.override_mode || 'STABLE';
       const label = ACTION_LABELS[act] || act;
-      return {{ action: label, basis: [`规则: ${{hit.name}} → ${{label}}`, `月末ROI ${{fmt(r.monthEndRoi,4)}} vs KPI ${{fmt(kpiT,4)}}`].join(' | '), budgetChange }};
+      return {{ action: label, basis: [`规则: ${{hit.name}} → ${{label}}`, `月末ROI ${{fmt(r.calibratedRoi,4)}} vs KPI ${{fmt(kpiT,4)}}`].join(' | '), budgetChange }};
     }}
   }}
   const scaleMode = mode === 'SCALE';
@@ -1053,7 +1056,7 @@ function appRoiDecision(r) {{
     '暂停投放': '暂停',
   }};
   const basis = [
-    `月末ROI ${{fmt(r.monthEndRoi,4)}} vs KPI ${{fmt(kpiT,4)}}（${{pct(gap)}}）`,
+    `月末ROI ${{fmt(r.calibratedRoi,4)}} vs KPI ${{fmt(kpiT,4)}}（${{pct(gap)}}）`,
     `预算 ${{fmt(r.plannedBudget,2)}}（变化${{pct(budgetChange)}}）| 昨日消耗 ${{fmt(r.actualSpend,2)}}`,
     `模式 ${{mode || '-'}} | 告警 ${{alertCount}} | ${{r.dominantFactor}}`,
   ].join('<br>');
@@ -1100,7 +1103,6 @@ function appMonthRoiRows() {{
       d1Calibrated: num(r.d1_anchor_calibrated_mean),
       spendT1Calibrated: num(r.spend_t1_pred_calibrated),
       roiD1T1Calibrated: num(r.roi_d1_t1_pred_calibrated),
-      trend7d: (()=>{{ const d1=num(r.roi_d1_t1_pred_calibrated); if(!d1||d1<=0) return '-'; const rm=payload.release_multipliers||{{}}; const app=rm.apps||{{}}; const c=app[r.app]||{{}}; const d3r=c.d3||rm.global_d3||1.20; const d7r=c.d7||rm.global_d7||1.29; const steps=[1.0,1.0+(d3r-1.0)*0.5,d3r,d3r+(d7r-d3r)*0.25,d3r+(d7r-d3r)*0.5,d3r+(d7r-d3r)*0.75,d7r]; const bars=steps.map(function(m,i){{ const v=Math.min(1,Math.max(0,d1*m/1.5)); const h=8+Math.round(v*16); const c=d1*m>=1.05?'#16a34a':d1*m>=0.8?'#f59e0b':'#dc2626'; return '<span title=D'+(i+1)+':'+fmt(d1*m,3)+' style=display:inline-block;width:6px;height:'+h+'px;background:'+c+';border-radius:2px;margin:0 1px;vertical-align:middle;></span>'; }}).join(''); return bars; }})(),
       topActions: r.top_actions || '',
       topSuggestionsRaw: r.top_suggestions || '',
       alertsRaw: r.alerts || '',
@@ -1199,7 +1201,6 @@ function renderAppMonthRoiTable() {{
     ['monthEndRoiPredOnly', '纯预测'],
     ['monthEndRoiFused', '融合'],
     ['roiGap', '较KPI差距'],
-    ['trend7d', 'T+1 → T+7'],
     ['action', '建议动作'],
     ['monthEndSpend', '预测月末消耗'],
     ['plannedBudget', '主用计划预算'],
@@ -1245,12 +1246,11 @@ function renderAppMonthRoiTable() {{
       <td>${{r.mode}}</td>
       <td>${{r.targetDay}}</td>
       <td>${{r.canonicalLabel}}</td>
-      <td class="${{roiCls}}">${{fmt(r.monthEndRoi,4)}}</td>
+      <td class="${{roiCls}}">${{fmt(r.calibratedRoi,4)}}</td>
       <td>${{fmt(r.monthEndRoiStable,4)}}</td>
       <td>${{fmt(r.monthEndRoiPredOnly,4)}}</td>
       <td>${{fmt(r.monthEndRoiFused,4)}}</td>
       <td class="${{roiCls}}">${{pct(r.roiGap)}}</td>
-      <td style="white-space:nowrap;text-align:center;">${{r.trend7d || '-'}}</td>
       <td><span class="pill" style="background:${{actBg}};">${{r.action}}</span></td>
       <td>${{fmt(r.monthEndSpend,2)}}</td>
       <td>${{fmt(r.plannedBudget,2)}}</td>
@@ -1467,7 +1467,7 @@ function renderBusinessSnapshot() {{
     return;
   }}
   const kpi = num(payload.app_month_roi.kpi || 1.05);
-  const avgRoi = rows.reduce((s,r)=>s+r.monthEndRoi,0) / rows.length;
+  const avgRoi = rows.reduce((s,r)=>s+r.calibratedRoi,0) / rows.length;
   const totalPlan = rows.reduce((s,r)=>s+r.plannedBudget,0);
   const totalMonthSpend = rows.reduce((s,r)=>s+r.monthEndSpend,0);
   const actionCounts = new Map();
@@ -1483,7 +1483,7 @@ function renderBusinessSnapshot() {{
   document.getElementById('businessCards').innerHTML = cards.map(c => `<div class="metric"><div class="k">${{c[0]}}</div><div class="v">${{c[1]}}</div><div class="d">${{c[2]}}</div></div>`).join('');
 
   const actionData = [...actionCounts.entries()].map(([name, value]) => ({{name, value}}));
-  charts.budget.setOption({{
+  if (charts.budget) charts.budget.setOption({{
     color: ['#2563eb', '#16a34a', '#f59e0b', '#7c3aed'],
     tooltip: {{ trigger:'item', formatter: p => `${{p.name}}<br/>应用数：${{p.value}} (${{fmt(p.percent,1)}}%)` }},
     legend: {{ bottom: 8 }},
@@ -1492,7 +1492,7 @@ function renderBusinessSnapshot() {{
   }});
 
   const topRows = [...rows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 12);
-  charts.product.setOption({{
+  if (charts.product) charts.product.setOption({{
     color: ['#2563eb', '#16a34a'],
     tooltip: {{ trigger:'axis' }},
     legend: {{ bottom: 8 }},
@@ -1504,13 +1504,13 @@ function renderBusinessSnapshot() {{
     ],
     series: [
       {{ name:'今日计划预算', type:'bar', data:topRows.map(r=>r.plannedBudget) }},
-      {{ name:'预测月末ROI', type:'line', yAxisIndex:1, data:topRows.map(r=>r.monthEndRoi) }},
+      {{ name:'预测月末ROI', type:'line', yAxisIndex:1, data:topRows.map(r=>r.calibratedRoi) }},
     ]
   }});
 
   const factorCounts = new Map();
   rows.forEach(r => factorCounts.set(r.dominantFactor, (factorCounts.get(r.dominantFactor) || 0) + 1));
-  charts.layer.setOption({{
+  if (charts.layer) charts.layer.setOption({{
     color: ['#2563eb'],
     tooltip: {{ trigger:'axis' }},
     legend: {{ bottom: 8 }},
@@ -1522,14 +1522,15 @@ function renderBusinessSnapshot() {{
 
   const topRecommend = [...rows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 5)
     .map(r => `<li><b>${{r.app}}</b>：${{r.action}}；${{r.basis}}</li>`).join('');
-  const riskList = [...riskRows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 5).map(r => `<li>${{r.app}}：ROI=${{fmt(r.monthEndRoi,4)}}，告警${{r.alertCount}}次，建议${{r.action}}</li>`).join('');
+  const riskList = [...riskRows].sort((a,b)=>b.priorityScore-a.priorityScore).slice(0, 5).map(r => `<li>${{r.app}}：ROI=${{fmt(r.calibratedRoi,4)}}，告警${{r.alertCount}}次，建议${{r.action}}</li>`).join('');
 
   const kpiOk = avgRoi >= kpi;
   const kpiStatusCls = kpiOk ? 's-ok' : 's-warn';
   const kpiStatusText = kpiOk ? '达标' : '未达标';
   const kpiGapText = kpiOk ? `超出 ${{pct(avgRoi - kpi)}}` : `差距 ${{pct(kpi - avgRoi)}}`;
 
-  document.getElementById('decisionNote').innerHTML = `
+  const dn = document.getElementById('decisionNote');
+  if (dn) dn.innerHTML = `
     <div class="note-section">
       <div class="note-label">KPI 状态</div>
       <div class="note-body">
@@ -1552,7 +1553,7 @@ function renderBusinessSnapshot() {{
   `;
 
   // ---- 六层交互面板 ----
-  const aboveKpiCount = rows.filter(r => r.monthEndRoi >= kpi).length;
+  const aboveKpiCount = rows.filter(r => r.calibratedRoi >= kpi).length;
   const belowKpiCount = rows.length - aboveKpiCount;
   const factorEntries = [...factorCounts.entries()];
 
@@ -1633,7 +1634,7 @@ function renderBusinessSnapshot() {{
             const aBg = Object.entries(actColors).find(([k])=>r.action.includes(k));
             return `<tr>
             <td><b>${{r.app}}</b></td>
-            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
+            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.calibratedRoi,4)}}</td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{pct(r.roiGap)}}</td>
             <td>${{r.alertCount}}</td>
             <td><span class="pill" style="background:${{aBg ? aBg[1] : '#f8fafc'}};">${{r.action}}</span></td>
@@ -1654,7 +1655,7 @@ function renderBusinessSnapshot() {{
             return `<tr>
             <td>${{i + 1}}</td>
             <td><b>${{r.app}}</b></td>
-            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.monthEndRoi,4)}}</td>
+            <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{fmt(r.calibratedRoi,4)}}</td>
             <td class="${{r.roiGap >= 0 ? 'good' : 'bad'}}">${{pct(r.roiGap)}}</td>
             <td><span class="pill" style="background:${{aBg ? aBg[1] : '#f8fafc'}};">${{r.action}}</span></td>
           </tr>`;}}).join('')}}
@@ -2021,7 +2022,7 @@ function render() {{
   if (el) el.addEventListener('change', () => {{ selectedAppId = ''; _chartAppId = ''; document.getElementById('appSelectHint').style.display = 'none'; detailState = {{ appId: '', page: 0, limit: 200, total: 0 }}; render(); }});
 }});
 const targetSelEl = document.getElementById('targetSel');
-if (targetSelEl) targetSelEl.addEventListener('change', () => {{ _chartAppId = ''; detailState = selectedAppId ? {{ appId: selectedAppId, page: 0, limit: 200, total: 0 }} : {{ appId: '', page: 0, limit: 200, total: 0 }}; const link = document.getElementById('exportCsvLink'); if (link) link.href = '/web/export/predictions/' + targetSelEl.value; document.getElementById('forecastLabel').style.display = targetSelEl.value === 'spend' ? '' : 'none'; render(); setTimeout(() => Object.values(charts).forEach(c => c.resize()), 100); }});
+if (targetSelEl) targetSelEl.addEventListener('change', () => {{ _chartAppId = ''; detailState = selectedAppId ? {{ appId: selectedAppId, page: 0, limit: 200, total: 0 }} : {{ appId: '', page: 0, limit: 200, total: 0 }}; const link = document.getElementById('exportCsvLink'); if (link) link.href = '/web/export/predictions/' + targetSelEl.value; document.getElementById('forecastLabel').style.display = targetSelEl.value === 'spend' ? '' : 'none'; render(); setTimeout(() => Object.values(charts).forEach(c => c && c.resize()), 100); }});
 const appTableSearchEl = document.getElementById('appTableSearch');
 if (appTableSearchEl) appTableSearchEl.addEventListener('input', renderAppSummary);
 const detailAppSearchEl = document.getElementById('detailAppSearch');
@@ -2099,7 +2100,7 @@ function setActiveView(view) {{
   hideAppPopup(true);
   if (view === 'watchlist') loadWatchlist();
   if (view === 'predict') {{ render(); }}
-  setTimeout(() => {{ Object.values(charts).forEach(c => c.resize()); if (view === 'daily-revenue') {{ loadDailyRevenueChart(); loadDailyRevenueAppSummary(); }} if (view === 'monitor') loadMonitorView(); }}, 0);
+  setTimeout(() => {{ Object.values(charts).forEach(c => c && c.resize()); if (view === 'daily-revenue') {{ loadDailyRevenueChart(); loadDailyRevenueAppSummary(); }} if (view === 'monitor') loadMonitorView(); }}, 0);
 }}
 document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setActiveView(btn.dataset.view)));
 
@@ -2493,27 +2494,47 @@ function wlRow(a, showChange) {{
   const anomalyLabel = {{spike_up:'📈 突升', spike_down:'📉 骤降', normal:'-'}};
   const statusBg = {{star:'#bbf7d0', good:'#e2e8f0', watch:'#fde68a', critical:'#fecaca'}};
   const roiCls = a.cur_roi >= 1.05 ? 'good' : a.cur_roi >= 0.8 ? '' : 'bad';
-  if (!showChange || a.roi_change == null) {{
-    return `<tr>
-      <td><b>${{a.app_id}}</b></td>
-      <td class="num">${{money(a.cur_spend)}}</td>
-      <td class="${{roiCls}} num">${{fmt(a.cur_roi, 4)}}</td>
-      <td class="num">${{a.prev_roi != null ? fmt(a.prev_roi, 4) : '数据不足'}}</td>
-      <td class="num" style="color:var(--muted);">数据不足</td>
-      <td class="num">${{money(a.daily_spend)}}</td>
-      <td><span class="pill" style="background:${{statusBg[a.status]||'#f8fafc'}};">${{statusLabel[a.status]||a.status}}</span></td>
-      <td>${{anomalyLabel[a.anomaly]||'-'}}</td>
-    </tr>`;
+  // 7日走势sparkline
+  let sparkline = '-';
+  let trend = '-';
+  const daily = a.recent_daily || [];
+  if (daily.length >= 3) {{
+    // Mini SVG line chart
+    const W = 140, H = 28, pad = 2;
+    const vals = daily.map(d => d.spend > 0 ? d.spend : null);
+    const validVals = vals.filter(v => v != null);
+    const maxV = Math.max(...validVals, 5), minV = 0, range = maxV - minV || 1;
+    // x坐标用原始索引（7个均匀位置），polyline跳过null点
+    const getX = (i) => pad + (i / Math.max(vals.length - 1, 1)) * (W - pad * 2);
+    const getY = (v) => H - pad - ((v - minV) / range) * (H - pad * 2);
+    const pts = vals.map((v, i) => v != null ? getX(i).toFixed(1)+','+getY(v).toFixed(1) : '').filter(x=>x).join(' ');
+    const areaPts = pts + ' ' + (W-pad).toFixed(1) + ',' + (H-pad).toFixed(0) + ' ' + pad.toFixed(1) +','+(H-pad).toFixed(0);
+    const lineColor = '#3b82f6';
+    sparkline = `<svg width=\"${{W}}\" height=\"${{H}}\" style=\"display:block;\">
+      <polygon points=\"${{areaPts}}\" fill=\"${{lineColor}}\" opacity=\"0.1\"/>
+      <polyline points=\"${{pts}}\" fill=\"none\" stroke=\"${{lineColor}}\" stroke-width=\"1.5\" stroke-linejoin=\"round\"/>
+      ${{daily.map((d,i)=>{{
+        if (d.spend <= 0) return '';
+        const x=getX(i), y=getY(d.spend);
+        return d.is_holiday?'<circle cx=\"'+x.toFixed(1)+'\" cy=\"'+y.toFixed(1)+'\" r=\"2.5\" fill=\"#f59e0b\" stroke=\"#d97706\" stroke-width=\"0.5\"/>':'';
+      }}).join('')}}
+    </svg>`;
+    const recent3 = daily.slice(-3).reduce((s,d)=>s+d.roi,0)/3;
+    const prev4 = daily.slice(0,-3).reduce((s,d)=>s+d.roi,0)/Math.max(daily.length-3,1);
+    const diff = recent3 - prev4;
+    if (Math.abs(diff) < 0.05) trend = '→';
+    else if (diff > 0) trend = '<span style=color:#16a34a;>↑</span>';
+    else trend = '<span style=color:#dc2626;>↓</span>';
   }}
   const changeCls = a.roi_change > 0 ? 'good' : 'bad';
   const changeSign = a.roi_change > 0 ? '+' : '';
   return `<tr>
     <td><b>${{a.app_id}}</b></td>
-    <td class="num">${{money(a.cur_spend)}}</td>
+    <td class="num">${{money(a.daily_spend)}}</td>
     <td class="${{roiCls}} num">${{fmt(a.cur_roi, 4)}}</td>
     <td class="num">${{a.prev_roi != null ? fmt(a.prev_roi, 4) : '数据不足'}}</td>
-    <td class="${{changeCls}} num">${{changeSign}}${{fmt(a.roi_change, 4)}}</td>
-    <td class="num">${{money(a.daily_spend)}}</td>
+    <td class="${{changeCls}} num">${{a.roi_change != null ? changeSign+fmt(a.roi_change, 4) : '-'}}</td>
+    <td style="padding:2px 4px;">${{sparkline}}</td>
     <td><span class="pill" style="background:${{statusBg[a.status]||'#f8fafc'}};">${{statusLabel[a.status]||a.status}}</span></td>
     <td>${{anomalyLabel[a.anomaly]||'-'}}</td>
   </tr>`;
@@ -2707,7 +2728,15 @@ if (rb) rb.addEventListener('click', () => {{
   if (das) das.value = '';
   render();
 }});
-window.addEventListener('resize', () => {{ Object.values(charts).forEach(c => c.resize()); if (_popupCharts.roi) _popupCharts.roi.resize(); if (_popupCharts.spend) _popupCharts.spend.resize(); }});
+let _resizeTimer = null;
+window.addEventListener('resize', () => {{
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(() => {{
+    Object.values(charts).forEach(c => {{ try {{ c.resize(); }} catch(e) {{}} }});
+    if (_popupCharts.roi) try {{ _popupCharts.roi.resize(); }} catch(e) {{}};
+    if (_popupCharts.spend) try {{ _popupCharts.spend.resize(); }} catch(e) {{}};
+  }}, 200);
+}});
 render();
 setActiveView(initialView);
 document.getElementById('forecastLabel').style.display = document.getElementById('targetSel').value === 'spend' ? '' : 'none';
@@ -3272,21 +3301,32 @@ def _build_watchlist_snapshot():
     csv_path = _repo_root() / "daily_merged.csv"
     if not csv_path.exists():
         return None
-    df = pd.read_csv(csv_path, usecols=["应用ID", "日期", "消耗金额", "买量广告收入", "30日累计变现金额"],
-                     dtype={"应用ID": str, "消耗金额": float, "买量广告收入": float, "30日累计变现金额": float}, parse_dates=["日期"])
+    df = _read_dataframe(str(csv_path), columns=["应用ID", "日期", "消耗金额", "买量广告收入", "30日累计变现金额"])
     today = datetime.now().date()
     cur_m = today.strftime("%Y-%m")
     prev_m = (today.replace(day=1) - pd.DateOffset(months=1)).strftime("%Y-%m")
     cur = df[df["日期"].dt.strftime("%Y-%m") == cur_m]
     prev = df[df["日期"].dt.strftime("%Y-%m") == prev_m]
-    # 最近7天日级数据（含节假日标记）
+    # 数据最后7天日级走势（含节假日标记）
     from chinese_calendar import is_workday
-    recent7 = df[df["日期"] >= (today - pd.Timedelta(days=7)).strftime("%Y-%m-%d")].copy()
+    last_data_date = df["日期"].max().date()
+    cutoff_date = last_data_date - pd.Timedelta(days=6)
+    recent7 = df[df["日期"] >= pd.Timestamp(cutoff_date)].copy()
     recent7["is_holiday"] = recent7["日期"].apply(lambda d: not is_workday(d.date())).astype(int)
-    recent_daily = recent7.groupby("应用ID").apply(
-        lambda g: g.sort_values("日期")[["日期","消耗金额","买量广告收入","is_holiday"]].tail(7)
-        .rename(columns={"消耗金额":"spend","买量广告收入":"buyout"}).to_dict("records")
-    ).to_dict()
+    # 聚合到应用-日期级
+    daily_agg = recent7.groupby(["应用ID","日期"], as_index=False).agg(
+        spend=("消耗金额","sum"), buyout=("买量广告收入","sum"),
+        is_holiday=("is_holiday","max")
+    )
+    rd_dict = {}
+    for aid, g in daily_agg.groupby("应用ID"):
+        rows = g.sort_values("日期").tail(7)
+        rd_dict[str(aid)] = [{
+            "date": str(r["日期"].date()), "spend": round(float(r["spend"]), 2),
+            "roi": round(float(r["buyout"]) / max(float(r["spend"]), 1e-8), 4) if float(r["spend"]) >= 3 else None,
+            "is_holiday": int(r["is_holiday"])
+        } for _, r in rows.iterrows()]
+    recent_daily = rd_dict
     ca = cur.groupby("应用ID").agg(s=("消耗金额","sum"), b=("买量广告收入","sum"), d30=("30日累计变现金额","sum"), d=("日期","nunique")).reset_index()
     ca["revenue"] = np.where(ca["b"] / np.maximum(ca["s"], 1e-8) >= 0.05, ca["b"], ca["d30"])
     ca["roi"] = ca["revenue"] / np.maximum(ca["s"], 1e-8)
@@ -3308,19 +3348,16 @@ def _build_watchlist_snapshot():
             elif chg <= -0.2 and r["roi"] < 0.8: anomaly = "spike_down"
         is_ext = (r["roi"] > 2.0 or r["roi"] < 0.2) and r["s"] >= 50
         aid_str = str(r["应用ID"])
-        daily_7d = []
-        if aid_str in recent_daily:
-            for d in recent_daily[aid_str]:
-                s = float(d.get("spend", 0) or 0); b = float(d.get("buyout", 0) or 0)
-                daily_7d.append({
-                    "date": str(d["日期"].date()) if hasattr(d["日期"], "date") else str(d["日期"])[:10],
-                    "spend": round(s, 2), "roi": round(b / max(s, 1e-8), 4),
-                    "is_holiday": int(d.get("is_holiday", 0))
-                })
+        daily_7d = recent_daily.get(aid_str, [])
+        import math
+        cur_roi_val = float(r["roi"])
+        cur_spend_val = float(r["s"])
         result.append({
-            "app_id": aid_str, "cur_spend": round(float(r["s"]), 2),
-            "cur_roi": round(float(r["roi"]), 4), "prev_roi": prev_roi,
-            "roi_change": chg, "daily_spend": round(float(r["s"]) / max(int(r["d"]), 1), 2),
+            "app_id": aid_str, "cur_spend": round(cur_spend_val, 2),
+            "cur_roi": round(cur_roi_val, 4) if math.isfinite(cur_roi_val) else 0.0,
+            "prev_roi": prev_roi if (prev_roi is None or math.isfinite(prev_roi)) else 0.0,
+            "roi_change": chg if (chg is None or math.isfinite(chg)) else 0.0,
+            "daily_spend": round(cur_spend_val / max(int(r["d"]), 1), 2),
             "cur_days": int(r["d"]), "status": status, "anomaly": anomaly, "is_extreme": is_ext,
             "recent_daily": daily_7d,
         })
@@ -3336,6 +3373,13 @@ def _build_watchlist_snapshot():
         for r in result:
             del r["_score"]
     snapshot = {"apps": result, "month": cur_m, "prev_month": prev_m, "total": len(result)}
+    # 清除所有NaN/Inf
+    def clean(o):
+        if isinstance(o, dict): return {k: clean(v) for k, v in o.items()}
+        if isinstance(o, list): return [clean(v) for v in o]
+        if isinstance(o, float) and not math.isfinite(o): return 0.0
+        return o
+    snapshot = clean(snapshot)
     _WL_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
     _WL_SNAPSHOT_PATH.write_text(_json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
     return snapshot
